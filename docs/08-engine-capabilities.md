@@ -1434,6 +1434,51 @@ The agent used 0.0001 core idle, with a peak RSS of 19.4 MiB (memory peak 10.9 M
 
 Scope: one CI run on a shared runner, files written by one SQLite version, one rollback journal mode (`DELETE`).
 
+## Firebird Audit
+
+What the Firebird connector's Audit does, as implemented in lot 3 (P10-B #385; [ADR-0060](adr/0060-firebird-connector.md) decision 6, its refinements and its [implementation note of 2026-10-31](adr/0060-firebird-connector.md#implementation-note-2026-10-31-lot-3)). **Merged on `dev`, not released yet.** Firebird Discovery, the account and the transport are documented with P10-G. The trust model of the trace log is in [05-security.md](05-security.md#firebird-audit-trace-log); the setup is in the [user guide](10-user-guide.md#firebird-audit).
+
+### Source and level
+- **Source**: the server's system audit trace (`AuditTraceConfigFile` in `firebird.conf`), a text log on the server host. The core tailer reads it locally under the file rules of [ADR-0043](adr/0043-audit-logs-opened-without-following-a-final-symlink.md) (`audit_source` `firebird_audit_trace`). The agent needs no database grant for Audit, and never starts a user trace session.
+- **Level: not stated yet.** The ceiling is Partial; Full is never reported. `check()` computes Partial or Limited from proofs 1 to 11 of decision 6, and None when no record of a declared database was parsed in the last 24 h. **No Firebird Audit level is stated until the `e2e-firebird` run and the 10 000-object schema measurement are done** ([release gates](../RELEASE.md#open-release-gates)).
+- **Partial is not proven when the agent runs in a container**: the readers check (who other than root, the server's account and the agent can read the log, its rotated files and its directory) needs the host's own identity files. A refinement that lets the operator declare them, mounted read-only into the agent's container, is planned (maintainer decision of 2026-10-31).
+- **What lowers the level**, each shown as a target note:
+  - a missing trace setting (`audit.trace_settings_missing`, with the setting's label);
+  - a missing or incomplete services section (`audit.services_not_audited`, with the label `log_services` of `audit.trace_settings_missing`);
+  - a trace configuration the agent cannot evaluate, or a configuration not bound to the running server (`audit.trace_config_not_evaluated`, with labels such as `trace_config_file_mismatch`, `config_changed_since_start`, `server_process_not_visible` or `server_layout_not_the_root`);
+  - a log the agent cannot read under the file rules (`audit.log_not_readable`), or one that others can read (`audit.log_readable_by_others`);
+  - a `max_sql_length` below the agent's longest own statement (`audit.statement_text_limit_low`, also reported, without lowering the level, below 4096);
+  - `ServerMode = Classic`: Limited at best (R1 rule 10);
+  - a gap (`audit.records_dropped`) or an ambiguous record (`audit.log_records_ambiguous`) in the last 24 h.
+
+### Gaps that cap the level for 24 h
+- **Every live log rotation counts as a gap** (proof 8): each one caps Partial for 24 h.
+- **A server restart**, until the next `check()`: the records between the restart and that check are ambiguous (always reported with `*`).
+- **DDL and DCL statements run through `isql`**: they are written without a `Statement <n>:` line, so they are ambiguous until measurement 3o (R37).
+- **A local external data source** (`<internal>` attachment lines with a user) on a declared database.
+- **An embedded `gbak` run**, which writes under its own pid. Run backups through the services manager or over loopback TCP.
+
+### Known limits
+- **Silent reads through a utility attachment.** The database owner, `RDB$ADMIN` and the holders of any utility system privilege (`USE_GBAK_UTILITY`, `USE_GFIX_UTILITY`, `USE_GSTAT_UTILITY` and the like) are **untraced readers** within their object rights. A client can set the utility attachment tag over TCP; Firebird then writes no record of its BLR reads, so these reads give **no event, no signal and no `*`**. DSQL reads under such an attachment may be silent too (not measured yet, 3n). Grant these privileges only to accounts trusted to read without audit.
+- **Not seen by the trace**: file-level copies of the database (`.fdb` backups, `nbackup` copies, snapshots), embedded-engine access, replication, and anything the server does without an attachment.
+- **Duplicates after an agent restart**: the records re-read after a restart are emitted again, so events sent before the restart can be sent twice (over-reporting, never a loss). A cursor reset across agent processes is not detected.
+- **After an agent restart**, until a parser checkpoint exists (follow-up lot), the previous agent process's records not yet read are no longer recognized as its own: its catalog reads are mostly left out as noise, and its reads of always-reported relations and its sampling reads are reported as reads by the agent's account (over-reporting). The confirmed clock offset is learned again, and times are taken as printed until the first own attachment.
+- **Error records**: other clients' `ERROR` and `WARNING` records give no event of their own, except a permission refusal, which gives an always-reported `*` event. The failed statement itself is reported from its finish record.
+- **Over-reported objects** (always-reported `*` events, which match "every read" policies):
+  - reads of tables with check constraints or domain checks, and of tables with expression indexes;
+  - reads of views, routines, packages, triggers and computed-column tables that depend on a statement-text or credential-bearing relation;
+  - reads of every such object while the dependency read is cut, or for a database whose sets are invalidated by DDL until a `check()` after the DDL transaction ends.
+- **Residuals R-1 to R-4** (accepted by the maintainer):
+  - **R-1**: a DDL transaction of an attachment whose database name the agent cannot resolve (an unmapped alias, for example), committed after a `check()`, leaves other clients' reads of the changed object without the always-reported mark until the next periodic `check()`. That attachment's own records, the DDL included, are always-reported `*` events and cap the level.
+  - **R-2**: a forged record that resolves to a declared database with an unknown attachment keeps that database's sets invalidated for the server run (over-reporting).
+  - **R-3**: long-lived connection pools keep an unresolved hold about as long as the server run (over-reporting).
+  - **R-4**: one unreadable record invalidates every declared database until the other clients' attachments open at that record end (over-reporting).
+- **Misattribution**: a client that forges records in its own statement text can, if it guesses the right header token, attach its real read to another principal. The read stays reported with its objects and row count ([05-security.md](05-security.md#firebird-audit-trace-log)).
+- **Volume**: `records fetched` counts rows, not blob bytes, so a few rows of large blobs do not raise `volume.large_result`.
+- **Unknown names**: names the catalog does not know count as dependent only where an object is named (relations, routines, block and routine-name lines); elsewhere in a text they do not mark the read.
+- **Tested by unit tests only** (R41 item 9): block-less `ON CONNECT` and `ON TRANSACTION START` triggers, a failed call of a dependent routine, an early-ended group, and the `NONE` and `WIN1252` attachment character sets.
+- **Database impact under load is not measured yet** (P10-D: measurements 3l, 3m and 8g).
+
 ## Known export signatures
 | Tool | Observable signature | Engine |
 |-------|---------------------|--------|

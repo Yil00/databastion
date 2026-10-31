@@ -490,6 +490,45 @@ While a scan runs, the agent page shows the target's state from the last check b
 
 **Location exceptions are scoped to the target**: an exception with a location pattern covers SQLite findings only when it names both the agent id and the target. Without both, it still applies to the other engines but covers no SQLite target, and the console says so when you create it. To cover the same table and column names in every SQLite file of the exception's scope, tick the cross-target confirmation: the confirmation is recorded in the console audit log. Exceptions without a location (agent, target or classifier only) work as on other engines. SQLite names are compared with case, and trailing spaces count. Exceptions follow the target id, not the file: if you point a target at another file in `agent.yaml`, its exceptions now apply to the new file.
 
+### Firebird Audit
+*On `dev`, not released yet (phase 10, [ADR-0060](adr/0060-firebird-connector.md), lot 3). The Firebird target itself (account, `databases`, `peer_uid`, loopback) is documented with P10-G; [`agent/agent.example.yaml`](../agent/agent.example.yaml) shows the block.* No Firebird Audit level is stated yet: it waits for the `e2e-firebird` run and the 10 000-object schema measurement ([release gates](../RELEASE.md#open-release-gates)). What Audit sees and its limits: [08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit); the trust model: [05-security.md](05-security.md#firebird-audit-trace-log).
+
+The agent reads the server's **system audit trace**, a text log the server writes on its host. Audit needs no database grant; it is refused for a target with `tunnel: true`. Add an `audit` block to the target's `firebird` block, with canonical absolute paths on the agent host:
+
+```yaml
+    firebird:
+      # … databases, peer_uid …
+      audit:
+        root: /opt/firebird                          # the Firebird root ($(root)); the server binary must be in <root>/bin
+        firebird_conf: /opt/firebird/firebird.conf   # must be <root>/firebird.conf
+        databases_conf: /opt/firebird/databases.conf # optional, must be <root>/databases.conf; without it, aliases are not evaluated
+        trace_config: /opt/firebird/fbtrace.conf     # the file AuditTraceConfigFile names
+        log: /var/log/firebird/audit/audit.log       # the log_filename of the trace configuration
+```
+
+**Server configuration.** Set `AuditTraceConfigFile` in `firebird.conf` to the trace configuration, then **restart the server**: it reads both files at start only, and a file changed after the server started is not proven. In the trace configuration:
+
+- a `database = <path>` section for each declared database, with the exact path the server prints (no `SIMILAR TO` pattern: a path holding `_`, `%`, `-` or another metacharacter is not evaluated). Disable the default `database` section, or keep it off the declared log: the log must hold only declared databases;
+- in each of these sections: `enabled = true`, `log_filename` the declared log, `connection_id = 0`, `time_threshold = 0`, `max_sql_length` at least 4096, no `include_filter`, `exclude_filter` or GDS-code filter, and `true` (unquoted) for `log_connections`, `log_transactions`, `log_statement_finish`, `log_procedure_finish`, `log_function_finish`, `log_trigger_finish`, `log_blr_requests`, `log_errors`, `log_initfini`, `log_sweep` and `print_perf`;
+- a `services` section with `enabled = true`, `log_services = true` and the same `log_filename`.
+
+`ServerMode = Classic` in `firebird.conf` gives Limited at best; use `Super` or `SuperClassic`.
+
+A missing setting is shown as `audit.trace_settings_missing` with the setting's name. The dev service's [`dev/firebird/fbtrace.conf`](../dev/firebird/fbtrace.conf) is a complete example.
+
+**Log file permissions.**
+
+- The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them.
+- No account other than root, the server's account and the agent may read them. Give the agent a named-user ACL, and a default ACL on the directory so that the next log file after a rotation gets it too (an example to adapt, not tested on a real host: `setfacl -m u:databastion:rx <dir>`, `setfacl -m u:databastion:r <log>` and `setfacl -d -m u:databastion:r <dir>`, with the agent's account `databastion`); the server creates rotated files `0600`. Whether the default ACL is inherited under that mode is not confirmed yet (P10-D): after the first rotation, check with `getfacl <log>` that the agent's entry is effective (not masked). Otherwise the agent cannot read the new file and the stream stops with a gap (fail closed). With a group grant instead, every member of that group must be root, the server's account or the agent.
+- The server's account is taken from the server process, or from `peer_uid`; both must agree.
+- **An agent in a container cannot prove the readers check** (it does not see the host's identity files), so Partial needs the agent on the host for now. A refinement that lets you declare the host's identity files, mounted read-only, is planned.
+
+**Rotation.** Every rotation of the log (by the server's `max_log_size`, or any other) counts as a gap and caps the target for 24 h. Set `max_log_size` high enough, or to `0`, so that rotations are rare.
+
+**Backups.** Run backups through the services manager or over loopback TCP. An embedded `gbak` on the server host writes under its own process and makes its records ambiguous (24 h cap).
+
+**Untraced readers.** The database owner, `RDB$ADMIN` and holders of a utility system privilege (`USE_GBAK_UTILITY`, `USE_GFIX_UTILITY`, `USE_GSTAT_UTILITY` and the like) can read, within their object rights, **with no record in the trace**, so with no event. Grant these privileges only to accounts trusted to read without audit.
+
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
 
