@@ -613,13 +613,25 @@ log "Audit: EXECUTE STATEMENT ON EXTERNAL with a marker password as SYSDBA (fail
   printf "EXECUTE BLOCK AS DECLARE X INTEGER; BEGIN EXECUTE STATEMENT 'SELECT 1 FROM RDB\$DATABASE' ON EXTERNAL '127.0.0.1/3050:%s' AS USER 'E2E_ANALYST' PASSWORD '%s' INTO X; END^\n" "$FB_DB" "$MARK_EXT"
   printf 'SET TERM ; ^\n'
 } | fb_isql SYSDBA target_fb_sysdba_password && fail "EXECUTE STATEMENT ON EXTERNAL with a wrong password succeeded"
-log "Audit: ON EXTERNAL refused as expected ($(client_error_code))"
+# Review L5: refused for the reason intended, the inner attachment's login (measured on 5.0.4:
+# SQLSTATE 42000, "Execute statement error at attach", then gds 335544472), not any other error.
+if ! { grep -qF 'Execute statement error at attach' "$E2E_WORK_DIR/client.err" \
+    && grep -qE '^335544472 : ' "$E2E_WORK_DIR/client.err"; }; then
+  fail "EXECUTE STATEMENT ON EXTERNAL failed for another reason than the inner attachment's login ($(client_error_code))"
+fi
+log "Audit: ON EXTERNAL refused at the inner attachment's login, as intended ($(client_error_code), gds 335544472)"
 # M3: a failed attachment whose user name is a marker (a wrong password for an unknown user).
 log "Audit: a failed attachment as a marker user name"
 # shellcheck disable=SC2016 # a Firebird name
 printf 'SELECT 1 FROM RDB$DATABASE;\n' | fb_isql "$MARK_USER" target_client_password \
   && fail "the attachment as an unknown user succeeded"
-log "Audit: the marker user's attachment refused as expected ($(client_error_code))"
+# Review L5: a login failure (SQLSTATE 28000, the server's "user name and password are not
+# defined"), not any other error.
+if ! { grep -qF 'SQLSTATE = 28000' "$E2E_WORK_DIR/client.err" \
+    && grep -qF 'Your user name and password are not defined' "$E2E_WORK_DIR/client.err"; }; then
+  fail "the marker user's attachment failed for another reason than its login ($(client_error_code))"
+fi
+log "Audit: the marker user's attachment refused at login, as intended ($(client_error_code))"
 rm -f -- "$E2E_WORK_DIR/client.err"
 phase_done traffic
 
