@@ -15,22 +15,27 @@ case "$A" in '' | *[!0-9]*) echo "acl-layout: DATABASTION_DEV_AGENT_UID must be 
 [ "$A" -ne 0 ] && [ "$A" -ne 84 ] || { echo "acl-layout: DATABASTION_DEV_AGENT_UID must not be 0 or 84" >&2; exit 1; }
 D=/a
 L="$D/audit.log"
+# Security review N7: never follow a link planted on the volume.
+for p in "$D" "$L"; do
+  [ ! -L "$p" ] || { echo "acl-layout: a symbolic link on the volume, refused" >&2; exit 1; }
+done
 [ -e "$L" ] || touch "$L"
-chown 84:84 "$D" "$L"
+[ -f "$L" ] || { echo "acl-layout: the log is not a regular file" >&2; exit 1; }
+chown -h 84:84 "$D" "$L"
 chmod 0700 "$D"
 chmod 0600 "$L"
-setfacl -b "$D" "$L"
-setfacl -k "$D"
-setfacl -m "u::rwx,g::---,o::---,u:$A:rx,m::rx" "$D"
-setfacl -d -m "u::rw,g::---,m::r,o::---,u:$A:r" "$D"
-setfacl -m "u::rw,g::---,o::---,u:$A:r,m::r" "$L"
+setfacl -P -b "$D" "$L"
+setfacl -P -k "$D"
+setfacl -P -m "u::rwx,g::---,o::---,u:$A:rx,m::rx" "$D"
+setfacl -P -d -m "u::rw,g::---,m::r,o::---,u:$A:r" "$D"
+setfacl -P -m "u::rw,g::---,o::---,u:$A:r,m::r" "$L"
 # Rotated files the server already wrote: the log's entries.
 for f in "$L".* "$L"-*; do
   [ -f "$f" ] && [ ! -L "$f" ] || continue
-  chown 84:84 "$f"
+  chown -h 84:84 "$f"
   chmod 0600 "$f"
-  setfacl -b "$f"
-  setfacl -m "u::rw,g::---,o::---,u:$A:r,m::r" "$f"
+  setfacl -P -b "$f"
+  setfacl -P -m "u::rw,g::---,o::---,u:$A:r,m::r" "$f"
 done
 getfacl -cp "$D" "$L" >/dev/null
 echo "firebird audit layout: named-user ACLs for uid $A"
