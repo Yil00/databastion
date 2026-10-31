@@ -87,6 +87,154 @@ pub struct FirebirdAuditConfig {
     /// (Limited, label `databases_conf`).
     #[serde(default)]
     pub databases_conf: Option<std::path::PathBuf>,
+    /// The host's identity files, bind-mounted read-only into the agent's
+    /// container (ADR-0060 refinement of 2026-10-31, R44): accepted only
+    /// for an agent in a container, refused at load on the bare host.
+    #[serde(default)]
+    pub host_identity: Option<FirebirdHostIdentity>,
+}
+
+/// `firebird.audit.host_identity` (ADR-0060 R44): the host's passwd,
+/// group and NSS configuration files (and optionally its subordinate id
+/// files) as single-file read-only bind mounts, for the readers check of
+/// an agent in a container. The files are the operator's statement that
+/// they are the host's (R51); the connector checks them under R45 at every
+/// check. Never sent, never logged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirebirdHostIdentity {
+    /// The host's `/etc/passwd`.
+    pub passwd: std::path::PathBuf,
+    /// The host's `/etc/group`.
+    pub group: std::path::PathBuf,
+    /// The host's `/etc/nsswitch.conf` (R47).
+    pub nsswitch: std::path::PathBuf,
+    /// The host's `/etc/subuid` (R48 item 4a); without it, every uid of
+    /// 100000 or more is unprovable.
+    #[serde(default)]
+    pub subuid: Option<std::path::PathBuf>,
+    /// The host's `/etc/subgid` (R48 item 4a).
+    #[serde(default)]
+    pub subgid: Option<std::path::PathBuf>,
+    /// The only name the server's uid may carry in the declared passwd
+    /// file (R48 item 4).
+    #[serde(default)]
+    pub server_account: Option<String>,
+    /// The only name the agent's uid may carry in the declared passwd
+    /// file (R48 item 4).
+    #[serde(default)]
+    pub agent_account: Option<String>,
+}
+
+/// The default directory of the declared host identity files (R44, R52
+/// item 5: the agent image ships nothing under it).
+pub const HOST_IDENTITY_DIR: &str = "/run/databastion/host";
+
+/// Whether `name` is a user name of the shadow-utils default form
+/// (`[a-z_][a-z0-9_.-]*[$]?`, 1 to 32 bytes; ADR-0060 R44 item 4).
+#[must_use]
+pub fn account_name_ok(name: &str) -> bool {
+    let b = name.as_bytes();
+    let body = b.strip_suffix(b"$").unwrap_or(b);
+    !b.is_empty()
+        && b.len() <= 32
+        && body
+            .first()
+            .is_some_and(|c| c.is_ascii_lowercase() || *c == b'_')
+        && body.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-')
+        })
+}
+
+/// Whether `p` is a canonical absolute path: at most 4096 bytes, no empty,
+/// `.` or `..` component, no trailing `/`, no control character.
+fn canonical(p: &std::path::Path) -> bool {
+    let s = p.as_os_str().as_encoded_bytes();
+    p.is_absolute()
+        && s.len() <= MAX_AUDIT_PATH_BYTES
+        && !s.iter().any(|b| b.is_ascii_control())
+        && s.len() > 1
+        && s[1..]
+            .split(|b| *b == b'/')
+            .all(|part| !part.is_empty() && part != b"." && part != b"..")
+}
+
+impl FirebirdHostIdentity {
+    /// The declared files, with their keys.
+    #[must_use]
+    pub fn files(&self) -> Vec<(&'static str, &std::path::Path)> {
+        let mut v = vec![
+            ("audit.host_identity.passwd", self.passwd.as_path()),
+            ("audit.host_identity.group", self.group.as_path()),
+            ("audit.host_identity.nsswitch", self.nsswitch.as_path()),
+        ];
+        if let Some(p) = &self.subuid {
+            v.push(("audit.host_identity.subuid", p.as_path()));
+        }
+        if let Some(p) = &self.subgid {
+            v.push(("audit.host_identity.subgid", p.as_path()));
+        }
+        v
+    }
+
+    /// R44 item 4, against the rest of the `audit` block.
+    fn validate(&self, audit: &FirebirdAuditConfig) -> Result<(), (&'static str, &'static str)> {
+        let files = self.files();
+        for (key, p) in &files {
+            if !canonical(p) {
+                return Err((
+                    key,
+                    "must be a canonical absolute path (no empty, . or .. component, no \
+                     trailing /, no control character, at most 4096 bytes)",
+                ));
+            }
+        }
+        let mut others: Vec<&std::path::Path> = vec![
+            audit.log.as_path(),
+            audit.trace_config.as_path(),
+            audit.firebird_conf.as_path(),
+        ];
+        others.extend(audit.databases_conf.as_deref());
+        let log_dir = audit.log.parent();
+        for (i, (key, p)) in files.iter().enumerate() {
+            if files[..i].iter().any(|(_, q)| q == p) || others.contains(p) {
+                return Err((
+                    key,
+                    "must be distinct from the other declared files (host_identity, log, \
+                     trace_config, firebird_conf, databases_conf)",
+                ));
+            }
+            if p.starts_with(&audit.root) || log_dir.is_some_and(|d| p.starts_with(d)) {
+                return Err((key, "must not be under audit.root or the log's directory"));
+            }
+        }
+        for (key, name) in [
+            ("audit.host_identity.server_account", &self.server_account),
+            ("audit.host_identity.agent_account", &self.agent_account),
+        ] {
+            if name.as_deref().is_some_and(|n| !account_name_ok(n)) {
+                return Err((
+                    key,
+                    "must be a user name of 1 to 32 bytes matching [a-z_][a-z0-9_.-]*[$]?",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// R44 item 4: none of the declared files is under the agent's state
+    /// directory.
+    pub(crate) fn validate_state_dir(
+        &self,
+        state_dir: &std::path::Path,
+    ) -> Result<(), (&'static str, &'static str)> {
+        for (key, p) in self.files() {
+            if p.starts_with(state_dir) {
+                return Err((key, "must not be under the agent's state_dir"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Longest declared path of `firebird.audit`, in bytes.
@@ -95,16 +243,6 @@ pub const MAX_AUDIT_PATH_BYTES: usize = 4096;
 impl FirebirdAuditConfig {
     /// Local rules: `(key, reason)` on error, never the value.
     pub(crate) fn validate(&self) -> Result<(), (&'static str, &'static str)> {
-        let canonical = |p: &std::path::Path| {
-            let s = p.as_os_str().as_encoded_bytes();
-            p.is_absolute()
-                && s.len() <= MAX_AUDIT_PATH_BYTES
-                && !s.iter().any(|b| b.is_ascii_control())
-                && s.len() > 1
-                && s[1..]
-                    .split(|b| *b == b'/')
-                    .all(|part| !part.is_empty() && part != b"." && part != b"..")
-        };
         for (key, p) in [
             ("audit.log", &self.log),
             ("audit.trace_config", &self.trace_config),
@@ -141,6 +279,9 @@ impl FirebirdAuditConfig {
                 "audit",
                 "log, trace_config and firebird_conf must be distinct files",
             ));
+        }
+        if let Some(h) = &self.host_identity {
+            h.validate(self)?;
         }
         Ok(())
     }
@@ -258,6 +399,18 @@ impl FirebirdTargetConfig {
         passwd: Option<&str>,
         in_container: bool,
     ) -> Result<(), (&'static str, &'static str)> {
+        if self
+            .audit
+            .as_ref()
+            .is_some_and(|a| a.host_identity.is_some())
+            && !in_container
+        {
+            return Err((
+                "audit.host_identity",
+                "only for an agent in a container: on the host, the agent reads /etc/passwd, \
+                 /etc/group and /etc/nsswitch.conf directly",
+            ));
+        }
         let uid = resolve_peer_uid(
             self.peer_uid.as_ref(),
             self.peer_uid_root,
@@ -374,29 +527,67 @@ fn lookup_user(passwd: &str, name: &str) -> Option<u32> {
     })
 }
 
-/// Whether the agent runs in a container (decision 3, review L6): any of
-/// `/.dockerenv`, `/run/.containerenv` (Podman), a container runtime named
-/// in `/proc/1/cgroup`, a user namespace (`/proc/self/uid_map` not the
-/// identity map), `KUBERNETES_SERVICE_HOST` set, an overlay file system as
-/// the root (`/proc/self/mountinfo`), or a process 1 that is not pid 1 of
-/// the kernel (`/proc/1/sched`, a pid namespace). Any signal is enough: in
-/// a container a `peer_uid` name is refused (it would resolve against the
-/// agent image's `/etc/passwd`). Read once per configuration load.
+/// Whether the agent runs in a container (decision 3, review L6; ADR-0060
+/// R44 item 3 and R46 item 3): any of `/.dockerenv`, `/run/.containerenv`
+/// (Podman), `/run/systemd/container`, `/run/host/container-manager`, a
+/// container runtime named in `/proc/1/cgroup`, a user namespace
+/// (`/proc/self/uid_map` or `/proc/self/gid_map` not the identity map),
+/// `KUBERNETES_SERVICE_HOST` set, an overlay file system as the root
+/// (`/proc/self/mountinfo`), or a process 1 that is not pid 1 of the
+/// kernel (`/proc/1/sched`, a pid namespace). Any signal is enough: in a
+/// container a `peer_uid` name is refused (it would resolve against the
+/// agent image's `/etc/passwd`). Read at configuration load and, by the
+/// Firebird readers check, at every check (R44 item 3).
 #[must_use]
 pub fn agent_in_container() -> bool {
-    let read = |p: &str| std::fs::read_to_string(p).ok();
+    // Security review N1 (refinement of 2026-10-31): run at every check,
+    // so every `/proc` file is read through one handle checked to be on
+    // procfs, with a bound; a file that is not read gives no signal.
+    let read = |p: &str, bytes: usize, lines: usize| {
+        read_proc_bounded(p, bytes, lines).and_then(|b| String::from_utf8(b).ok())
+    };
     std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists()
+        || std::path::Path::new("/run/systemd/container").exists()
+        || std::path::Path::new("/run/host/container-manager").exists()
         || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
-        || read("/proc/1/cgroup").is_some_and(|t| cgroup_names_container(&t))
-        || read("/proc/self/uid_map").is_some_and(|t| uid_map_is_namespaced(&t))
-        || read("/proc/self/mountinfo").is_some_and(|t| root_is_overlay(&t))
-        || read("/proc/1/sched").is_some_and(|t| sched_pid_is_not_1(&t))
+        || read("/proc/1/cgroup", 1 << 20, 65_536).is_some_and(|t| cgroup_names_container(&t))
+        || read("/proc/self/uid_map", 64 << 10, 512).is_some_and(|t| uid_map_is_namespaced(&t))
+        || read("/proc/self/gid_map", 64 << 10, 512).is_some_and(|t| uid_map_is_namespaced(&t))
+        || read("/proc/self/mountinfo", 16 << 20, 65_536).is_some_and(|t| root_is_overlay(&t))
+        || read("/proc/1/sched", 64 << 10, 4096).is_some_and(|t| sched_pid_is_not_1(&t))
 }
 
-/// Whether a `/proc/self/uid_map` text is anything but the identity map
-/// of the initial user namespace (`0 0 4294967295`).
-pub(crate) fn uid_map_is_namespaced(text: &str) -> bool {
+/// Reads a `/proc` file through one handle (`O_NOFOLLOW` on the last
+/// component) checked to be on procfs (`fstatfs`), `None` when it is not
+/// there, not on procfs, or reaches either bound (`max_bytes` bytes or
+/// `max_lines` newlines): a bounded text is never read as if complete.
+#[must_use]
+pub fn read_proc_bounded(path: &str, max_bytes: usize, max_lines: usize) -> Option<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read;
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    if rustix::fs::fstatfs(&fd).ok()?.f_type != rustix::fs::PROC_SUPER_MAGIC {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::from(fd)
+        .take(max_bytes as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+    (bytes.len() < max_bytes && newlines < max_lines).then_some(bytes)
+}
+
+/// Whether a `/proc/self/uid_map` (or `gid_map`) text is anything but the
+/// identity map of the initial user namespace (`0 0 4294967295`).
+#[must_use]
+pub fn uid_map_is_namespaced(text: &str) -> bool {
     let lines: Vec<Vec<&str>> = text
         .lines()
         .take(340)
@@ -553,6 +744,129 @@ mod tests {
         );
     }
 
+    /// ADR-0060 R44: the `host_identity` block, its path rules, the
+    /// account names and the refusal on the bare host.
+    #[test]
+    fn host_identity_block_rules() {
+        let base = "databases: [{name: a, attach: a}]";
+        let audit = "log: /var/log/fb/audit.log, trace_config: /opt/firebird/fbtrace.conf, \
+                     firebird_conf: /opt/firebird/firebird.conf, root: /opt/firebird";
+        let hi = "passwd: /run/databastion/host/passwd, group: /run/databastion/host/group, \
+                  nsswitch: /run/databastion/host/nsswitch.conf";
+        let with = |extra: &str| {
+            block(&format!(
+                "{{{base}, peer_uid: 84, audit: {{{audit}, host_identity: {{{hi}{extra}}}}}}}"
+            ))
+        };
+        let ok = with(
+            ", subuid: /run/databastion/host/subuid, subgid: /run/databastion/host/subgid, \
+             server_account: firebird, agent_account: databastion",
+        );
+        assert!(ok.validate().is_ok());
+        // Refused at load on the bare host, accepted in a container.
+        let mut bare = ok.clone();
+        assert_eq!(
+            bare.resolve(None, false).unwrap_err().0,
+            "audit.host_identity"
+        );
+        let mut inside = ok.clone();
+        assert!(inside.resolve(None, true).is_ok());
+        assert_eq!(inside.peer_uid(), Some(84));
+        // Without the block, nothing changes on the bare host.
+        let mut plain = block(&format!("{{{base}, peer_uid: 84, audit: {{{audit}}}}}"));
+        assert!(plain.resolve(None, false).is_ok());
+        // passwd, group and nsswitch are required; no unknown key.
+        for missing in [
+            "group: /h/group, nsswitch: /h/ns",
+            "passwd: /h/passwd, nsswitch: /h/ns",
+            "passwd: /h/passwd, group: /h/group",
+        ] {
+            assert!(
+                serde_yaml_ng::from_str::<FirebirdTargetConfig>(&format!(
+                    "{{{base}, audit: {{{audit}, host_identity: {{{missing}}}}}}}"
+                ))
+                .is_err(),
+                "{missing}"
+            );
+        }
+        assert!(
+            serde_yaml_ng::from_str::<FirebirdTargetConfig>(&format!(
+                "{{{base}, audit: {{{audit}, host_identity: {{{hi}, shadow: /h/shadow}}}}}}"
+            ))
+            .is_err()
+        );
+        // Path rules (R44 item 4).
+        for (extra, key) in [
+            (", subuid: run/x", "audit.host_identity.subuid"),
+            (", subuid: /run/../x", "audit.host_identity.subuid"),
+            (", subuid: /run/x/", "audit.host_identity.subuid"),
+            (", subuid: /run/./x", "audit.host_identity.subuid"),
+            (
+                ", subuid: /run/databastion/host/passwd",
+                "audit.host_identity.subuid",
+            ),
+            (
+                ", subgid: /opt/firebird/fbtrace.conf",
+                "audit.host_identity.subgid",
+            ),
+            (
+                ", subgid: /var/log/fb/audit.log",
+                "audit.host_identity.subgid",
+            ),
+            (
+                ", subuid: /opt/firebird/passwd",
+                "audit.host_identity.subuid",
+            ),
+            (", subuid: /var/log/fb/subuid", "audit.host_identity.subuid"),
+        ] {
+            assert_eq!(with(extra).validate().unwrap_err().0, key, "{extra}");
+        }
+        let long = format!(", subuid: /{}", "a".repeat(MAX_AUDIT_PATH_BYTES));
+        assert_eq!(
+            with(&long).validate().unwrap_err().0,
+            "audit.host_identity.subuid"
+        );
+        let ctl = with(", subuid: \"/run/a\\tb\"");
+        assert_eq!(ctl.validate().unwrap_err().0, "audit.host_identity.subuid");
+        // Under the state directory.
+        let h = ok.audit.as_ref().unwrap().host_identity.as_ref().unwrap();
+        assert!(
+            h.validate_state_dir(std::path::Path::new("/var/lib/databastion"))
+                .is_ok()
+        );
+        assert_eq!(
+            h.validate_state_dir(std::path::Path::new("/run/databastion"))
+                .unwrap_err()
+                .0,
+            "audit.host_identity.passwd"
+        );
+        // Account names (N5): the shadow-utils default form only.
+        for good in ["firebird", "_fb", "fb-1.x", "a$", "databastion"] {
+            assert!(account_name_ok(good), "{good}");
+        }
+        for bad in [
+            "",
+            "Firebird",
+            "1fb",
+            "-fb",
+            "fb$x",
+            "f b",
+            "fé",
+            "$",
+            &"a".repeat(33),
+        ] {
+            assert!(!account_name_ok(bad), "{bad:?}");
+        }
+        assert_eq!(
+            with(", server_account: Firebird").validate().unwrap_err().0,
+            "audit.host_identity.server_account"
+        );
+        assert_eq!(
+            with(", agent_account: \"a b\"").validate().unwrap_err().0,
+            "audit.host_identity.agent_account"
+        );
+    }
+
     #[test]
     fn attach_forms() {
         for good in [
@@ -659,6 +973,20 @@ mod tests {
         let yaml: FirebirdTargetConfig =
             serde_yaml_ng::from_str("{peer_uid: 84, databases: [{name: a, attach: a}]}").unwrap();
         assert_eq!(yaml.peer_uid, Some(PeerUid::Number(84)));
+    }
+
+    /// Security review N1: bounded reads on procfs only.
+    #[test]
+    fn proc_reads_are_bounded_and_on_procfs() {
+        let m = read_proc_bounded("/proc/self/mountinfo", 16 << 20, 65_536).unwrap();
+        assert!(!m.is_empty());
+        assert!(read_proc_bounded("/proc/self/mountinfo", 8, 65_536).is_none());
+        assert!(read_proc_bounded("/proc/self/mountinfo", 16 << 20, 1).is_none());
+        assert!(read_proc_bounded("/proc/no-such-file", 1 << 20, 10).is_none());
+        let off = std::env::temp_dir().join(format!("fb-proc-{}", std::process::id()));
+        std::fs::write(&off, "0 0 4294967295\n").unwrap();
+        assert!(read_proc_bounded(off.to_str().unwrap(), 1 << 20, 10).is_none());
+        let _ = std::fs::remove_file(&off);
     }
 
     #[test]

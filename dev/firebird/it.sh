@@ -28,7 +28,14 @@
 # from a read-only bind mount (the entrypoint runs as root); the tests read the agent passwords
 # from their files (FIREBIRD_IT_*_PASSWORD_FILE, `secret: {file: …}`). No password is on a command
 # line, in an environment variable of the build, or in a committed image's configuration.
-# Everything is removed at exit. Ports, all inside the namespace: FIREBIRD_PORT (default 13050),
+# Host identity files (ADR-0060 refinement of 2026-10-31, R52 items 1 to 3): a last step runs
+# it::host_identity in a private mount namespace (`unshare --mount`, root or sudo for the namespace
+# only) on a tmpfs over /mnt: the calling host's own /etc/passwd, /etc/group and /etc/nsswitch.conf
+# bind-mounted read-only file by file, and the negative mounts (read-write, a plain file, a stale
+# mount, a symbolic link, a file not owned by root, a group-writable file); the dev log layout
+# (named-user ACLs) and the earlier group layout (the negative case) are prepared as root, then the
+# checks run as uid 10001 with no supplementary group. It needs no server and changes nothing on the
+# host. Everything is removed at exit. Ports, all inside the namespace: FIREBIRD_PORT (default 13050),
 # + 1 to + 5 for the variants, + 10 for the forwarder. COMPOSE_PROJECT_NAME prefixes the
 # container names, so parallel runs do not collide.
 set -euo pipefail
@@ -533,3 +540,40 @@ run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" 
   FIREBIRD_IT_DEFECT_LOG="$WORK/defect.log" \
   FIREBIRD_IT_TZ_OFFSET="${FIREBIRD_IT_TZ_OFFSET:-0}" \
   FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_BOOLEANS_FILE="$WORK/booleans.txt"
+
+# 5. The host identity files of the readers check (ADR-0060 refinement of 2026-10-31, R52 items 1
+# to 3), on the real kernel: single-file read-only bind mounts of this host's own identity files in
+# a private mount namespace (nothing outside it changes; the tmpfs goes with it), the negative
+# mounts next to them, then the checks as the agent image's uid.
+echo "[it] host identity files: single-file bind mounts" >&2
+# shellcheck disable=SC2016 # The inner shell's variables.
+timeout 600 $SUDO unshare --mount --propagation private -- /bin/sh -eu -c '
+  M=/mnt
+  mount -t tmpfs -o mode=0755,size=2g databastion-it-hostid "$M"
+  mkdir -m 0755 "$M/host" "$M/src" "$M/bin"
+  install -m 0755 "$1" "$M/bin/it"
+  ro_bind() { # source target
+    : > "$2"
+    mount --bind "$1" "$2"
+    mount -o remount,bind,ro "$2"
+  }
+  for f in passwd group nsswitch.conf; do ro_bind "/etc/$f" "$M/host/$f"; done
+  : > "$M/host/rw-passwd"
+  mount --bind /etc/passwd "$M/host/rw-passwd"
+  install -m 0644 /etc/passwd "$M/host/plain"
+  install -m 0644 /etc/passwd "$M/src/stale"
+  ro_bind "$M/src/stale" "$M/host/stale"
+  install -m 0644 /etc/passwd "$M/src/stale.new"
+  mv "$M/src/stale.new" "$M/src/stale"
+  ln -s "$M/host/passwd" "$M/host/link"
+  install -m 0644 -o 5 -g 5 /etc/passwd "$M/src/owned"
+  ro_bind "$M/src/owned" "$M/host/owned"
+  install -m 0664 /etc/passwd "$M/src/gw"
+  ro_bind "$M/src/gw" "$M/host/gw"
+  ln -s "$M/host" "$M/hostlink"
+  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 FIREBIRD_IT_HOSTID_DIR="$M" FIREBIRD_IT_HOSTID_PREPARE=1 \
+    "$M/bin/it" it::host_identity::prepare --exact --nocapture
+  setpriv --reuid 10001 --regid 10001 --clear-groups -- \
+    env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 FIREBIRD_IT_HOSTID_DIR="$M" \
+    "$M/bin/it" it::host_identity::checks --exact --nocapture
+' sh "$EXE"

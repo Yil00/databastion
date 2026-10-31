@@ -586,26 +586,25 @@ services:
   # container of it drops NET_RAW and NET_ADMIN (dev/README.md, "Firebird"). Audit (lot 3): the
   # system audit trace configured by firebird/firebird.conf (AuditTraceConfigFile) and
   # firebird/fbtrace.conf (every setting of the Partial proofs), its log on the volume
-  # `firebird-audit`, prepared by firebird-audit-init: owner the server (84), group the agent's
-  # (DATABASTION_DEV_AGENT_GID, 10001 by default), the log 0640, so the agent can read it and not
-  # write it (ADR-0060 R4); mount the volume read-only into the agent's container.
+  # `firebird-audit`, prepared by firebird-audit-init (ADR-0060 refinement of 2026-10-31, R52
+  # item 1): owner the server (84), no group or other access, the agent's uid
+  # (DATABASTION_DEV_AGENT_UID, 10001 by default) reading the log through a named-user ACL and the
+  # next log file through the directory's default ACL (firebird/acl-init/layout.sh), so the agent
+  # can read it and not write it, and no group grants read (R4, R47 item 4). Mount the volume
+  # read-only into the agent's container. Whether the volume's file system keeps ACLs is checked in
+  # P10-D. The earlier group layout (0640, directory 2750 with the agent's gid) is a negative case
+  # of dev/firebird/it.sh.
   firebird-audit-init:
-    image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    build: ./firebird/acl-init
+    image: databastion-dev/firebird-acl-init:5.0.4
     profiles: [firebird]
     user: "0:0"
     network_mode: none
     cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     security_opt: ["no-new-privileges:true"]
     environment:
-      DATABASTION_DEV_AGENT_GID: ${DATABASTION_DEV_AGENT_GID:-10001}
-    command:
-      - sh
-      - -c
-      - >-
-        chown 84:"$$DATABASTION_DEV_AGENT_GID" /a && chmod 2750 /a &&
-        { [ -e /a/audit.log ] || touch /a/audit.log; } &&
-        chown 84:"$$DATABASTION_DEV_AGENT_GID" /a/audit.log && chmod 0640 /a/audit.log
+      DATABASTION_DEV_AGENT_UID: ${DATABASTION_DEV_AGENT_UID:-10001}
     volumes:
       - firebird-audit:/a
     restart: "no"

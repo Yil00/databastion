@@ -28,13 +28,28 @@ RUN cargo build --release --locked -p databastion-agent \
  && install -D -m 0755 target/release/databastion-agent /out/databastion-agent \
  && install -d -m 0700 -o 10001 -g 10001 /out/varlib/databastion
 
+# ---------------------------------------------------------------- base
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS base
+
+# ---------------------------------------------------------------- image check
+# ADR-0060 refinement of 2026-10-31, R52 item 5 (security review N4): the image ships nothing under
+# /run/databastion, the directory of the default declared Firebird host identity files
+# (firebird.audit.host_identity), so that a declared path that is not mounted names no file of the
+# image. The base image's tree is checked here; the runtime stage copies its binary from this stage,
+# so the image is not built without the check, and its own COPY steps write under /usr/local/bin and
+# /var/lib only (crates/agent/tests/architecture.rs, `the_agent_image_ships_nothing_under_run_databastion`).
+FROM build AS image-check
+COPY --from=base / /image-root/
+RUN test ! -e /image-root/run/databastion \
+ && echo "image check: nothing under /run/databastion"
+
 # ---------------------------------------------------------------- runtime
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
+FROM base AS runtime
 LABEL org.opencontainers.image.title="databastion-agent" \
       org.opencontainers.image.source="https://github.com/yil00/databastion" \
       org.opencontainers.image.licenses="Apache-2.0"
 # Binary owned by root, not writable by the runtime user.
-COPY --from=build --chown=0:0 --chmod=0755 /out/databastion-agent /usr/local/bin/databastion-agent
+COPY --from=image-check --chown=0:0 --chmod=0755 /out/databastion-agent /usr/local/bin/databastion-agent
 # State directory: owned by the agent user, 0700 (the agent refuses a group / world writable
 # state_dir). An empty named volume mounted here inherits this owner and mode.
 # The parent is copied so that `databastion/` is itself a copied entry and keeps its 0700 mode:

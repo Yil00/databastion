@@ -1317,15 +1317,30 @@ impl AgentConfig {
                     && !matches!(&f.peer_uid, Some(firebird::PeerUid::Name(n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
             })
         });
-        let (passwd, in_container) = if names_a_user {
-            (
-                std::fs::read_to_string("/etc/passwd").ok(),
-                firebird::agent_in_container(),
-            )
-        } else {
-            (None, false)
-        };
+        // ADR-0060 R44 item 3: `host_identity` only in a container,
+        // detected at load (and at every check by the connector).
+        let host_identity = self.targets.iter().any(|t| {
+            t.firebird
+                .as_ref()
+                .and_then(|f| f.audit.as_ref())
+                .is_some_and(|a| a.host_identity.is_some())
+        });
+        let passwd = names_a_user
+            .then(|| std::fs::read_to_string("/etc/passwd").ok())
+            .flatten();
+        let in_container = (names_a_user || host_identity) && firebird::agent_in_container();
+        let state_dir = self.state_dir.clone();
         for (i, t) in self.targets.iter_mut().enumerate() {
+            if let Some(h) = t
+                .firebird
+                .as_ref()
+                .and_then(|f| f.audit.as_ref())
+                .and_then(|a| a.host_identity.as_ref())
+            {
+                h.validate_state_dir(&state_dir).map_err(|(key, reason)| {
+                    invalid(format!("targets[{i}].firebird.{key}"), reason)
+                })?;
+            }
             if let Some(f) = t.firebird.as_mut() {
                 f.resolve(passwd.as_deref(), in_container)
                     .map_err(|(key, reason)| {
@@ -1385,6 +1400,9 @@ impl AgentConfig {
                     a.firebird_conf.clone(),
                 ]);
                 files.extend(a.databases_conf.clone());
+                if let Some(h) = &a.host_identity {
+                    files.extend(h.files().into_iter().map(|(_, p)| p.to_owned()));
+                }
             }
         }
         for f in files.into_iter().filter(|f| f.is_absolute()) {
@@ -2543,6 +2561,46 @@ targets:
         assert_eq!(fb.peer_uid(), Some(84));
         assert_eq!(fb.databases[0].attach, "appdb");
         assert!(!fb.tunnel && !fb.extended_grants);
+        assert!(fb.audit.as_ref().unwrap().host_identity.is_none());
+        // ADR-0060 R44: the `host_identity` example uncommented, accepted
+        // only for an agent in a container.
+        let hi: String = text[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.strip_prefix("  # ").map(|r| format!("  {r}"))?;
+                let t = l.trim_start();
+                let key = t.strip_prefix("#   ").is_some_and(|k| !k.starts_with('#'));
+                if t.starts_with("# tunnel:")
+                    || t.starts_with("# extended_grants:")
+                    || t.starts_with("# host_identity:")
+                    || key
+                {
+                    Some(l.replacen("# ", "", 1))
+                } else if t.starts_with('#') {
+                    None
+                } else {
+                    Some(l)
+                }
+            })
+            .map(|l| l.replace("peer_uid: firebird", "peer_uid: 84") + "\n")
+            .collect();
+        assert!(hi.contains("host_identity:") && hi.contains("agent_account: databastion"));
+        let parsed = parse(&format!("{base}targets:\n{hi}"));
+        if firebird::agent_in_container() {
+            let cfg = parsed.unwrap_or_else(|e| panic!("{e}\n{hi}"));
+            let h = cfg.targets[0]
+                .firebird_settings()
+                .unwrap()
+                .audit
+                .as_ref()
+                .unwrap();
+            let h = h.host_identity.as_ref().unwrap();
+            assert_eq!(h.files().len(), 5);
+            assert_eq!(h.server_account.as_deref(), Some("firebird"));
+        } else {
+            let e = parsed.unwrap_err().to_string();
+            assert!(e.contains("targets[0].firebird.audit.host_identity"), "{e}");
+        }
     }
 
     /// The commented SQL Server target of the example file is valid once

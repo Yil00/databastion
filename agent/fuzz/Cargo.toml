@@ -334,6 +334,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "firebird_host_identity"
+path = "fuzz_targets/firebird_host_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "firebird_statement"
 path = "fuzz_targets/firebird_statement.rs"
 test = false
