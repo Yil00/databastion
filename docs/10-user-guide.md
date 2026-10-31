@@ -518,10 +518,47 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 
 **Log file permissions.**
 
-- The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them.
-- No account other than root, the server's account and the agent may read them. Give the agent a named-user ACL, and a default ACL on the directory so that the next log file after a rotation gets it too (an example to adapt, not tested on a real host: `setfacl -m u:databastion:rx <dir>`, `setfacl -m u:databastion:r <log>` and `setfacl -d -m u:databastion:r <dir>`, with the agent's account `databastion`); the server creates rotated files `0600`. Whether the default ACL is inherited under that mode is not confirmed yet (P10-D): after the first rotation, check with `getfacl <log>` that the agent's entry is effective (not masked). Otherwise the agent cannot read the new file and the stream stops with a gap (fail closed). With a group grant instead, every member of that group must be root, the server's account or the agent.
-- The server's account is taken from the server process, or from `peer_uid`; both must agree.
-- **An agent in a container cannot prove the readers check** (it does not see the host's identity files), so Partial needs the agent on the host for now. A refinement that lets you declare the host's identity files, mounted read-only, is accepted (ADR-0060 refinement of 2026-10-31) and comes with its agent lot.
+- The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them. Run the agent as a dedicated account, never as root: with root, every file counts as writable by the agent and the readers check always fails (`host_identity_refused (passwd: writable)` in the agent's log).
+- No account other than root, the server's account and the agent may read them. The server's account is taken from the server process, or from `peer_uid`; both must agree.
+- **Use named-user ACLs, not a group.** The server owns the directory and the log, with no group or other access, and the agent reads them through a named-user ACL; a default ACL on the directory gives the next log file after a rotation the same entries. With the server's account owning the files and the agent's account `databastion` (the layout of the dev service, [`dev/firebird/acl-init/layout.sh`](../dev/firebird/acl-init/layout.sh)):
+  ```sh
+  chmod 0700 <dir>; chmod 0600 <log>
+  setfacl -m 'u::rwx,g::---,o::---,u:databastion:rx,m::rx' <dir>
+  setfacl -d -m 'u::rw,g::---,m::r,o::---,u:databastion:r' <dir>
+  setfacl -m 'u::rw,g::---,o::---,u:databastion:r,m::r' <log>
+  ```
+  The server creates rotated files `0600`. Whether the default ACL is inherited under that mode is not confirmed yet (P10-D): after the first rotation, check with `getfacl <log>` that the agent's entry `user:databastion:r--` is there and not masked (no `#effective:---` next to it). Otherwise the agent cannot read the new file and the stream stops with a gap (fail closed).
+- **A group that grants read** counts only when every member, named in the group file or by primary group, is root, the server's account or the agent, and when the group file is the only source of groups (below). Prefer the named-user layout.
+- **What the agent reads to decide** (at every check, on the host): `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, and `/etc/subuid` and `/etc/subgid` when present, each owned by root and not writable by group or other (a symbolic link is followed only when every link and directory under `/etc` is root's). It needs Linux 5.6 or later. Consequences:
+  - a `passwd:` line in `nsswitch.conf` that names a source other than `files` and `systemd` (LDAP, SSSD, NIS…) fails the check: users from another source cannot be proven;
+  - a `group:` or `initgroups:` line with any source other than `files` makes every group that grants read count as open. The stock Debian and Ubuntu `group: files systemd` is such a line: use the named-user layout there;
+  - the server's and the agent's uids must not be 65534, 4294967294 or 4294967295, nor lie in a subordinate id range (`/etc/subuid`) or one of systemd's ranges (60001 to 60513, 61184 to 65519, 524288 to 1879048191, 2147352576 to 2147418111); a group that grants read in such a range counts as open;
+  - a host whose root file system is an overlay (a live system, composefs) is taken for a container, and gets no Partial from its own files.
+
+**Agent in a container.** The agent cannot read the host's identity files from its image, so you declare them in the target's `audit` block, each bind-mounted read-only from the host. Without this block, an agent in a container gets no Partial (`agent_in_container` in its log).
+
+```yaml
+      audit:
+        # … root, firebird_conf, databases_conf, trace_config, log …
+        host_identity:
+          passwd: /run/databastion/host/passwd           # the host's /etc/passwd
+          group: /run/databastion/host/group             # the host's /etc/group
+          nsswitch: /run/databastion/host/nsswitch.conf  # the host's /etc/nsswitch.conf
+          subuid: /run/databastion/host/subuid           # optional: the host's /etc/subuid
+          subgid: /run/databastion/host/subgid           # optional: the host's /etc/subgid
+          server_account: firebird                       # optional: the only name the server's uid may have on the host
+          agent_account: databastion                     # optional: the only name the agent's uid may have on the host
+```
+
+- **Each file is its own single-file, read-only bind mount from the host**, at exactly the declared path, for example `- /etc/passwd:/run/databastion/host/passwd:ro` in Compose. Use **host bind mounts only** (`hostPath` on Kubernetes), **never a ConfigMap, a Secret or an `emptyDir`**: the agent checks that each file is owned by root, not writable, has one hard link, and is the root of its own read-only mount, but it cannot check where the mount comes from. A file of the image itself, a writable mount or a whole mounted directory is refused.
+- **The agent trusts the container definition.** The declared files are your statement that they are the host's. Whoever can edit the agent's container definition (a Compose file, a pod specification) or the mounted files can make the check pass for a log others can read: keep that definition as trusted as the host's root. On Kubernetes, where `hostPath` mounts of `/etc` files may be disallowed, an agent installed on the node may be simpler.
+- **Restart the agent's container after a change of host accounts or groups.** Tools that edit `/etc/passwd` or `/etc/group` replace the file, which leaves the mount on the old one; the agent refuses that stale mount until the container restarts.
+- **Without the subordinate id files**, every uid or gid of 100000 or more is treated as subordinate.
+- **Uids**: the server's and the agent's uids must be absent from the host's passwd file, or present there only under `server_account` / `agent_account` (otherwise `uid_collision`). `peer_uid` must be numeric in a container.
+- **The agent must not run as root**, and its uid and gid maps must be the identity (no user namespace: rootless Docker, `userns-remap` or `hostUsers: false` give no Partial).
+- **Namespaces**: the agent's container shares the server's network namespace (`network_mode: service:<firebird>`, as for any Firebird target in a container) and its pid namespace (`pid: service:<firebird>` when the server runs in a container, `pid: host` when it runs on the host, which shows every host process to the agent). Every container of that network namespace drops `NET_RAW` and `NET_ADMIN`.
+- **Paths**: mount the Firebird root, the configuration files and the log directory into the agent's container read-only **at the same paths** as the server sees them.
+- Needs Linux 5.8 or later. A refused file is named in the agent's log by its role and the reason, for example `host_identity_refused (passwd: mount)`, never by its path.
 
 **Rotation.** Every rotation of the log (by the server's `max_log_size`, or any other) counts as a gap and caps the target for 24 h. Set `max_log_size` high enough, or to `0`, so that rotations are rare.
 
