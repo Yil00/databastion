@@ -362,12 +362,17 @@ pub(crate) fn readers_with(
         let acl = acl_entries(p, "system.posix_acl_access");
         others_can(&m, need, acl.as_deref(), &groups, &allowed)
     };
-    if check(path, 0o4) {
-        return Err("log_readable_by_others");
-    }
     let Some(dir) = path.parent() else {
         return Err("log_directory_unknown");
     };
+    // Security review N3: a directory that is a symbolic link has its own
+    // reason (and counts as open).
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("log_directory_is_a_symlink");
+    }
+    if check(path, 0o4) {
+        return Err("log_readable_by_others");
+    }
     if check(dir, 0o4) {
         return Err("log_directory_readable_by_others");
     }
@@ -396,11 +401,13 @@ pub(crate) fn readers_with(
             return Err("log_directory_unreadable");
         };
         let f = e.file_name();
-        let Some(f) = f.to_str() else { continue };
         let rotated = f
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'));
-        if rotated && check(&dir.join(f), 0o4) {
+            .as_encoded_bytes()
+            .strip_prefix(name.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b".") || rest.starts_with(b"-"));
+        // Security review N5: a rotated name that is not UTF-8 counts as
+        // open rather than being skipped.
+        if rotated && (f.to_str().is_none() || check(&dir.join(&f), 0o4)) {
             return Err("rotated_log_readable_by_others");
         }
     }
@@ -772,6 +779,27 @@ mod tests {
             readers_with(&log, me, None, me, &id),
             Err("rotated_log_readable_by_others")
         );
+        std::fs::remove_file(dir.join("audit.log.1")).unwrap();
+        assert_eq!(readers_with(&log, me, None, me, &id), Ok(()));
+        // Review N5: a rotated name that is not UTF-8 counts as open.
+        use std::os::unix::ffi::OsStrExt;
+        let odd = dir.join(std::ffi::OsStr::from_bytes(b"audit.log.\xff"));
+        std::fs::write(&odd, b"z").unwrap();
+        std::fs::set_permissions(&odd, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            readers_with(&log, me, None, me, &id),
+            Err("rotated_log_readable_by_others")
+        );
+        std::fs::remove_file(&odd).unwrap();
+        // Review N3: a log directory that is a symbolic link.
+        let alias = dir.with_extension("alias");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        assert_eq!(
+            readers_with(&alias.join("audit.log"), me, None, me, &id),
+            Err("log_directory_is_a_symlink")
+        );
+        let _ = std::fs::remove_file(&alias);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
