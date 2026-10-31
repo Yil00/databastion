@@ -6,14 +6,15 @@ import { heldAccepts } from "./capabilities";
 /**
  * Recurring signals of `DATABASTION_AGENT_TOKENS_HOLD` (ADR-0022 decision 8; security review of the
  * token hold, L1): while the hold is set, the ADR-0053, ADR-0055 and ADR-0056 detection rules do
- * not apply to new items (no agent sends those fields), and with `0.9` no SQLite target is
- * reported (ADR-0059), so a hold left set after the upgrade must stay visible: a startup
+ * not apply to new items (no agent sends those fields), and with `0.8` or `0.9` no SQLite
+ * (ADR-0059) or Firebird (ADR-0060) target is reported, so a hold left set after the upgrade must stay visible: a startup
  * warning, a warning at most once an hour from the heartbeat path of each web process, and the `databastion_console_agent_tokens_hold` gauge (src/server/metrics.ts).
  */
 
 /**
  * The ADR behind each token a hold can hold back, named in the warning: ADR-0053, ADR-0055 and
- * ADR-0056 detection rules, and the SQLite targets of ADR-0059 (not reported while held).
+ * ADR-0056 detection rules, the SQLite targets of ADR-0059 and the Firebird targets and labels of
+ * ADR-0060 (not reported while held).
  */
 const HELD_TOKEN_ADRS: Partial<Record<string, string>> = {
   "access_event.objects_overflowed": "ADR-0053",
@@ -21,6 +22,8 @@ const HELD_TOKEN_ADRS: Partial<Record<string, string>> = {
   "location.altered": "ADR-0056",
   "object_ref.altered": "ADR-0056",
   "engine.sqlite": "ADR-0059",
+  "engine.firebird": "ADR-0060",
+  "target_status.note_labels.2026_10_d": "ADR-0060",
 };
 
 /** At most one recurring hold warning per process and hour. */

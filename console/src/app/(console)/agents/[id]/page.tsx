@@ -244,7 +244,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                     <TableCell>{t.auditSource ?? ""}</TableCell>
                     <TableCell>{t.lastError ?? ""}</TableCell>
                     <TableCell className="max-w-80 whitespace-normal">
-                      <TargetNotes notes={t.notes} />
+                      <TargetNotes notes={t.notes} engine={t.engine} />
                     </TableCell>
                     <TableCell className="max-w-56 whitespace-normal">
                       <TargetNameCase engine={t.engine} rule={t.nameCase} inventory={nameCaseInventories.get(t.targetId)} now={now} />
