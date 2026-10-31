@@ -29,8 +29,10 @@ setfacl -P -k "$D"
 setfacl -P -m "u::rwx,g::---,o::---,u:$A:rx,m::rx" "$D"
 setfacl -P -d -m "u::rw,g::---,m::r,o::---,u:$A:r" "$D"
 setfacl -P -m "u::rw,g::---,o::---,u:$A:r,m::r" "$L"
-# Rotated files the server already wrote: the log's entries.
-for f in "$L".* "$L"-*; do
+# Rotated files already there: the log's entries. The server names them audit.<timestamp>.log
+# (PluginLogWriter, at the last dot of the log's name); an external rotation, audit.log.* or
+# audit.log-*.
+for f in "$D"/audit.*.log "$L".* "$L"-*; do
   [ -f "$f" ] && [ ! -L "$f" ] || continue
   chown -h 84:84 "$f"
   chmod 0600 "$f"

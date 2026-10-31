@@ -28,6 +28,16 @@
 //!   offset. A different inode at the path means the file was rotated
 //!   while the agent was stopped: the new file is read from its start (the
 //!   tail of the old one is lost; a warning is logged).
+//! - Rotation while running: the old file is read to its end, then the
+//!   path is reopened. When the new file cannot be opened (not readable,
+//!   a symlink, refused by the open check), the records read from the end
+//!   of the old file are returned first (`more` set) and the next poll
+//!   fails (the same for a read error after some records were read); the
+//!   closed file is reported once by [`Tailer::take_ended`], so that a
+//!   source ends what it holds of it; no cursor is saved while no file is open, so once the new
+//!   file opens it is read from its start (through the saved cursor, as
+//!   after a restart; without a cursor store too, since security review L3
+//!   of #392, no longer from its end as at a first start).
 //! - The cursor also keeps a keyed fingerprint of the [`FP_BYTES`] bytes
 //!   of the file just before its offset, and before the end of what was
 //!   read when it holds a replay: HMAC-SHA256 with a sub-key of the agent
@@ -147,6 +157,11 @@ fn csv_record_start(seg: &[u8]) -> bool {
 
 /// Most bytes read per poll.
 pub const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+/// With the line framings ([`Framing::Lines`], [`Framing::LinesKeepingEmpty`]),
+/// a poll also stops after the chunk that brings it to this many records:
+/// an empty line (or, with [`Framing::Lines`], a bare `\r\n`) is a record,
+/// so [`MAX_POLL_BYTES`] alone would let a poll hold millions of them.
+pub const MAX_POLL_LINE_RECORDS: usize = 64 * 1024;
 /// Read chunk.
 const CHUNK: usize = 256 * 1024;
 /// Bytes before the offset compared at each poll (in-place rewrite).
@@ -167,8 +182,13 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
     /// One record per line (`jsonlog`, `server_audit`, `audit_log` JSON
-    /// lines).
+    /// lines). An empty line gives no record.
     Lines,
+    /// One record per line, as [`Framing::Lines`] (same bound, same `\r`
+    /// handling, same positions and alignment), except that an empty line
+    /// is a record too (an empty one): the Firebird trace log, whose
+    /// records end with empty lines that its grammar requires.
+    LinesKeepingEmpty,
     /// CSV records: a newline inside a quoted field does not end the
     /// record (`csvlog`).
     Csv,
@@ -197,6 +217,10 @@ pub struct Splitter {
     /// Records completed by the last `feed`: (index after their last byte
     /// in the data fed, bytes since the previous record boundary).
     ends: Vec<(usize, u64)>,
+    /// Records skipped for their size by the last `feed`: the number of
+    /// records in `out` when each skipped record ended (the index of the
+    /// first record after it).
+    skips: Vec<usize>,
     /// Records skipped for their size.
     pub oversized: u64,
     /// Records dropped as damaged ([`Framing::JsonObjects`]; with
@@ -276,6 +300,7 @@ impl Splitter {
             skipping: false,
             pending: 0,
             ends: Vec::new(),
+            skips: Vec::new(),
             oversized: 0,
             malformed: 0,
             max,
@@ -335,8 +360,8 @@ impl Splitter {
     /// `write`s). `after_newline`: the byte before the offset is a
     /// newline.
     ///
-    /// - [`Framing::Lines`]: the first record is dropped unless the offset
-    ///   follows a newline.
+    /// - [`Framing::Lines`] and [`Framing::LinesKeepingEmpty`]: the first
+    ///   record is dropped unless the offset follows a newline.
     /// - [`Framing::Csv`]: the offset may lie inside a quoted field, where
     ///   a newline does not end a record; a quote state taken as "outside"
     ///   there would stay inverted for every later record (each record has
@@ -349,7 +374,7 @@ impl Splitter {
     pub fn reset_unaligned(&mut self, after_newline: bool) {
         self.reset();
         match self.framing {
-            Framing::Lines | Framing::Csv => {
+            Framing::Lines | Framing::LinesKeepingEmpty | Framing::Csv => {
                 self.parity_known = !self.csv;
                 self.aligned = after_newline && !self.csv;
                 if !after_newline {
@@ -452,9 +477,17 @@ impl Splitter {
         &self.ends
     }
 
+    /// Where the records the last [`Self::feed`] skipped for their size
+    /// were: for each, the number of records in `out` when it ended.
+    #[must_use]
+    pub fn last_skips(&self) -> &[usize] {
+        &self.skips
+    }
+
     /// Feeds bytes; complete records are appended to `out`.
     pub fn feed(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
         self.ends.clear();
+        self.skips.clear();
         if self.framing == Framing::JsonObjects {
             self.feed_json(data, out);
             return;
@@ -480,7 +513,8 @@ impl Splitter {
                 } else if self.skipping {
                     self.skipping = false;
                     self.oversized += 1;
-                } else if !self.buf.is_empty() {
+                    self.skips.push(out.len());
+                } else if !self.buf.is_empty() || self.framing == Framing::LinesKeepingEmpty {
                     let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
                     record.extend_from_slice(&self.buf);
                     if record.last() == Some(&b'\r') {
@@ -587,6 +621,7 @@ impl Splitter {
                         if self.skipping {
                             self.skipping = false;
                             self.oversized += 1;
+                            self.skips.push(out.len());
                         } else {
                             let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
                             record.extend_from_slice(&self.buf);
@@ -748,8 +783,18 @@ pub struct Polled {
     pub records: Vec<Zeroizing<Vec<u8>>>,
     /// Position of each record (same order as `records`).
     pub positions: Vec<RecordPos>,
-    /// More data is waiting (the poll stopped at its byte bound).
+    /// More data is waiting (the poll stopped at its byte or record
+    /// bound), or the poll stopped at an error after reading records (a
+    /// rotation whose new file could not be opened, a read error): those
+    /// records are returned and the next poll meets the error.
     pub more: bool,
+    /// Records skipped for their size ([`MAX_RECORD_BYTES`], counted in
+    /// [`Tailer::oversized`]): for each, the index in `records` of the
+    /// first record after it (`records.len()` when none followed in this
+    /// poll) and the file it was in. A source whose records span several
+    /// of the tailer's records (the Firebird trace log, one line each)
+    /// uses it to know which of its records lost a part.
+    pub skipped: Vec<(usize, (u64, u64))>,
 }
 
 /// Follows one log file (see the module documentation).
@@ -773,6 +818,15 @@ pub struct Tailer {
     pub rotations: u64,
     /// The source's checks of every opened file.
     open_check: Option<OpenCheck>,
+    /// See [`Self::take_ended`].
+    ended: Option<(u64, u64)>,
+    /// A rotation closed the file and the new one could not be opened:
+    /// the file opened next is a new file, read from its start even with
+    /// no saved cursor (not from its end, as at a first start).
+    after_rotation: bool,
+    /// Tests: reads that succeed before every later read fails.
+    #[cfg(test)]
+    reads_before_failure: Option<u32>,
 }
 
 /// Test support only: accept log files the agent's user could write
@@ -921,6 +975,10 @@ impl Tailer {
             replay: None,
             oversized: 0,
             rotations: 0,
+            ended: None,
+            after_rotation: false,
+            #[cfg(test)]
+            reads_before_failure: None,
             open_check: None,
         }
     }
@@ -967,6 +1025,7 @@ impl Tailer {
         }
         let (mut file, dev, ino, len) = open_regular(&self.path, self.open_check.as_ref())?;
         let cursor = self.load_cursor();
+        let cursor_none = cursor.is_none();
         // First start: the end of a file being written need not be a record
         // boundary (see `Splitter::reset_unaligned`); nor the position of a
         // cursor saved before one was known.
@@ -1001,8 +1060,13 @@ impl Tailer {
                 );
                 0
             }
+            // The path's file after a rotation whose new file could not
+            // be opened then: a new file, read from its start.
+            None if self.after_rotation => 0,
             None => len,
         };
+        let unaligned = unaligned && !(self.after_rotation && cursor_none);
+        self.after_rotation = false;
         file.seek(SeekFrom::Start(start))
             .map_err(|e| TailError::Unreadable(e.kind()))?;
         // The bytes before the start, for the in-place rewrite check of the
@@ -1069,10 +1133,48 @@ impl Tailer {
     /// readable.
     pub fn poll(&mut self) -> Result<Polled, TailError> {
         self.ensure_open()?;
-        let mut records = Vec::new();
-        let mut positions = Vec::new();
+        let mut out = Polled {
+            records: Vec::new(),
+            positions: Vec::new(),
+            more: false,
+            skipped: Vec::new(),
+        };
+        match self.read_into(&mut out) {
+            Ok(more) => {
+                out.more = more;
+                Ok(out)
+            }
+            // What this poll read before the error (the end of a file
+            // rotated away whose successor cannot be opened, or the bytes
+            // read before a read error) is handed on first: the offset has
+            // moved past it, so it would be lost otherwise (security review
+            // M1 and N8 of #392). The next poll meets the error again.
+            Err(e) if out.records.is_empty() && out.skipped.is_empty() => Err(e),
+            Err(_) => {
+                tracing::warn!(
+                    "audit log read stopped by an error; the records read before it are handed \
+                     on first"
+                );
+                out.more = true;
+                Ok(out)
+            }
+        }
+    }
+
+    /// The body of [`Self::poll`]: whether more data waits.
+    fn read_into(&mut self, out: &mut Polled) -> Result<bool, TailError> {
+        let Polled {
+            records,
+            positions,
+            skipped,
+            ..
+        } = out;
         let mut read_total: u64 = 0;
         let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
+        let bound = match self.framing {
+            Framing::Lines | Framing::LinesKeepingEmpty => MAX_POLL_LINE_RECORDS,
+            Framing::Csv | Framing::JsonObjects => usize::MAX,
+        };
         while let Some((file, dev, ino)) = self.file.as_mut() {
             let (dev, ino) = (*dev, *ino);
             // Truncated (or rewritten) in place?
@@ -1097,7 +1199,14 @@ impl Tailer {
                 self.splitter.reset();
             }
             let mut eof = false;
-            while read_total < MAX_POLL_BYTES {
+            while read_total < MAX_POLL_BYTES && records.len() < bound {
+                #[cfg(test)]
+                if let Some(left) = self.reads_before_failure.as_mut() {
+                    if *left == 0 {
+                        return Err(TailError::Unreadable(std::io::ErrorKind::Other));
+                    }
+                    *left -= 1;
+                }
                 let n = file
                     .read(&mut buf[..])
                     .map_err(|e| TailError::Unreadable(e.kind()))?;
@@ -1108,7 +1217,8 @@ impl Tailer {
                 let base = self.offset;
                 self.offset += n as u64;
                 read_total += n as u64;
-                self.splitter.feed(&buf[..n], &mut records);
+                self.splitter.feed(&buf[..n], records);
+                skipped.extend(self.splitter.last_skips().iter().map(|&k| (k, (dev, ino))));
                 for &(i, len) in self.splitter.last_ends() {
                     let end = base + i as u64;
                     positions.push(RecordPos {
@@ -1123,11 +1233,7 @@ impl Tailer {
             }
             self.oversized = self.splitter.oversized;
             if !eof {
-                return Ok(Polled {
-                    records,
-                    positions,
-                    more: true,
-                });
+                return Ok(true);
             }
             // At the end of the open file: has the path moved to a new file?
             // `lstat`: a symlink put in its place is a change too, and the
@@ -1140,24 +1246,39 @@ impl Tailer {
                     self.rotations += 1;
                     tracing::info!("audit log rotated; following the new file");
                     self.file = None;
-                    match open_regular(&self.path, self.open_check.as_ref()) {
-                        Ok((file, dev, ino, _)) => {
-                            self.file = Some((file, dev, ino));
-                            self.offset = 0;
-                            self.tail.clear();
-                            self.splitter.reset();
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    // The old file is read to its end and closed: a source
+                    // holding records of it ends them now, whether or not
+                    // the new file opens (security review M1 of #392). No
+                    // cursor is saved while no file is open, so the saved
+                    // one stays in the old file, and the new file is read
+                    // from its start once it opens.
+                    self.ended = Some((dev, ino));
+                    self.after_rotation = true;
+                    let (file, dev, ino, _) = open_regular(&self.path, self.open_check.as_ref())?;
+                    self.after_rotation = false;
+                    self.file = Some((file, dev, ino));
+                    self.offset = 0;
+                    self.tail.clear();
+                    self.splitter.reset();
                 }
                 _ => break,
             }
         }
-        Ok(Polled {
-            records,
-            positions,
-            more: false,
-        })
+        Ok(false)
+    }
+
+    /// The file a rotation closed after reading it to its end, once (see
+    /// [`Self::poll`]): set whether or not the new file could be opened,
+    /// also when the poll that met it failed. A source holding records of
+    /// that file ends them (they can no longer be re-read).
+    pub fn take_ended(&mut self) -> Option<(u64, u64)> {
+        self.ended.take()
+    }
+
+    /// The `(st_dev, st_ino)` of the file open for reading, if any.
+    #[must_use]
+    pub fn open_file(&self) -> Option<(u64, u64)> {
+        self.file.as_ref().map(|(_, dev, ino)| (*dev, *ino))
     }
 
     /// The replay found in the saved cursor when the file was opened
@@ -1813,6 +1934,93 @@ mod tests {
         assert_eq!(s.last_ends(), [(2, 8), (11, 9)]);
     }
 
+    /// Empty lines: no record with [`Framing::Lines`] (unchanged), an
+    /// empty record with [`Framing::LinesKeepingEmpty`], with the same
+    /// positions, `\r` handling, bound and unaligned start otherwise.
+    #[test]
+    fn empty_lines_are_kept_only_when_asked() {
+        let data = b"a\n\nb \r\n\r\n\n";
+        let mut s = Splitter::new(Framing::Lines);
+        let mut out = Vec::new();
+        s.feed(data, &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        // `\r\n` alone was already an empty record; a bare `\n` none.
+        assert_eq!(got, [&b"a"[..], b"b ", b""]);
+        assert_eq!(s.last_ends(), [(2, 2), (7, 4), (9, 2)]);
+        let mut k = Splitter::new(Framing::LinesKeepingEmpty);
+        let mut out = Vec::new();
+        k.feed(data, &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(got, [&b"a"[..], b"", b"b ", b"", b""]);
+        assert_eq!(k.last_ends(), [(2, 2), (3, 1), (7, 4), (9, 2), (10, 1)]);
+        assert_eq!(k.pending(), 0);
+        // The bound: a longer line is skipped and counted, the empty line
+        // after it kept.
+        let mut k = Splitter::with_max(Framing::LinesKeepingEmpty, 4);
+        let mut out = Vec::new();
+        k.feed(b"abcdefgh\n\nab\n", &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(got, [&b""[..], b"ab"]);
+        assert_eq!(k.oversized, 1);
+        // An unaligned start drops the first (partial) line only.
+        let mut k = Splitter::new(Framing::LinesKeepingEmpty);
+        k.reset_unaligned(false);
+        assert!(!k.aligned());
+        let mut out = Vec::new();
+        k.feed(b"tail\n\nx\n", &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(got, [&b""[..], b"x"]);
+        assert!(k.aligned());
+        let mut k = Splitter::new(Framing::LinesKeepingEmpty);
+        k.reset_unaligned(true);
+        assert!(k.aligned());
+        let mut out = Vec::new();
+        k.feed(b"\nx\n", &mut out);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// The tailer with [`Framing::LinesKeepingEmpty`]: empty lines and
+    /// their positions, rotation as with [`Framing::Lines`], and a poll
+    /// of empty lines bounded in records.
+    #[test]
+    fn a_tailer_keeping_empty_lines() {
+        let d = Dir::new("keep-empty");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::LinesKeepingEmpty, None);
+        assert_eq!(t.framing(), Framing::LinesKeepingEmpty);
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, "h1\n\nh2\nbody\n\n");
+        let p = t.poll().unwrap();
+        assert_eq!(lines_of(&p), ["h1", "", "h2", "body", ""]);
+        let spans: Vec<(u64, u64)> = p.positions.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(spans, [(0, 3), (3, 4), (4, 7), (7, 12), (12, 13)]);
+        // Rotation: the old file is finished, the new one read.
+        append(&log, "old\n\n");
+        std::fs::rename(&log, d.0.join("audit.2026-10-31T10-00-00.0000.log")).unwrap();
+        append(&log, "\nnew\n");
+        let p = t.poll().unwrap();
+        assert_eq!(lines_of(&p), ["old", "", "", "new"]);
+        assert_eq!(t.rotations, 1);
+        // Bounded in records: 600 000 empty lines (well under the byte
+        // bound) take several polls, each under the record bound plus one
+        // chunk.
+        append(&log, &"\n".repeat(600_000));
+        let (mut total, mut polls) = (0, 0);
+        loop {
+            let p = t.poll().unwrap();
+            polls += 1;
+            assert!(p.records.len() <= MAX_POLL_LINE_RECORDS + CHUNK);
+            assert_eq!(p.records.len(), p.positions.len());
+            total += p.records.len();
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(total, 600_000);
+        assert!(polls >= 3, "{polls}");
+    }
+
     #[test]
     fn polls_are_bounded() {
         let d = Dir::new("bound");
@@ -1892,6 +2100,205 @@ mod tests {
         append(&log, "b\n");
         let got = lines(t.poll().unwrap());
         assert_eq!(got, ["b"]);
+    }
+
+    /// The loss measured on Firebird 4.0.7 and 5.0.4 (`dev/firebird/it.sh`
+    /// step 6): at a rotation whose new file cannot be opened, the poll
+    /// failed and dropped the records it had already read from the end of
+    /// the old file. They are now handed on first; the next poll fails;
+    /// the saved cursor stays in the old file, so once the new file opens
+    /// it is read from its start (also after a restart). Every framing.
+    #[test]
+    fn the_end_of_a_rotated_file_is_handed_on_when_the_new_one_cannot_be_opened() {
+        for framing in [
+            Framing::Lines,
+            Framing::LinesKeepingEmpty,
+            Framing::Csv,
+            Framing::JsonObjects,
+        ] {
+            let d = Dir::new("rot-unreadable");
+            let log = d.0.join("audit.log");
+            let rec = |n: u32| match framing {
+                Framing::JsonObjects => format!("{{\"n\":{n}}}\n"),
+                Framing::Csv => format!("2026-10-31,\"r{n}\"\n"),
+                _ => format!("r{n}\n"),
+            };
+            let store = || CursorStore::new(&d.0, "t", "rot");
+            append(&log, "");
+            let mut t = Tailer::new(log.clone(), framing, store());
+            assert!(t.poll().unwrap().records.is_empty());
+            append(&log, &format!("{}{}", rec(1), rec(2)));
+            assert_eq!(t.poll().unwrap().records.len(), 2, "{framing:?}");
+            t.commit();
+            let before = saved(&store().unwrap());
+            // Written by the server just before it rotates, read in the
+            // poll that sees the rotation.
+            append(&log, &format!("{}{}", rec(3), rec(4)));
+            let old = std::fs::metadata(&log).unwrap().ino();
+            std::fs::rename(&log, d.0.join("audit.1.log")).unwrap();
+            let elsewhere = d.0.join("other");
+            append(&elsewhere, &rec(99));
+            std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+            let p = t.poll().unwrap();
+            assert_eq!(p.records.len(), 2, "{framing:?}");
+            assert!(p.more);
+            assert!(p.positions.iter().all(|r| r.file.1 == old));
+            assert_eq!(t.rotations, 1);
+            // No file is open: nothing is saved, the cursor stays.
+            t.commit();
+            assert_eq!(saved(&store().unwrap()), before);
+            assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+            assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+            // The new file opens: read from its start, through the saved
+            // cursor of the old file (counted as a rotation again).
+            std::fs::remove_file(&log).unwrap();
+            append(&log, &rec(5));
+            let p = t.poll().unwrap();
+            assert_eq!(p.records.len(), 1, "{framing:?}");
+            assert!(!p.records[0].contains(&b'9'));
+            assert_eq!(t.rotations, 2);
+            // A restart before the new file is read again: the same.
+            let mut t2 = Tailer::new(log.clone(), framing, store());
+            assert_eq!(t2.poll().unwrap().records.len(), 1, "{framing:?}");
+        }
+    }
+
+    /// Records skipped for their size are placed among the records read
+    /// (index of the next record, file), for every bound framing path.
+    #[test]
+    fn skipped_records_are_placed() {
+        let d = Dir::new("skipped");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::LinesKeepingEmpty, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        let big = "x".repeat(MAX_RECORD_BYTES + 10);
+        append(&log, &format!("a\n{big}\n\nb\n{big}\n"));
+        let mut all = Vec::new();
+        let mut skipped = Vec::new();
+        loop {
+            let p = t.poll().unwrap();
+            let base = all.len();
+            skipped.extend(p.skipped.iter().map(|(k, f)| (base + k, *f)));
+            all.extend(lines_of(&p));
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(all, ["a", "", "b"]);
+        let ino = std::fs::metadata(&log).unwrap().ino();
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].0, 1);
+        assert_eq!(skipped[1].0, 3);
+        assert!(skipped.iter().all(|(_, f)| f.1 == ino));
+        assert_eq!(t.oversized, 2);
+        let mut s = Splitter::with_max(Framing::JsonObjects, 8);
+        let mut out = Vec::new();
+        s.feed(b"{\"a\":1}\n{\"long\":\"value\"}\n{\"b\":2}\n", &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(s.last_skips(), [1]);
+    }
+
+    /// Security review M1 of #392: the closed file is reported once,
+    /// whether the new file opened, could not be opened with records read
+    /// (handed on), or could not be opened with nothing read (the poll
+    /// fails). L1: a poll that only skipped a record is handed on too.
+    #[test]
+    fn a_rotation_reports_the_ended_file() {
+        let d = Dir::new("ended");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        assert_eq!(t.take_ended(), None);
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        // The new file opens.
+        let first = ino(&log);
+        std::fs::rename(&log, d.0.join("audit.1.log")).unwrap();
+        append(&log, "n1\n");
+        assert_eq!(lines(t.poll().unwrap()), ["n1"]);
+        assert_eq!(t.take_ended().map(|f| f.1), Some(first));
+        assert_eq!(t.take_ended(), None);
+        // Nothing read, the new file refused: the poll fails, the old file
+        // is reported ended all the same.
+        let second = ino(&log);
+        std::fs::rename(&log, d.0.join("audit.2.log")).unwrap();
+        let elsewhere = d.0.join("other");
+        append(&elsewhere, "x\n");
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        assert!(t.poll().is_err());
+        assert_eq!(t.take_ended().map(|f| f.1), Some(second));
+        assert!(t.poll().is_err());
+        assert_eq!(t.take_ended(), None);
+        // The new file opens later: read from its start, also with no
+        // cursor store (L3), what was written while it was refused.
+        std::fs::remove_file(&log).unwrap();
+        append(&log, "written while refused\n");
+        assert_eq!(lines(t.poll().unwrap()), ["written while refused"]);
+        // Only a record skipped for its size before the refusal (L1).
+        let third = ino(&log);
+        append(&log, &format!("{}\n", "y".repeat(MAX_RECORD_BYTES + 1)));
+        std::fs::rename(&log, d.0.join("audit.3.log")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        let p = t.poll().unwrap();
+        assert!(p.records.is_empty());
+        assert_eq!(p.skipped, [(0, (p_dev(&d.0), third))]);
+        assert!(p.more);
+        assert_eq!(t.take_ended().map(|f| f.1), Some(third));
+        assert!(t.poll().is_err());
+    }
+
+    fn p_dev(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p).unwrap().dev()
+    }
+
+    /// Security review N8 of #392: a read error after some records were
+    /// read in the poll hands them on (the offset is past them); the next
+    /// poll meets the error; nothing is read twice once reads work again.
+    #[test]
+    fn a_read_error_hands_on_what_was_read() {
+        let d = Dir::new("readerr");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        // More than one chunk, so that the second read fails.
+        let line = format!("{}\n", "z".repeat(1023));
+        append(&log, &line.repeat(CHUNK / 1024 + 8));
+        t.reads_before_failure = Some(1);
+        let p = t.poll().unwrap();
+        assert_eq!(p.records.len(), CHUNK / 1024);
+        assert!(p.more);
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        t.reads_before_failure = None;
+        let p = t.poll().unwrap();
+        assert_eq!(p.records.len(), 8);
+        assert_eq!(t.take_ended(), None);
+    }
+
+    /// Security review N1 of #392: a flood of `\r\n` (an empty record each
+    /// with `Lines`) is bounded in records per poll as with
+    /// `LinesKeepingEmpty`; ordinary lines are not affected.
+    #[test]
+    fn lines_polls_are_bounded_in_records() {
+        let d = Dir::new("crlf-flood");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, &"\r\n".repeat(600_000));
+        let (mut total, mut polls) = (0, 0);
+        loop {
+            let p = t.poll().unwrap();
+            polls += 1;
+            assert!(p.records.len() <= MAX_POLL_LINE_RECORDS + CHUNK);
+            total += p.records.len();
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(total, 600_000);
+        assert!(polls >= 3, "{polls}");
     }
 
     #[test]
@@ -2343,6 +2750,57 @@ mod tests {
         ) {
             let statements: Vec<&[u8]> = statements.iter().map(String::as_bytes).collect();
             fuzz::check(&statements, chunk, at, damage, max);
+        }
+
+        /// [`Framing::LinesKeepingEmpty`] at any chunking: exactly the
+        /// complete lines (one `\r` before the newline dropped, as with
+        /// [`Framing::Lines`]), and [`Framing::Lines`] gives the same
+        /// records and positions less the empty lines.
+        #[test]
+        fn lines_keeping_empty_are_lines_plus_the_empty_ones(
+            data in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::strategy::Just(b'\n'),
+                    proptest::strategy::Just(b'\r'),
+                    proptest::strategy::Just(b' '),
+                    proptest::strategy::Just(b'a'),
+                ],
+                0..200,
+            ),
+            chunk in 1usize..32,
+        ) {
+            let run = |framing| {
+                let mut s = Splitter::new(framing);
+                let (mut out, mut ends) = (Vec::new(), Vec::new());
+                let mut base = 0;
+                for c in data.chunks(chunk) {
+                    s.feed(c, &mut out);
+                    ends.extend(s.last_ends().iter().map(|&(i, n)| (base + i, n)));
+                    base += c.len();
+                }
+                let out: Vec<Vec<u8>> = out.iter().map(|r| r.to_vec()).collect();
+                (out, ends)
+            };
+            let (kept, kept_ends) = run(Framing::LinesKeepingEmpty);
+            let mut expect: Vec<Vec<u8>> = data.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+            expect.pop();
+            for l in &mut expect {
+                if l.last() == Some(&b'\r') {
+                    l.pop();
+                }
+            }
+            proptest::prop_assert_eq!(&kept, &expect);
+            let (lines, line_ends) = run(Framing::Lines);
+            // `Lines` drops a line that is a bare newline (one byte); an
+            // empty line written `\r\n` stays a record there.
+            let (want, want_ends): (Vec<_>, Vec<_>) = kept
+                .iter()
+                .zip(&kept_ends)
+                .filter(|(_, (_, n))| *n > 1)
+                .map(|(r, e)| (r.clone(), *e))
+                .unzip();
+            proptest::prop_assert_eq!(lines, want);
+            proptest::prop_assert_eq!(line_ends, want_ends);
         }
     }
 

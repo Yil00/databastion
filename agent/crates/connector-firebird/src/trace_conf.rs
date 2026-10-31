@@ -37,6 +37,14 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_LINE: usize = 8192;
 /// The proof 5 floor of `max_sql_length`.
 pub(crate) const MIN_SQL_LENGTH: u64 = 4096;
+/// The largest `max_sql_length` the Partial level accepts: a statement
+/// text line must fit the core tailer's line bound (1 MiB,
+/// `databastion_core::audit::tail::MAX_RECORD_BYTES`), with a margin of
+/// 64 KiB. A longer line would be skipped by the tailer (its record is
+/// then made ambiguous by the stream, never parsed without it), so a text
+/// could never be read whole.
+pub(crate) const MAX_SQL_LENGTH_CARRIED: u64 =
+    databastion_core::audit::tail::MAX_RECORD_BYTES as u64 - 64 * 1024;
 /// The server's default `max_sql_length` (images' `fbtrace.conf`).
 const DEFAULT_SQL_LENGTH: u64 = 300;
 
@@ -972,8 +980,31 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         if eff.number("time_threshold").unwrap_or(100) != 0 {
             add(&mut missing, "time_threshold");
         }
+        // ADR-0060 refinement of 2026-10-31 c, R54: the server rotates
+        // its log at max_log_size and creates every new file 0600, which
+        // the agent cannot read; Partial requires no rotation.
+        if eff.number("max_log_size").unwrap_or(0) != 0 {
+            // Sent as `other` until the label set has `max_log_size`.
+            add(&mut missing, "max_log_size");
+            detail.push(format!(
+                "{}: max_log_size is not 0 (the server would rotate the log into files the \
+                 agent cannot read)",
+                db.label
+            ));
+        }
         log_connections &= eff.flag("log_connections");
-        max_sql = max_sql.min(eff.number("max_sql_length").unwrap_or(DEFAULT_SQL_LENGTH));
+        let sql_length = eff.number("max_sql_length").unwrap_or(DEFAULT_SQL_LENGTH);
+        if sql_length > MAX_SQL_LENGTH_CARRIED {
+            // Sent as `other` until the label set has `max_sql_length`
+            // (a contract revision).
+            add(&mut missing, "max_sql_length");
+            detail.push(format!(
+                "{}: max_sql_length {sql_length} above {MAX_SQL_LENGTH_CARRIED} bytes, the \
+                 longest statement text line the agent reads",
+                db.label
+            ));
+        }
+        max_sql = max_sql.min(sql_length);
     }
     if i.databases.is_empty() {
         max_sql = DEFAULT_SQL_LENGTH;
@@ -1015,6 +1046,29 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         }
         _ => false,
     };
+    // R54 for every other enabled section that writes the declared log
+    // (the default section, sections of undeclared databases: already not
+    // Partial for proof 11, the reason named too; fail closed).
+    let rotating = |s: &Settings| writes_here(s) && s.number("max_log_size").unwrap_or(0) != 0;
+    if rotating(&default_db) || named.iter().any(|(_, st)| rotating(&st.over(&default_db))) {
+        if !missing.contains(&"max_log_size") {
+            detail
+                .push("a trace section writing the declared log has max_log_size not 0".to_owned());
+        }
+        add(&mut missing, "max_log_size");
+    }
+    // R54: the services section that writes the declared log rotates it
+    // too.
+    for s in &services {
+        if writes_here(&s.settings) && s.settings.number("max_log_size").unwrap_or(0) != 0 {
+            add(&mut missing, "max_log_size");
+            detail.push(
+                "services: max_log_size is not 0 (the server would rotate the log into files \
+                 the agent cannot read)"
+                    .to_owned(),
+            );
+        }
+    }
     let mut notes = Vec::new();
     if !svc_ok {
         add(&mut missing, "log_services");

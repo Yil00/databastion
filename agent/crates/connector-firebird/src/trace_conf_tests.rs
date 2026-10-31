@@ -306,6 +306,82 @@ fn statement_text_limits() {
     assert_eq!(codes(&v.notes), [NoteCode::AuditStatementTextLimitLow]);
     let t = DEV_TRACE.replace("\tmax_sql_length = 65000\n", "");
     assert_eq!(eval(&t, Some(&empty_map()), &crm()).max_sql_length, 300);
+    // Above what the tailer carries in one line: Partial withheld, the
+    // setting reported (as `other`: the label set has no
+    // `max_sql_length` yet), the detail local.
+    let at = MAX_SQL_LENGTH_CARRIED;
+    let t = DEV_TRACE.replace("max_sql_length = 65000", &format!("max_sql_length = {at}"));
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(v.partial, "{:?}", v.notes);
+    let t = DEV_TRACE.replace(
+        "max_sql_length = 65000",
+        &format!("max_sql_length = {}", at + 1),
+    );
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert_eq!(codes(&v.notes), [NoteCode::AuditTraceSettingsMissing]);
+    assert_eq!(
+        labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
+        ["other"]
+    );
+    assert!(v.detail.iter().any(|d| d.contains("max_sql_length")));
+    let t = DEV_TRACE.replace("max_sql_length = 65000", "max_sql_length = 10485760");
+    assert!(!eval(&t, Some(&empty_map()), &crm()).partial);
+}
+
+/// ADR-0060 refinement of 2026-10-31 c, R54: Partial requires
+/// `max_log_size = 0` in the declared database's section and in the
+/// services section that writes the log (label `other` until the label
+/// set has `max_log_size`).
+#[test]
+fn a_rotating_log_is_not_partial() {
+    assert!(eval(DEV_TRACE, Some(&empty_map()), &crm()).partial);
+    let t = DEV_TRACE.replace("\tmax_log_size = 0\n", "\tmax_log_size = 1\n");
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert_eq!(codes(&v.notes), [NoteCode::AuditTraceSettingsMissing]);
+    assert_eq!(
+        labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
+        ["other"]
+    );
+    assert!(v.detail.iter().any(|d| d.starts_with("crm: max_log_size")));
+    // Absent: the server's default, 0.
+    let t = DEV_TRACE.replace("\tmax_log_size = 0\n", "");
+    assert!(eval(&t, Some(&empty_map()), &crm()).partial);
+    // The services section writing the log.
+    let t = DEV_TRACE.replace(
+        "\tlog_services = true\n",
+        "\tlog_services = true\n\tmax_log_size = 10\n",
+    );
+    assert_ne!(t, DEV_TRACE);
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert!(
+        v.detail
+            .iter()
+            .any(|d| d.starts_with("services: max_log_size"))
+    );
+    // Only the default section rotates, and it is disabled: no effect.
+    let t = DEV_TRACE.replace(
+        "database\n{\n\tenabled = false\n",
+        "database\n{\n\tenabled = false\n\tmax_log_size = 5\n",
+    );
+    assert_ne!(t, DEV_TRACE);
+    assert!(eval(&t, Some(&empty_map()), &crm()).partial);
+    // Another enabled section writing the declared log (not Partial for
+    // proof 11 already): the rotation is named too (fail closed).
+    let other = format!(
+        "{DEV_TRACE}\ndatabase = /var/lib/firebird/data/other.fdb\n{{\n\tenabled = true\n\tlog_filename = {LOG}\n\tmax_log_size = 3\n}}\n"
+    );
+    let v = eval(&other, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert!(
+        v.detail
+            .iter()
+            .any(|d| d.contains("a trace section writing the declared log")),
+        "{:?}",
+        v.detail
+    );
 }
 
 /// R2 rule 4: every alias mapping to the database is evaluated; differing
