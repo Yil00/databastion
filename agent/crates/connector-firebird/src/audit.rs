@@ -620,6 +620,13 @@ fn settings(
     })
 }
 
+/// How the trace log is split into lines: every line, empty ones
+/// included. A record of the trace log ends with empty lines its grammar
+/// requires (between the context lines and the statement, before the
+/// per-table block, at its end): dropping them makes every statement
+/// finish a [`crate::trace_log::Defect::Shape`] (found by the e2e job).
+pub(crate) const FRAMING: Framing = Framing::LinesKeepingEmpty;
+
 /// Starts an early `check()` of the stream's target; `false` when one is
 /// running (R11 8d, R28 item 4).
 pub(crate) type EarlyCheck = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -656,7 +663,7 @@ pub(crate) async fn stream(
         machine.confirm_run(r);
     }
     let mut runner = Runner {
-        tailer: Tailer::new(audit.log.clone(), Framing::Lines, cfg.cursor(CURSOR))
+        tailer: Tailer::new(audit.log.clone(), FRAMING, cfg.cursor(CURSOR))
             .with_open_check(open_check(audit.log.clone())),
         asm: Assembler::new(),
         record_start: None,
@@ -1015,7 +1022,7 @@ mod tests {
         store: Option<databastion_core::audit::CursorStore>,
     ) -> Runner {
         Runner {
-            tailer: Tailer::new(log.to_path_buf(), Framing::Lines, store)
+            tailer: Tailer::new(log.to_path_buf(), FRAMING, store)
                 .with_open_check(open_check(log.to_path_buf())),
             asm: Assembler::new(),
             record_start: None,
@@ -1459,7 +1466,7 @@ mod tests {
         let classes = Classes::default();
         let cats: Vec<&dyn Catalog> = vec![&classes];
         let mut r = Runner {
-            tailer: Tailer::new(log.clone(), Framing::Lines, None)
+            tailer: Tailer::new(log.clone(), FRAMING, None)
                 .with_open_check(open_check(log.clone())),
             asm: Assembler::new(),
             record_start: None,
@@ -1482,6 +1489,196 @@ mod tests {
         // The record in progress is held back.
         assert!(r.record_start.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What one path made of a recorded log: records, ambiguous records
+    /// (by rule), events, and the records whose parse found a defect.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Outcome {
+        records: u64,
+        ambiguous: u64,
+        why: std::collections::BTreeMap<u32, u64>,
+        events: usize,
+        defects: Vec<(crate::trace_log::Event, crate::trace_log::Defect)>,
+    }
+
+    fn settings_for(series: Series) -> Settings {
+        let mut s = test_settings();
+        s.parse.series = series;
+        s
+    }
+
+    fn defects_of(
+        recs: &[Assembled],
+        series: Series,
+    ) -> Vec<(crate::trace_log::Event, crate::trace_log::Defect)> {
+        let opts = settings_for(series).parse;
+        recs.iter()
+            .filter_map(|r| match r {
+                Assembled::Record(raw) => crate::trace_log::parse(raw, opts)
+                    .and_then(|p| p.defect.map(|d| (p.header.event, d))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The parser's path of the connector's other tests: the log split on
+    /// `\n` in memory and assembled, no tailer.
+    fn direct(log: &[u8], series: Series) -> Outcome {
+        let mut m = Machine::new(
+            settings_for(series),
+            Arc::new(crate::own::Ledger::default()),
+        );
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut asm = Assembler::new();
+        let mut recs = Vec::new();
+        for line in log.split(|b| *b == b'\n') {
+            recs.extend(asm.push_line(line));
+        }
+        recs.extend(asm.flush());
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for r in &recs {
+            if let Assembled::Record(raw) = r {
+                m.push(raw, pos, now, &cats, &mut out);
+                pos += raw.len() as u64 + 1;
+            }
+        }
+        m.expire(now + Duration::from_secs(120), &cats, &mut out);
+        Outcome {
+            records: m.counts.records,
+            ambiguous: m.counts.ambiguous,
+            why: m.why.clone(),
+            events: out.len(),
+            defects: defects_of(&recs, series),
+        }
+    }
+
+    /// The live path: the log appended to a real file after a first start,
+    /// read by the core tailer with `framing` and the stream's runner (its
+    /// record held at end of file, then flushed as at a stable end); the
+    /// defects from the same tailer lines through the same assembler.
+    fn through_the_tailer(name: &str, log: &[u8], series: Series, framing: Framing) -> Outcome {
+        let dir = temp(name);
+        let path = dir.join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+        let mut r = runner(&path, None);
+        r.tailer =
+            Tailer::new(path.clone(), framing, None).with_open_check(open_check(path.clone()));
+        let mut m = Machine::new(
+            settings_for(series),
+            Arc::new(crate::own::Ledger::default()),
+        );
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+        // Written in pieces that cut records and lines, as a server does.
+        for piece in log.chunks(4093) {
+            append(&path, std::str::from_utf8(piece).unwrap());
+            while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        }
+        let now = Instant::now();
+        let done = r.asm.flush();
+        let rs = r.record_start.unwrap_or(0);
+        r.hand(&mut m, done, rs, now, &cats, &mut out);
+        m.expire(now + Duration::from_secs(120), &cats, &mut out);
+        // The same log read by a fresh tailer (a first start reads from
+        // the end: an empty copy first), its lines assembled.
+        let copy = dir.join("copy.log");
+        std::fs::write(&copy, b"").unwrap();
+        let mut asm = Assembler::new();
+        let mut recs = Vec::new();
+        let mut t =
+            Tailer::new(copy.clone(), framing, None).with_open_check(open_check(copy.clone()));
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&copy, std::str::from_utf8(log).unwrap());
+        loop {
+            let p = t.poll().unwrap();
+            for line in &p.records {
+                recs.extend(asm.push_line(line));
+            }
+            if !p.more {
+                break;
+            }
+        }
+        recs.extend(asm.flush());
+        let _ = std::fs::remove_dir_all(&dir);
+        Outcome {
+            records: m.counts.records,
+            ambiguous: m.counts.ambiguous,
+            why: m.why.clone(),
+            events: out.len(),
+            defects: defects_of(&recs, series),
+        }
+    }
+
+    /// The e2e-firebird defect: the trace log's records need their empty
+    /// lines. The recorded logs of both images, read by the real tailer and
+    /// the stream's runner, give exactly what the parser's own tests see
+    /// (no statement finish judged a `Shape` defect, no ambiguous record
+    /// beyond the recorded logs' known ones); with empty lines dropped
+    /// (the framing of the other line-based sources), every statement
+    /// finish was a `Shape` defect and ambiguous.
+    #[test]
+    fn the_recorded_logs_read_through_the_tailer_are_parsed_as_recorded() {
+        use crate::trace_log::{Defect, Event};
+        let logs: [(&str, &[u8], Series); 3] = [
+            (
+                "rec5t",
+                include_bytes!("../testdata/trace-5.0.4-triggers-sweep.log"),
+                Series::V5,
+            ),
+            (
+                "rec4t",
+                include_bytes!("../testdata/trace-4.0.7-triggers-sweep.log"),
+                Series::V4,
+            ),
+            (
+                "rec5i",
+                include_bytes!("../testdata/trace-5.0.4-isql-gbak.log"),
+                Series::V5,
+            ),
+        ];
+        for (name, log, series) in logs {
+            let want = direct(log, series);
+            let got = through_the_tailer(name, log, series, FRAMING);
+            assert_eq!(got, want, "{name}");
+            let finishes = log
+                .split(|b| *b == b'\n')
+                .filter(|l| l.ends_with(b") EXECUTE_STATEMENT_FINISH"))
+                .count();
+            assert!(finishes > 10, "{name}: {finishes}");
+            if name != "rec5i" {
+                // The trigger logs: no defect at all.
+                assert!(got.defects.is_empty(), "{name}: {:?}", got.defects);
+            } else {
+                // The isql log's only defects are its forged split (a
+                // header in a comment, 8f), never a statement finish's
+                // shape.
+                assert!(!got.defects.is_empty());
+                assert!(
+                    !got.defects
+                        .contains(&(Event::ExecuteStatementFinish, Defect::Shape)),
+                    "{:?}",
+                    got.defects
+                );
+            }
+            // What the old framing did (this test would have caught it).
+            let old = through_the_tailer(&format!("{name}-old"), log, series, Framing::Lines);
+            let shaped = old
+                .defects
+                .iter()
+                .filter(|d| **d == (Event::ExecuteStatementFinish, Defect::Shape))
+                .count();
+            assert!(
+                shaped * 10 >= finishes * 9,
+                "{name}: {shaped} of {finishes}"
+            );
+            assert!(old.ambiguous > want.ambiguous, "{name}");
+        }
     }
 
     /// R28 item 4 under R11 8d: requests are merged, at most one early

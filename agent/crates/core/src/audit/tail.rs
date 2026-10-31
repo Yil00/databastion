@@ -147,6 +147,10 @@ fn csv_record_start(seg: &[u8]) -> bool {
 
 /// Most bytes read per poll.
 pub const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
+/// With [`Framing::LinesKeepingEmpty`], a poll also stops after the chunk
+/// that brings it to this many records: an empty line is a record there,
+/// so [`MAX_POLL_BYTES`] alone would let a poll hold millions of them.
+pub const MAX_POLL_RECORDS_KEEPING_EMPTY: usize = 64 * 1024;
 /// Read chunk.
 const CHUNK: usize = 256 * 1024;
 /// Bytes before the offset compared at each poll (in-place rewrite).
@@ -167,8 +171,13 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
     /// One record per line (`jsonlog`, `server_audit`, `audit_log` JSON
-    /// lines).
+    /// lines). An empty line gives no record.
     Lines,
+    /// One record per line, as [`Framing::Lines`] (same bound, same `\r`
+    /// handling, same positions and alignment), except that an empty line
+    /// is a record too (an empty one): the Firebird trace log, whose
+    /// records end with empty lines that its grammar requires.
+    LinesKeepingEmpty,
     /// CSV records: a newline inside a quoted field does not end the
     /// record (`csvlog`).
     Csv,
@@ -335,8 +344,8 @@ impl Splitter {
     /// `write`s). `after_newline`: the byte before the offset is a
     /// newline.
     ///
-    /// - [`Framing::Lines`]: the first record is dropped unless the offset
-    ///   follows a newline.
+    /// - [`Framing::Lines`] and [`Framing::LinesKeepingEmpty`]: the first
+    ///   record is dropped unless the offset follows a newline.
     /// - [`Framing::Csv`]: the offset may lie inside a quoted field, where
     ///   a newline does not end a record; a quote state taken as "outside"
     ///   there would stay inverted for every later record (each record has
@@ -349,7 +358,7 @@ impl Splitter {
     pub fn reset_unaligned(&mut self, after_newline: bool) {
         self.reset();
         match self.framing {
-            Framing::Lines | Framing::Csv => {
+            Framing::Lines | Framing::LinesKeepingEmpty | Framing::Csv => {
                 self.parity_known = !self.csv;
                 self.aligned = after_newline && !self.csv;
                 if !after_newline {
@@ -480,7 +489,7 @@ impl Splitter {
                 } else if self.skipping {
                     self.skipping = false;
                     self.oversized += 1;
-                } else if !self.buf.is_empty() {
+                } else if !self.buf.is_empty() || self.framing == Framing::LinesKeepingEmpty {
                     let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
                     record.extend_from_slice(&self.buf);
                     if record.last() == Some(&b'\r') {
@@ -1097,7 +1106,10 @@ impl Tailer {
                 self.splitter.reset();
             }
             let mut eof = false;
-            while read_total < MAX_POLL_BYTES {
+            while read_total < MAX_POLL_BYTES
+                && (self.framing != Framing::LinesKeepingEmpty
+                    || records.len() < MAX_POLL_RECORDS_KEEPING_EMPTY)
+            {
                 let n = file
                     .read(&mut buf[..])
                     .map_err(|e| TailError::Unreadable(e.kind()))?;
@@ -1813,6 +1825,93 @@ mod tests {
         assert_eq!(s.last_ends(), [(2, 8), (11, 9)]);
     }
 
+    /// Empty lines: no record with [`Framing::Lines`] (unchanged), an
+    /// empty record with [`Framing::LinesKeepingEmpty`], with the same
+    /// positions, `\r` handling, bound and unaligned start otherwise.
+    #[test]
+    fn empty_lines_are_kept_only_when_asked() {
+        let data = b"a\n\nb \r\n\r\n\n";
+        let mut s = Splitter::new(Framing::Lines);
+        let mut out = Vec::new();
+        s.feed(data, &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        // `\r\n` alone was already an empty record; a bare `\n` none.
+        assert_eq!(got, [&b"a"[..], b"b ", b""]);
+        assert_eq!(s.last_ends(), [(2, 2), (7, 4), (9, 2)]);
+        let mut k = Splitter::new(Framing::LinesKeepingEmpty);
+        let mut out = Vec::new();
+        k.feed(data, &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(got, [&b"a"[..], b"", b"b ", b"", b""]);
+        assert_eq!(k.last_ends(), [(2, 2), (3, 1), (7, 4), (9, 2), (10, 1)]);
+        assert_eq!(k.pending(), 0);
+        // The bound: a longer line is skipped and counted, the empty line
+        // after it kept.
+        let mut k = Splitter::with_max(Framing::LinesKeepingEmpty, 4);
+        let mut out = Vec::new();
+        k.feed(b"abcdefgh\n\nab\n", &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(got, [&b""[..], b"ab"]);
+        assert_eq!(k.oversized, 1);
+        // An unaligned start drops the first (partial) line only.
+        let mut k = Splitter::new(Framing::LinesKeepingEmpty);
+        k.reset_unaligned(false);
+        assert!(!k.aligned());
+        let mut out = Vec::new();
+        k.feed(b"tail\n\nx\n", &mut out);
+        let got: Vec<&[u8]> = out.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(got, [&b""[..], b"x"]);
+        assert!(k.aligned());
+        let mut k = Splitter::new(Framing::LinesKeepingEmpty);
+        k.reset_unaligned(true);
+        assert!(k.aligned());
+        let mut out = Vec::new();
+        k.feed(b"\nx\n", &mut out);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// The tailer with [`Framing::LinesKeepingEmpty`]: empty lines and
+    /// their positions, rotation as with [`Framing::Lines`], and a poll
+    /// of empty lines bounded in records.
+    #[test]
+    fn a_tailer_keeping_empty_lines() {
+        let d = Dir::new("keep-empty");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::LinesKeepingEmpty, None);
+        assert_eq!(t.framing(), Framing::LinesKeepingEmpty);
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, "h1\n\nh2\nbody\n\n");
+        let p = t.poll().unwrap();
+        assert_eq!(lines_of(&p), ["h1", "", "h2", "body", ""]);
+        let spans: Vec<(u64, u64)> = p.positions.iter().map(|r| (r.start, r.end)).collect();
+        assert_eq!(spans, [(0, 3), (3, 4), (4, 7), (7, 12), (12, 13)]);
+        // Rotation: the old file is finished, the new one read.
+        append(&log, "old\n\n");
+        std::fs::rename(&log, d.0.join("audit.2026-10-31T10-00-00.0000.log")).unwrap();
+        append(&log, "\nnew\n");
+        let p = t.poll().unwrap();
+        assert_eq!(lines_of(&p), ["old", "", "", "new"]);
+        assert_eq!(t.rotations, 1);
+        // Bounded in records: 600 000 empty lines (well under the byte
+        // bound) take several polls, each under the record bound plus one
+        // chunk.
+        append(&log, &"\n".repeat(600_000));
+        let (mut total, mut polls) = (0, 0);
+        loop {
+            let p = t.poll().unwrap();
+            polls += 1;
+            assert!(p.records.len() <= MAX_POLL_RECORDS_KEEPING_EMPTY + CHUNK);
+            assert_eq!(p.records.len(), p.positions.len());
+            total += p.records.len();
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(total, 600_000);
+        assert!(polls >= 3, "{polls}");
+    }
+
     #[test]
     fn polls_are_bounded() {
         let d = Dir::new("bound");
@@ -2343,6 +2442,57 @@ mod tests {
         ) {
             let statements: Vec<&[u8]> = statements.iter().map(String::as_bytes).collect();
             fuzz::check(&statements, chunk, at, damage, max);
+        }
+
+        /// [`Framing::LinesKeepingEmpty`] at any chunking: exactly the
+        /// complete lines (one `\r` before the newline dropped, as with
+        /// [`Framing::Lines`]), and [`Framing::Lines`] gives the same
+        /// records and positions less the empty lines.
+        #[test]
+        fn lines_keeping_empty_are_lines_plus_the_empty_ones(
+            data in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::strategy::Just(b'\n'),
+                    proptest::strategy::Just(b'\r'),
+                    proptest::strategy::Just(b' '),
+                    proptest::strategy::Just(b'a'),
+                ],
+                0..200,
+            ),
+            chunk in 1usize..32,
+        ) {
+            let run = |framing| {
+                let mut s = Splitter::new(framing);
+                let (mut out, mut ends) = (Vec::new(), Vec::new());
+                let mut base = 0;
+                for c in data.chunks(chunk) {
+                    s.feed(c, &mut out);
+                    ends.extend(s.last_ends().iter().map(|&(i, n)| (base + i, n)));
+                    base += c.len();
+                }
+                let out: Vec<Vec<u8>> = out.iter().map(|r| r.to_vec()).collect();
+                (out, ends)
+            };
+            let (kept, kept_ends) = run(Framing::LinesKeepingEmpty);
+            let mut expect: Vec<Vec<u8>> = data.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+            expect.pop();
+            for l in &mut expect {
+                if l.last() == Some(&b'\r') {
+                    l.pop();
+                }
+            }
+            proptest::prop_assert_eq!(&kept, &expect);
+            let (lines, line_ends) = run(Framing::Lines);
+            // `Lines` drops a line that is a bare newline (one byte); an
+            // empty line written `\r\n` stays a record there.
+            let (want, want_ends): (Vec<_>, Vec<_>) = kept
+                .iter()
+                .zip(&kept_ends)
+                .filter(|(_, (_, n))| *n > 1)
+                .map(|(r, e)| (r.clone(), *e))
+                .unzip();
+            proptest::prop_assert_eq!(lines, want);
+            proptest::prop_assert_eq!(line_ends, want_ends);
         }
     }
 
