@@ -517,9 +517,9 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 **Log file permissions.**
 
 - The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them.
-- No account other than root, the server's account and the agent may read them. Give the agent a named-user ACL, and a default ACL on the directory so that the next log file after a rotation gets it too (for example `setfacl -m u:databastion:rx <dir>`, `setfacl -m u:databastion:r <log>` and `setfacl -d -m u:databastion:r <dir>`, with the agent's account `databastion`); the server creates rotated files `0600`. With a group grant instead, every member of that group must be root, the server's account or the agent.
+- No account other than root, the server's account and the agent may read them. Give the agent a named-user ACL, and a default ACL on the directory so that the next log file after a rotation gets it too (an example to adapt, not tested on a real host: `setfacl -m u:databastion:rx <dir>`, `setfacl -m u:databastion:r <log>` and `setfacl -d -m u:databastion:r <dir>`, with the agent's account `databastion`); the server creates rotated files `0600`. With a group grant instead, every member of that group must be root, the server's account or the agent.
 - The server's account is taken from the server process, or from `peer_uid`; both must agree.
-- **An agent in a container cannot prove the readers check** (it does not see the host's identity files), so Partial needs the agent on the host.
+- **An agent in a container cannot prove the readers check** (it does not see the host's identity files), so Partial needs the agent on the host for now. A refinement that lets you declare the host's identity files, mounted read-only, is planned.
 
 **Rotation.** Every rotation of the log (by the server's `max_log_size`, or any other) counts as a gap and caps the target for 24 h. Set `max_log_size` high enough, or to `0`, so that rotations are rare.
 
