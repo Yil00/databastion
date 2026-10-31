@@ -311,6 +311,26 @@ pub(crate) fn alias_map(cfg: &FirebirdAuditConfig) -> Option<AliasMap> {
     trace_conf::parse_databases_conf(&bytes, &root).ok()
 }
 
+/// R44 item 6 (security review N7): one local `info` line naming the
+/// target and the source when its readers check switches between the
+/// host's files and declared files (never a path or content).
+fn note_identity_source(
+    state: &AuditState,
+    target_id: &str,
+    source: Option<crate::host_identity::Source>,
+) {
+    let previous = state.with(target_id, |t| {
+        std::mem::replace(&mut t.identity_source, source)
+    });
+    if let Some(now) = crate::host_identity::switched(previous, source) {
+        tracing::info!(
+            target_id = %target_id,
+            source = now.as_str(),
+            "Firebird readers check: identity files source"
+        );
+    }
+}
+
 /// The proofs, the level and the notes (decision 6; refinements).
 /// Blocking: reads local files.
 #[allow(clippy::too_many_lines)]
@@ -466,17 +486,7 @@ pub(crate) fn evaluate(
     // R44 item 3: container detection at every check.
     let in_container = databastion_core::config::firebird::agent_in_container();
     let source = crate::host_identity::Source::of(in_container, cfg.host_identity.is_some());
-    // R44 item 6 (N7): one local line when the source switches.
-    let previous = state.with(target_id, |t| {
-        std::mem::replace(&mut t.identity_source, source)
-    });
-    if let Some(now) = crate::host_identity::switched(previous, source) {
-        tracing::info!(
-            target_id = %target_id,
-            source = now.as_str(),
-            "Firebird readers check: identity files source"
-        );
-    }
+    note_identity_source(state, target_id, source);
     let server = input.server_pid.and_then(crate::fsread::server_ids);
     let place = crate::fsread::Place {
         in_container,
@@ -1512,6 +1522,52 @@ mod tests {
         r.serve(3, t0 + Duration::from_secs(100), &start);
         r.serve(3, t0 + Duration::from_secs(200), &start);
         assert_eq!(started.load(Ordering::Relaxed), 2);
+    }
+
+    /// R44 item 6 (review N8): the line is written where the check
+    /// switches, once per switch, and names no path.
+    #[test]
+    fn the_identity_source_line_is_written_on_a_switch() {
+        use crate::host_identity::Source;
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Logs::default();
+        let w = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || w.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = AuditState::default();
+        let lines = || {
+            String::from_utf8_lossy(&logs.0.lock().unwrap())
+                .lines()
+                .filter(|l| l.contains("identity files source"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        note_identity_source(&state, "fb-1", Some(Source::HostFiles));
+        note_identity_source(&state, "fb-1", Some(Source::HostFiles));
+        assert_eq!(lines().len(), 1);
+        note_identity_source(&state, "fb-1", Some(Source::DeclaredFiles));
+        note_identity_source(&state, "fb-1", None);
+        note_identity_source(&state, "fb-2", Some(Source::DeclaredFiles));
+        let l = lines();
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert!(l[0].contains("host_files") && l[0].contains("fb-1"));
+        assert!(l[1].contains("declared_files") && l[1].contains("fb-1"));
+        assert!(l[2].contains("fb-2"));
+        assert!(l.iter().all(|x| !x.contains('/')), "{l:?}");
+        assert!(l.iter().all(|x| x.contains("INFO")));
     }
 
     /// Re-review L-E: the `databases.conf` rule of R9, decided by the

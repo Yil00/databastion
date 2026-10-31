@@ -73,7 +73,7 @@ const DECLARED: &[u8] = b"/run/databastion/host/passwd";
 /// R45 items 1, 3 and 4 on the handle's facts.
 #[test]
 fn handle_refusals() {
-    assert_eq!(judge_handle(&good_handle()), Ok(()));
+    assert_eq!(judge_handle(&good_handle(), 0), Ok(()));
     let cases: [(HandleEdit, Kind); 8] = [
         (|f| f.regular = false, Kind::NotReadable),
         (|f| f.nlink = 2, Kind::Links),
@@ -88,7 +88,7 @@ fn handle_refusals() {
     for (edit, kind) in cases {
         let mut f = good_handle();
         edit(&mut f);
-        assert_eq!(judge_handle(&f), Err(kind), "{f:?}");
+        assert_eq!(judge_handle(&f, 0), Err(kind), "{f:?}");
     }
 }
 
@@ -136,7 +136,7 @@ fn a_second_hard_link_is_seen_on_the_handle() {
         nlink: meta.nlink(),
         ..good_handle()
     };
-    assert_eq!(judge_handle(&facts), Err(Kind::Links));
+    assert_eq!(judge_handle(&facts, 0), Err(Kind::Links));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -151,6 +151,7 @@ fn bare_host_chains() {
         base: &d,
         dir_owner: me,
         link_owner: me,
+        file_owner: me,
     };
     let real = d.join("authselect");
     std::fs::create_dir(&real).unwrap();
@@ -267,31 +268,55 @@ fn bare_host_files_on_disk() {
         base: &d,
         dir_owner: me,
         link_owner: me,
+        file_owner: me,
     };
     for (n, c) in [("passwd", PASSWD), ("group", GROUP)] {
         std::fs::write(d.join(n), c).unwrap();
         std::fs::set_permissions(d.join(n), std::fs::Permissions::from_mode(0o644)).unwrap();
     }
-    let r = crate::host_identity::load_bare_host_under(&d, rules);
-    if me == 0 {
-        assert_eq!(r.unwrap_err(), Fail::Nss);
-        std::fs::write(d.join("nsswitch.conf"), FILES).unwrap();
-        let id = crate::host_identity::load_bare_host_under(&d, rules).unwrap();
-        assert_eq!(id.sub_uid, Ranges::Known(Vec::new()));
-        assert_eq!(id.users.len(), 4);
-        std::fs::write(d.join("subuid"), "ubuntu:100000:65536\n").unwrap();
-        let id = crate::host_identity::load_bare_host_under(&d, rules).unwrap();
-        assert_eq!(id.sub_uid, Ranges::Known(vec![(100_000, 65_536)]));
-        // Oversized.
-        std::fs::write(d.join("group"), vec![b'a'; (4 << 20) + 1]).unwrap();
-        assert_eq!(
-            crate::host_identity::load_bare_host_under(&d, rules).unwrap_err(),
-            Fail::Refused(Role::Group, Kind::TooLarge)
-        );
-    } else {
-        // Owned by the test's user, not root.
-        assert_eq!(r.unwrap_err(), Fail::Refused(Role::Passwd, Kind::Owner));
-    }
+    let load = || crate::host_identity::load_bare_host_under(&d, rules);
+    // Review N8: every refusal runs under the test's own uid.
+    assert_eq!(load().unwrap_err(), Fail::Nss);
+    std::fs::write(d.join("nsswitch.conf"), FILES).unwrap();
+    let id = load().unwrap();
+    assert_eq!(id.sub_uid, Ranges::Known(Vec::new()));
+    assert_eq!(id.users.len(), 4);
+    std::fs::write(d.join("subuid"), "ubuntu:100000:65536\n").unwrap();
+    let id = load().unwrap();
+    assert_eq!(id.sub_uid, Ranges::Known(vec![(100_000, 65_536)]));
+    // Another owner than the expected one.
+    let other = ChainRules {
+        file_owner: me.wrapping_add(1),
+        ..rules
+    };
+    assert_eq!(
+        crate::host_identity::load_bare_host_under(&d, other).unwrap_err(),
+        Fail::Refused(Role::Passwd, Kind::Owner)
+    );
+    // A group-writable file.
+    std::fs::set_permissions(d.join("group"), std::fs::Permissions::from_mode(0o664)).unwrap();
+    assert_eq!(load().unwrap_err(), Fail::Refused(Role::Group, Kind::Mode));
+    std::fs::set_permissions(d.join("group"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    // A malformed subuid (present, not missing): refused.
+    std::fs::write(d.join("subuid"), "ubuntu:100000\n").unwrap();
+    assert_eq!(
+        load().unwrap_err(),
+        Fail::Refused(Role::Subuid, Kind::Malformed)
+    );
+    std::fs::remove_file(d.join("subuid")).unwrap();
+    // A second hard link.
+    std::fs::hard_link(d.join("passwd"), d.join("passwd.bak")).unwrap();
+    assert_eq!(
+        load().unwrap_err(),
+        Fail::Refused(Role::Passwd, Kind::Links)
+    );
+    std::fs::remove_file(d.join("passwd.bak")).unwrap();
+    // Oversized.
+    std::fs::write(d.join("group"), vec![b'a'; (4 << 20) + 1]).unwrap();
+    assert_eq!(
+        load().unwrap_err(),
+        Fail::Refused(Role::Group, Kind::TooLarge)
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 

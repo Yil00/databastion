@@ -686,7 +686,9 @@ pub(crate) struct HandleFacts {
 }
 
 /// R45 items 1, 3 and 4 on a handle's facts.
-pub(crate) fn judge_handle(f: &HandleFacts) -> Result<(), Kind> {
+/// `owner`: the uid the file must belong to, 0 in production (tests of
+/// the bare-host files set their own uid).
+pub(crate) fn judge_handle(f: &HandleFacts, owner: u32) -> Result<(), Kind> {
     if !f.regular {
         return Err(Kind::NotReadable);
     }
@@ -700,7 +702,7 @@ pub(crate) fn judge_handle(f: &HandleFacts) -> Result<(), Kind> {
     if f.agent_can_write {
         return Err(Kind::Writable);
     }
-    if f.uid != 0 {
+    if f.uid != owner {
         return Err(Kind::Owner);
     }
     if f.mode & 0o022 != 0 {
@@ -787,6 +789,8 @@ pub(crate) struct ChainRules<'a> {
     pub(crate) base: &'a Path,
     pub(crate) dir_owner: u32,
     pub(crate) link_owner: u32,
+    /// The owner of the final file (R45 item 4).
+    pub(crate) file_owner: u32,
 }
 
 /// The production rules: root-owned links under `/etc`.
@@ -795,6 +799,7 @@ pub(crate) fn etc_chain() -> ChainRules<'static> {
         base: Path::new("/etc"),
         dir_owner: 0,
         link_owner: 0,
+        file_owner: 0,
     }
 }
 
@@ -1039,7 +1044,7 @@ fn read_declared(specs: &[Spec<'_>]) -> Result<Contents, Fail> {
         })?;
         let file = File::from(fd);
         let facts = handle_facts(&file, s.path).map_err(|k| Fail::Refused(s.role, k))?;
-        judge_handle(&facts).map_err(|k| Fail::Refused(s.role, k))?;
+        judge_handle(&facts, 0).map_err(|k| Fail::Refused(s.role, k))?;
         let m = mount_facts(&file);
         opened.push((file, m));
     }
@@ -1054,7 +1059,7 @@ fn read_declared(specs: &[Spec<'_>]) -> Result<Contents, Fail> {
         let bytes = read_bounded(&file, s.bounds).map_err(|k| Fail::Refused(s.role, k))?;
         // The path still names the handle after the checks and the read.
         let facts = handle_facts(&file, s.path).map_err(|k| Fail::Refused(s.role, k))?;
-        judge_handle(&facts).map_err(|k| Fail::Refused(s.role, k))?;
+        judge_handle(&facts, 0).map_err(|k| Fail::Refused(s.role, k))?;
         out.push(Some(bytes));
     }
     Ok(out)
@@ -1072,9 +1077,9 @@ fn read_bare(
         Err(OpenError::Refused(k)) => return Err(k),
     };
     let file = File::from(fd);
-    judge_handle(&handle_facts(&file, &at)?)?;
+    judge_handle(&handle_facts(&file, &at)?, rules.file_owner)?;
     let bytes = read_bounded(&file, bounds)?;
-    judge_handle(&handle_facts(&file, &at)?)?;
+    judge_handle(&handle_facts(&file, &at)?, rules.file_owner)?;
     Ok(Some(bytes))
 }
 

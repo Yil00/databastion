@@ -47,6 +47,8 @@ databastion-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Captures the local log lines in tests (R44 item 6).
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
