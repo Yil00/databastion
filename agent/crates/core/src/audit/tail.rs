@@ -28,6 +28,14 @@
 //!   offset. A different inode at the path means the file was rotated
 //!   while the agent was stopped: the new file is read from its start (the
 //!   tail of the old one is lost; a warning is logged).
+//! - Rotation while running: the old file is read to its end, then the
+//!   path is reopened. When the new file cannot be opened (not readable,
+//!   a symlink, refused by the open check), the records read from the end
+//!   of the old file are returned first (`more` set) and the next poll
+//!   fails; no cursor is saved while no file is open, so once the new
+//!   file opens it is read from its start through the saved cursor, as
+//!   after a restart (without a cursor store: from its end, as at a first
+//!   start, unchanged).
 //! - The cursor also keeps a keyed fingerprint of the [`FP_BYTES`] bytes
 //!   of the file just before its offset, and before the end of what was
 //!   read when it holds a replay: HMAC-SHA256 with a sub-key of the agent
@@ -206,6 +214,10 @@ pub struct Splitter {
     /// Records completed by the last `feed`: (index after their last byte
     /// in the data fed, bytes since the previous record boundary).
     ends: Vec<(usize, u64)>,
+    /// Records skipped for their size by the last `feed`: the number of
+    /// records in `out` when each skipped record ended (the index of the
+    /// first record after it).
+    skips: Vec<usize>,
     /// Records skipped for their size.
     pub oversized: u64,
     /// Records dropped as damaged ([`Framing::JsonObjects`]; with
@@ -285,6 +297,7 @@ impl Splitter {
             skipping: false,
             pending: 0,
             ends: Vec::new(),
+            skips: Vec::new(),
             oversized: 0,
             malformed: 0,
             max,
@@ -461,9 +474,17 @@ impl Splitter {
         &self.ends
     }
 
+    /// Where the records the last [`Self::feed`] skipped for their size
+    /// were: for each, the number of records in `out` when it ended.
+    #[must_use]
+    pub fn last_skips(&self) -> &[usize] {
+        &self.skips
+    }
+
     /// Feeds bytes; complete records are appended to `out`.
     pub fn feed(&mut self, data: &[u8], out: &mut Vec<Zeroizing<Vec<u8>>>) {
         self.ends.clear();
+        self.skips.clear();
         if self.framing == Framing::JsonObjects {
             self.feed_json(data, out);
             return;
@@ -489,6 +510,7 @@ impl Splitter {
                 } else if self.skipping {
                     self.skipping = false;
                     self.oversized += 1;
+                    self.skips.push(out.len());
                 } else if !self.buf.is_empty() || self.framing == Framing::LinesKeepingEmpty {
                     let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
                     record.extend_from_slice(&self.buf);
@@ -596,6 +618,7 @@ impl Splitter {
                         if self.skipping {
                             self.skipping = false;
                             self.oversized += 1;
+                            self.skips.push(out.len());
                         } else {
                             let mut record = Zeroizing::new(Vec::with_capacity(self.buf.len()));
                             record.extend_from_slice(&self.buf);
@@ -757,8 +780,17 @@ pub struct Polled {
     pub records: Vec<Zeroizing<Vec<u8>>>,
     /// Position of each record (same order as `records`).
     pub positions: Vec<RecordPos>,
-    /// More data is waiting (the poll stopped at its byte bound).
+    /// More data is waiting (the poll stopped at its byte or record
+    /// bound), or the poll stopped at a rotation whose new file could not
+    /// be opened, after the end of the old file (the next poll fails).
     pub more: bool,
+    /// Records skipped for their size ([`MAX_RECORD_BYTES`], counted in
+    /// [`Tailer::oversized`]): for each, the index in `records` of the
+    /// first record after it (`records.len()` when none followed in this
+    /// poll) and the file it was in. A source whose records span several
+    /// of the tailer's records (the Firebird trace log, one line each)
+    /// uses it to know which of its records lost a part.
+    pub skipped: Vec<(usize, (u64, u64))>,
 }
 
 /// Follows one log file (see the module documentation).
@@ -1080,6 +1112,7 @@ impl Tailer {
         self.ensure_open()?;
         let mut records = Vec::new();
         let mut positions = Vec::new();
+        let mut skipped = Vec::new();
         let mut read_total: u64 = 0;
         let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
         while let Some((file, dev, ino)) = self.file.as_mut() {
@@ -1121,6 +1154,7 @@ impl Tailer {
                 self.offset += n as u64;
                 read_total += n as u64;
                 self.splitter.feed(&buf[..n], &mut records);
+                skipped.extend(self.splitter.last_skips().iter().map(|&k| (k, (dev, ino))));
                 for &(i, len) in self.splitter.last_ends() {
                     let end = base + i as u64;
                     positions.push(RecordPos {
@@ -1139,6 +1173,7 @@ impl Tailer {
                     records,
                     positions,
                     more: true,
+                    skipped,
                 });
             }
             // At the end of the open file: has the path moved to a new file?
@@ -1159,7 +1194,26 @@ impl Tailer {
                             self.tail.clear();
                             self.splitter.reset();
                         }
-                        Err(e) => return Err(e),
+                        // The records already read from the end of the
+                        // old file are handed on first (they are lost
+                        // otherwise: the old file is no longer open); the
+                        // next poll reopens the path and fails then. No
+                        // cursor is saved while no file is open, so the
+                        // saved one stays in the old file, and the new
+                        // file is read from its start once it opens.
+                        Err(e) if records.is_empty() => return Err(e),
+                        Err(_) => {
+                            tracing::warn!(
+                                "audit log rotated and the new file cannot be opened; the end \
+                                 of the old file is handed on first"
+                            );
+                            return Ok(Polled {
+                                records,
+                                positions,
+                                more: true,
+                                skipped,
+                            });
+                        }
                     }
                 }
                 _ => break,
@@ -1169,6 +1223,7 @@ impl Tailer {
             records,
             positions,
             more: false,
+            skipped,
         })
     }
 
@@ -1991,6 +2046,103 @@ mod tests {
         append(&log, "b\n");
         let got = lines(t.poll().unwrap());
         assert_eq!(got, ["b"]);
+    }
+
+    /// The loss measured on Firebird 4.0.7 and 5.0.4 (`dev/firebird/it.sh`
+    /// step 6): at a rotation whose new file cannot be opened, the poll
+    /// failed and dropped the records it had already read from the end of
+    /// the old file. They are now handed on first; the next poll fails;
+    /// the saved cursor stays in the old file, so once the new file opens
+    /// it is read from its start (also after a restart). Every framing.
+    #[test]
+    fn the_end_of_a_rotated_file_is_handed_on_when_the_new_one_cannot_be_opened() {
+        for framing in [
+            Framing::Lines,
+            Framing::LinesKeepingEmpty,
+            Framing::Csv,
+            Framing::JsonObjects,
+        ] {
+            let d = Dir::new("rot-unreadable");
+            let log = d.0.join("audit.log");
+            let rec = |n: u32| match framing {
+                Framing::JsonObjects => format!("{{\"n\":{n}}}\n"),
+                Framing::Csv => format!("2026-10-31,\"r{n}\"\n"),
+                _ => format!("r{n}\n"),
+            };
+            let store = || CursorStore::new(&d.0, "t", "rot");
+            append(&log, "");
+            let mut t = Tailer::new(log.clone(), framing, store());
+            assert!(t.poll().unwrap().records.is_empty());
+            append(&log, &format!("{}{}", rec(1), rec(2)));
+            assert_eq!(t.poll().unwrap().records.len(), 2, "{framing:?}");
+            t.commit();
+            let before = saved(&store().unwrap());
+            // Written by the server just before it rotates, read in the
+            // poll that sees the rotation.
+            append(&log, &format!("{}{}", rec(3), rec(4)));
+            let old = std::fs::metadata(&log).unwrap().ino();
+            std::fs::rename(&log, d.0.join("audit.1.log")).unwrap();
+            let elsewhere = d.0.join("other");
+            append(&elsewhere, &rec(99));
+            std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+            let p = t.poll().unwrap();
+            assert_eq!(p.records.len(), 2, "{framing:?}");
+            assert!(p.more);
+            assert!(p.positions.iter().all(|r| r.file.1 == old));
+            assert_eq!(t.rotations, 1);
+            // No file is open: nothing is saved, the cursor stays.
+            t.commit();
+            assert_eq!(saved(&store().unwrap()), before);
+            assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+            assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+            // The new file opens: read from its start, through the saved
+            // cursor of the old file (counted as a rotation again).
+            std::fs::remove_file(&log).unwrap();
+            append(&log, &rec(5));
+            let p = t.poll().unwrap();
+            assert_eq!(p.records.len(), 1, "{framing:?}");
+            assert!(!p.records[0].contains(&b'9'));
+            assert_eq!(t.rotations, 2);
+            // A restart before the new file is read again: the same.
+            let mut t2 = Tailer::new(log.clone(), framing, store());
+            assert_eq!(t2.poll().unwrap().records.len(), 1, "{framing:?}");
+        }
+    }
+
+    /// Records skipped for their size are placed among the records read
+    /// (index of the next record, file), for every bound framing path.
+    #[test]
+    fn skipped_records_are_placed() {
+        let d = Dir::new("skipped");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::LinesKeepingEmpty, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        let big = "x".repeat(MAX_RECORD_BYTES + 10);
+        append(&log, &format!("a\n{big}\n\nb\n{big}\n"));
+        let mut all = Vec::new();
+        let mut skipped = Vec::new();
+        loop {
+            let p = t.poll().unwrap();
+            let base = all.len();
+            skipped.extend(p.skipped.iter().map(|(k, f)| (base + k, *f)));
+            all.extend(lines_of(&p));
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(all, ["a", "", "b"]);
+        let ino = std::fs::metadata(&log).unwrap().ino();
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].0, 1);
+        assert_eq!(skipped[1].0, 3);
+        assert!(skipped.iter().all(|(_, f)| f.1 == ino));
+        assert_eq!(t.oversized, 2);
+        let mut s = Splitter::with_max(Framing::JsonObjects, 8);
+        let mut out = Vec::new();
+        s.feed(b"{\"a\":1}\n{\"long\":\"value\"}\n{\"b\":2}\n", &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(s.last_skips(), [1]);
     }
 
     #[test]
