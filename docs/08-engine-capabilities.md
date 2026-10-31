@@ -1474,6 +1474,7 @@ What the Firebird connector's Audit does, as implemented in lot 3 (P10-B #385; [
   - the confirmed clock offset is learned again, and times are taken as printed until the first own attachment.
 
   No read is hidden: the outcome is over-reporting or a lower level.
+- **One Firebird account per agent process.** Each agent recognizes only its own statements. Two agent processes that use the same Firebird account (two agents, or a test agent beside the production one) see each other's statements in the trace and report them as reads by that account, matching "every read" policies. Give each agent its own account. This was most likely the cause of the agent-account events seen in the `e2e-firebird` run, where a second agent identity ran its checks over the main agent's account ([ADR-0060 implementation note of 2026-10-31 c](adr/0060-firebird-connector.md#implementation-note-2026-10-31-c-the-e2e-firebird-job-and-the-tailer-fixes)).
 - **Error records**: other clients' `ERROR` and `WARNING` records give no event of their own, except a permission refusal, which gives an always-reported `*` event. The failed statement itself is reported from its finish record.
 - **Over-reported objects** (always-reported `*` events, which match "every read" policies):
   - reads of tables with check constraints or domain checks, and of tables with expression indexes;

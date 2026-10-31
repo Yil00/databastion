@@ -572,6 +572,8 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 
 **Agent restarts.** Until the agent keeps its parser state across restarts (a planned change), restarting the agent while the server is busy can make the first records it re-reads ambiguous, which keeps the target at Limited for up to 24 h (`audit.log_records_ambiguous`), and its own recent reads are then reported as reads by the agent's account. No read is hidden. **Exclude the agent's account from "every read" policies** on Firebird targets, and expect a lower level for up to a day after an agent restart ([08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit)).
 
+**One account per agent.** Each agent recognizes only its own statements in the trace. If two agent processes use the same Firebird account (two agents, or a test agent beside the production one), each reports the other's reads as reads by that account. Give each agent its own Firebird account.
+
 **Backups.** Run backups through the services manager or over loopback TCP. An embedded `gbak` on the server host writes under its own process and makes its records ambiguous (24 h cap).
 
 **Untraced readers.** The database owner, `RDB$ADMIN` and holders of a utility system privilege (`USE_GBAK_UTILITY`, `USE_GFIX_UTILITY`, `USE_GSTAT_UTILITY` and the like) can read, within their object rights, **with no record in the trace**, so with no event. Grant these privileges only to accounts trusted to read without audit.
