@@ -911,7 +911,9 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   `audit.log_readable_by_others`), then each step replaces the agent's container and watches it for
   the main agent's measured time to Partial plus 60 s: the level is never `partial` in that window,
   the local reason stays the expected one, and at its end the notes that withhold Partial are
-  exactly `audit.log_readable_by_others`. The steps: without `host_identity`
+  `audit.log_readable_by_others` plus at most the baseline: what withholds Partial for the main
+  agent just before the steps (after the traffic, `audit.log_records_ambiguous`; a restarted agent
+  may or may not report it again, R39 (a)). The steps: without `host_identity`
   (`agent_in_container`); `host_identity.passwd` naming the agent image's own `/etc/passwd`, not a
   mount (`host_identity_refused (passwd: mount)`); a passwd file mounted read-write (the same
   reason); the agent run as the collision uid, a host user's (`agent-uid`: its own enrollment, its
@@ -920,8 +922,10 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   read-write step binds a root-owned copy of the host's passwd file (`install -o 0 -g 0 -m 0644`,
   with `sudo -n` in CI) rather than the host's own file read-write, which R52 item 2's text names:
   the refused rule (`mount`) is the same (for docs-keeper: an ADR-0060 note). Then a positive
-  control: the main agent with its own configuration and the read-only host files again, Partial
-  within the same window. Last, the console side again (a second database dump, the pages, the main
+  control: the main agent with its own configuration and the read-only host files again; within
+  the same window the readers check holds again, `audit.log_readable_by_others` is gone, and
+  either the target is Partial or only notes of the baseline withhold it (Partial is required
+  whenever nothing does). Last, the console side again (a second database dump, the pages, the main
   agent's state), the uid step's agent state and every log: no ground-truth value, marker or
   secret.
 
