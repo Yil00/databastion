@@ -35,9 +35,9 @@
 //!   fails (the same for a read error after some records were read); the
 //!   closed file is reported once by [`Tailer::take_ended`], so that a
 //!   source ends what it holds of it; no cursor is saved while no file is open, so once the new
-//!   file opens it is read from its start through the saved cursor, as
-//!   after a restart (without a cursor store: from its end, as at a first
-//!   start, unchanged).
+//!   file opens it is read from its start (through the saved cursor, as
+//!   after a restart; without a cursor store too, since security review L3
+//!   of #392, no longer from its end as at a first start).
 //! - The cursor also keeps a keyed fingerprint of the [`FP_BYTES`] bytes
 //!   of the file just before its offset, and before the end of what was
 //!   read when it holds a replay: HMAC-SHA256 with a sub-key of the agent
@@ -820,6 +820,10 @@ pub struct Tailer {
     open_check: Option<OpenCheck>,
     /// See [`Self::take_ended`].
     ended: Option<(u64, u64)>,
+    /// A rotation closed the file and the new one could not be opened:
+    /// the file opened next is a new file, read from its start even with
+    /// no saved cursor (not from its end, as at a first start).
+    after_rotation: bool,
     /// Tests: reads that succeed before every later read fails.
     #[cfg(test)]
     reads_before_failure: Option<u32>,
@@ -972,6 +976,7 @@ impl Tailer {
             oversized: 0,
             rotations: 0,
             ended: None,
+            after_rotation: false,
             #[cfg(test)]
             reads_before_failure: None,
             open_check: None,
@@ -1020,6 +1025,7 @@ impl Tailer {
         }
         let (mut file, dev, ino, len) = open_regular(&self.path, self.open_check.as_ref())?;
         let cursor = self.load_cursor();
+        let cursor_none = cursor.is_none();
         // First start: the end of a file being written need not be a record
         // boundary (see `Splitter::reset_unaligned`); nor the position of a
         // cursor saved before one was known.
@@ -1054,8 +1060,13 @@ impl Tailer {
                 );
                 0
             }
+            // The path's file after a rotation whose new file could not
+            // be opened then: a new file, read from its start.
+            None if self.after_rotation => 0,
             None => len,
         };
+        let unaligned = unaligned && !(self.after_rotation && cursor_none);
+        self.after_rotation = false;
         file.seek(SeekFrom::Start(start))
             .map_err(|e| TailError::Unreadable(e.kind()))?;
         // The bytes before the start, for the in-place rewrite check of the
@@ -1242,7 +1253,9 @@ impl Tailer {
                     // one stays in the old file, and the new file is read
                     // from its start once it opens.
                     self.ended = Some((dev, ino));
+                    self.after_rotation = true;
                     let (file, dev, ino, _) = open_regular(&self.path, self.open_check.as_ref())?;
+                    self.after_rotation = false;
                     self.file = Some((file, dev, ino));
                     self.offset = 0;
                     self.tail.clear();
@@ -1260,6 +1273,12 @@ impl Tailer {
     /// that file ends them (they can no longer be re-read).
     pub fn take_ended(&mut self) -> Option<(u64, u64)> {
         self.ended.take()
+    }
+
+    /// The `(st_dev, st_ino)` of the file open for reading, if any.
+    #[must_use]
+    pub fn open_file(&self) -> Option<(u64, u64)> {
+        self.file.as_ref().map(|(_, dev, ino)| (*dev, *ino))
     }
 
     /// The replay found in the saved cursor when the file was opened
@@ -2211,10 +2230,12 @@ mod tests {
         assert_eq!(t.take_ended().map(|f| f.1), Some(second));
         assert!(t.poll().is_err());
         assert_eq!(t.take_ended(), None);
-        // Only a record skipped for its size before the refusal (L1).
+        // The new file opens later: read from its start, also with no
+        // cursor store (L3), what was written while it was refused.
         std::fs::remove_file(&log).unwrap();
-        append(&log, "");
-        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, "written while refused\n");
+        assert_eq!(lines(t.poll().unwrap()), ["written while refused"]);
+        // Only a record skipped for its size before the refusal (L1).
         let third = ino(&log);
         append(&log, &format!("{}\n", "y".repeat(MAX_RECORD_BYTES + 1)));
         std::fs::rename(&log, d.0.join("audit.3.log")).unwrap();
