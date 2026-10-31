@@ -106,6 +106,15 @@ dump_agent() {
   compose logs --no-color --timestamps "$AGENT_SVC" >"$E2E_LOG_DIR/$f" 2>&1 || true
 }
 
+# host_fingerprints: sha256, inode, mode, owner and mtime of every mounted host identity file.
+HOSTID_FP=""
+host_fingerprints() {
+  local f
+  for f in "${HOST_FILES[@]}"; do
+    printf '%s %s\n' "$(stat -L -c '%i %a %u %g %Y' -- "$f")" "$(sha256sum -- "$f" | cut -d' ' -f1)"
+  done
+}
+
 cleanup() {
   local status=$?
   set +e
@@ -120,9 +129,16 @@ cleanup() {
   summary_append "$E2E_LOG_DIR"/census/*.md "$E2E_LOG_DIR/acl.md"
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
-  rm -rf "$E2E_WORK_DIR"
   phase_done teardown
   log "timings: ${TIMINGS}total $(( $(date +%s) - T_RUN ))s"
+  # L1 (review of #394): the host's identity files are never changed by the run.
+  if [ -s "$HOSTID_FP" ]; then
+    if ! host_fingerprints | cmp -s - "$HOSTID_FP"; then
+      log "FAIL: a host identity file changed during the run (sha256, inode, mode, owner or mtime)"
+      status=1
+    fi
+  fi
+  rm -rf "$E2E_WORK_DIR" 2>/dev/null || true
   if [ "$status" -eq 0 ]; then log "PASS"; else log "exit status $status"; fi
   exit "$status"
 }
@@ -136,6 +152,19 @@ log "preconditions: the host's identity files (R45, R47, R48; uids ${SERVER_UID}
 timeout 60 python3 -I "$HOSTID" check --uid "$SERVER_UID" --uid "$AGENT_UID" --present-uid "$COLLISION_UID" \
   --list "$E2E_WORK_DIR/hostid.list" >&2 || fail "the host's identity files do not meet the preconditions of R52 item 2 (above): the job fails, it never edits them nor picks other uids"
 mapfile -t HOST_FILES <"$E2E_WORK_DIR/hostid.list"
+HOSTID_FP="$E2E_WORK_DIR/hostid.fingerprints"
+host_fingerprints >"$HOSTID_FP"
+# The read-write negative step binds a root-owned copy of the passwd file, never the host's own file
+# read-write (review L1; R52 item 2 names the host's file: the mount rule refused is the same).
+PASSWD_COPY="$E2E_WORK_DIR/hostcopy/passwd"
+mkdir -p "$(dirname "$PASSWD_COPY")"
+chmod 0755 "$(dirname "$PASSWD_COPY")"
+if [ "$(id -u)" = 0 ]; then
+  install -o 0 -g 0 -m 0644 /etc/passwd "$PASSWD_COPY"
+else
+  timeout 30 sudo -n install -o 0 -g 0 -m 0644 /etc/passwd "$PASSWD_COPY" \
+    || fail "cannot make the root-owned passwd copy of the read-write step (sudo -n)"
+fi
 log "identity files mounted: ${HOST_FILES[*]}"
 kernel="$(uname -r)"
 IFS=. read -r kmaj kmin _ <<<"$kernel"
@@ -146,7 +175,9 @@ phase_done preconditions
 
 # R54 (ADR-0060 refinement of 2026-10-31 c): Partial needs max_log_size = 0 (absent: the server's
 # default, 0) in every section of the trace configuration that writes the declared log (no server
-# rotation); the database section of crm sets it explicitly.
+# rotation); the database section of crm sets it explicitly. A convenience check of the dev file's
+# own layout (one key per line, `{` and `}` on their own lines): the agent's check() is what decides,
+# and Partial below fails without it.
 awk -v log_file="$FB_LOG" '
   /^[[:space:]]*\{/ { in_s = 1; writes = 0; size = 0; next }
   /^[[:space:]]*\}/ { if (in_s && writes && size != 0) bad = 1; if (in_s && writes) n++; in_s = 0; next }
@@ -177,6 +208,15 @@ register_value dcl_marker_2 "$MARK_PW2"
 register_value routine_marker "$MARK_RET"
 register_value execute_statement_marker "$MARK_ES"
 register_value process_marker "$MARK_PROC"
+# M3 (review of #394; ADR-0060 decision 6, R4): the #82 cases the ADR lists beyond these, written
+# with the stock isql: a literal cut at max_sql_length, an ON EXTERNAL password, the user name of a
+# failed attachment (upper case: Firebird folds unquoted user names).
+MARK_CUT="fbcut$(rand_hex 12)"
+MARK_EXT="Fbext$(rand_hex 12)"
+MARK_USER="FBUSR$(openssl rand -hex 12 | tr 'a-f' 'A-F')"
+register_value cut_literal_marker "$MARK_CUT"
+register_value external_password_marker "$MARK_EXT"
+register_value failed_user_marker "$MARK_USER"
 test_ca "e2e Firebird"
 
 # agent_yaml FILE HOST_IDENTITY: the agent's configuration; HOST_IDENTITY: `declared` (the mounted
@@ -241,10 +281,10 @@ hostid_yml() {
     printf 'services:\n  %s:\n    volumes:\n' "$1"
     for f in "${HOST_FILES[@]}"; do
       n="$(basename "$f")"
-      ro=true
-      [ "$n" = passwd ] && [ "$2" = rw ] && ro=false
+      ro=true src="$f"
+      if [ "$n" = passwd ] && [ "$2" = rw ]; then ro=false src="$PASSWD_COPY"; fi
       printf '      - type: bind\n        source: %s\n        target: %s/%s\n        read_only: %s\n        bind:\n          create_host_path: false\n' \
-        "$f" "$HOST_DIR" "$n" "$ro"
+        "$src" "$HOST_DIR" "$n" "$ro"
     done
   } >"$HOSTID_YML"
 }
@@ -276,11 +316,22 @@ last_checked() {
     | grep -F '"Firebird checked"' | grep -F "\"target_id\":\"${TARGET}\"" | tail -n 1 || true
 }
 # readers_detail LINE: the readers check's reason of a "Firebird checked" line, or `holds`.
+# A line without a `detail` field gives `no-detail`, never `holds`.
 readers_detail() {
   local d
-  d="$(jq -r '.fields.detail // .detail // empty' <<<"$1" 2>/dev/null | tr ';' '\n' \
-    | sed -n 's/^ *readers check: //p' | head -n 1)"
+  if ! jq -e '.fields.detail | type == "string"' <<<"$1" >/dev/null 2>&1; then
+    printf 'no-detail'
+    return 0
+  fi
+  d="$(jq -r '.fields.detail' <<<"$1" | tr ';' '\n' | sed -n 's/^ *readers check: //p' | head -n 1)"
   printf '%s' "${d:-holds}"
+}
+# withholding NOTES: the notes of NOTES that withhold Partial (FORBIDDEN_NOTES), sorted.
+withholding() {
+  local c out=()
+  # shellcheck disable=SC2086 # lists of note codes
+  for c in $FORBIDDEN_NOTES; do [[ " $1 " != *" $c "* ]] || out+=("$c"); done
+  printf '%s\n' "${out[@]}" | sort | tr '\n' ' ' | sed 's/ $//'
 }
 # status_after AGENT_ID TIME: the target's status as the console stored it from a heartbeat
 # received after TIME: "level|source|notes", empty before.
@@ -333,19 +384,36 @@ done
 printf -- '### e2e-firebird: audit log ACLs (ADR-0060 R52 item 1)\n\n- The log volume (`%s`) keeps the named-user ACLs of the layout (access and default entries read back).\n' "$fs" >"$E2E_LOG_DIR/acl.md"
 log "ACLs: the log volume's file system (${fs}) keeps the layout's named-user ACLs"
 # Loopback only (decision 3): every listening TCP socket of the namespace is on 127.0.0.0/8 (the
-# server on 127.0.0.1, Docker's embedded DNS resolver on 127.0.0.11) or ::1.
+# server on 127.0.0.1, Docker's embedded DNS resolver on 127.0.0.11) or ::1, owned by the server
+# (84) or root (the resolver), never by the agent's or a host user's uid (review L4).
+check_listeners() { # WHEN
+  local sockets listen a u
+  # shellcheck disable=SC2016 # the container shell's script
+  sockets="$(compose exec -T firebird sh -c 'cat /proc/net/tcp; if [ -e /proc/net/tcp6 ]; then cat /proc/net/tcp6; fi')" \
+    || fail "cannot read the server namespace's sockets ($1)"
+  listen="$(awk '$4 == "0A" { split($2, a, ":"); print a[1] " " $8 }' <<<"$sockets" | sort -u)"
+  [ -n "$listen" ] || fail "nothing listens in the server's namespace ($1)"
+  while read -r a u; do
+    case "$a" in
+      ??????7F | 00000000000000000000000001000000) ;;
+      *) fail "a socket of the server's namespace listens on another address than the loopback ($a, $1)" ;;
+    esac
+    case "$u" in
+      "$SERVER_UID" | 0) ;;
+      *) fail "a listening socket of the server's namespace is owned by uid $u, not the server's or root's ($1)" ;;
+    esac
+  done <<<"$listen"
+  log "firebird: listening on the loopback only, uids 84 / 0 ($(wc -l <<<"$listen") socket(s), $1)"
+}
+check_listeners "after the start"
+# Review L3: the security database and the image's SYSDBA.password file in the Firebird root, which
+# the agent sees read-only, are not readable by the agent's uid.
 # shellcheck disable=SC2016 # the container shell's script
-sockets="$(compose exec -T firebird sh -c 'cat /proc/net/tcp; if [ -e /proc/net/tcp6 ]; then cat /proc/net/tcp6; fi')" \
-  || fail "cannot read the server namespace's sockets"
-listen="$(awk '$4 == "0A" { split($2, a, ":"); print a[1] }' <<<"$sockets" | sort -u | tr '\n' ' ')"
-for a in $listen; do
-  case "$a" in
-    ??????7F | 00000000000000000000000001000000) ;;
-    *) fail "a socket of the server's namespace listens on another address than the loopback ($a)" ;;
-  esac
-done
-[ -n "$listen" ] || fail "nothing listens in the server's namespace"
-log "firebird: listening on the loopback only ($(wc -w <<<"$listen") address(es))"
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T firebird-root-probe \
+  'n=0; for f in /opt/firebird/security*.fdb /opt/firebird/SYSDBA.password; do [ -e "$f" ] || continue; n=$((n + 1)); if [ -r "$f" ]; then echo "readable: $(basename "$f")"; exit 1; fi; done; [ "$n" -ge 1 ] || { echo "no security database in the root"; exit 2; }; echo "$n file(s) not readable"' \
+  >"$E2E_LOG_DIR/firebird-root-probe.log" 2>&1 \
+  || fail "the agent's uid can read the security database or SYSDBA.password in the Firebird root (firebird-root-probe.log)"
+log "firebird root: the security database is not readable by uid ${AGENT_UID} ($(tail -n 1 "$E2E_LOG_DIR/firebird-root-probe.log"))"
 inspect_scan "after the start"
 phase_done start
 
@@ -365,6 +433,7 @@ layout() { # container uid passwd_rw
       | $c.HostConfig.NetworkMode == "container:" + $fb and $c.HostConfig.PidMode == "container:" + $fb
       and ($c.HostConfig.CapDrop | index("ALL")) != null and ($c.HostConfig.CapAdd // [] | length) == 0
       and $c.HostConfig.ReadonlyRootfs and ($c.HostConfig.GroupAdd // [] | length) == 0
+      and ($c.HostConfig.SecurityOpt // [] | index("no-new-privileges:true")) != null
       and $c.Config.User == $user
       and all(["/opt/firebird", "/opt/firebird/firebird.conf", "/databastion/fbtrace.conf",
                "/var/lib/firebird/audit"][]; . as $d | any($c.Mounts[]; .Destination == $d and .RW == false))
@@ -372,11 +441,11 @@ layout() { # container uid passwd_rw
     || fail "the agent's container is not in the layout of R52 item 2 (namespaces, capabilities, read-only mounts)"
   for f in "${HOST_FILES[@]}"; do
     n="$(basename "$f")"
-    rw=false
-    [ "$n" = passwd ] && rw="$want_rw"
-    docker inspect "$1" | jq -e --arg s "$f" --arg d "${HOST_DIR}/${n}" --argjson rw "$rw" \
+    rw=false src="$f"
+    if [ "$n" = passwd ] && [ "$want_rw" = true ]; then rw=true src="$PASSWD_COPY"; fi
+    docker inspect "$1" | jq -e --arg s "$src" --arg d "${HOST_DIR}/${n}" --argjson rw "$rw" \
       'any(.[0].Mounts[]; .Type == "bind" and .Source == $s and .Destination == $d and .RW == $rw)' >/dev/null \
-      || fail "the host's ${f} is not a single-file bind mount at ${HOST_DIR}/${n} (RW ${rw})"
+      || fail "${src} is not a single-file bind mount at ${HOST_DIR}/${n} (RW ${rw})"
   done
   # Every container of the server's network namespace drops NET_RAW and NET_ADMIN (decision 3).
   docker inspect "$FB_CID" | jq -e '(.[0].HostConfig.CapDrop | index("ALL")) != null' >/dev/null \
@@ -390,6 +459,7 @@ layout() { # container uid passwd_rw
   done
 }
 layout "$AGENT_CID" "$AGENT_UID"
+check_listeners "with the agent"
 log "layout: the agent in the server's network and pid namespaces, no capability, read-only root, mounts at the server's paths; ${#HOST_FILES[@]} host file(s) bind-mounted read-only"
 wait_online 180 "${TARGET}:firebird"
 t="$(target_json "$TARGET")"
@@ -426,6 +496,7 @@ create_policy "$POLICY_FULL" critical "$(jq -nc --arg t "$TARGET" '{signals: ["s
 create_policy "$POLICY_READS" medium "$(jq -nc --arg t "$TARGET" '{event_actions: ["read"], target_ids: [$t]}')"
 log "Audit: enabling Audit on ${TARGET}"
 enable_audit "$TARGET"
+T_AUDIT="$(date +%s)"
 log "Audit: waiting for Partial (${SOURCE}, at most ${PARTIAL_TIMEOUT_S} s)"
 deadline=$(( $(date +%s) + PARTIAL_TIMEOUT_S ))
 while :; do
@@ -442,7 +513,10 @@ while :; do
 done
 why="$(readers_detail "$(last_checked agent)")"
 [ "$why" = holds ] || fail "${TARGET}: Partial while the agent's last check reports the readers check '${why}'"
-log "${TARGET}: audit level partial (${SOURCE}) through firebird.audit.host_identity; notes: ${notes}"
+PARTIAL_TOOK_S=$(( $(date +%s) - T_AUDIT ))
+# The negative steps watch at least this long, plus a heartbeat and a check (review M1).
+PARTIAL_WINDOW_S=$(( PARTIAL_TOOK_S + 60 ))
+log "${TARGET}: audit level partial (${SOURCE}) through firebird.audit.host_identity after ${PARTIAL_TOOK_S} s; notes: ${notes}"
 # The agent's own statements (check() and its read-back probe, the stream's catalog reads) are never
 # reported: two heartbeats later, no event at all (nobody else used the server since the stream
 # started).
@@ -519,6 +593,33 @@ log "Audit: a routine's returned marker and an EXECUTE STATEMENT marker as SYSDB
   # shellcheck disable=SC2016 # a Firebird name
   printf 'SELECT F_E2E_MARKER() FROM RDB$DATABASE;\nDROP FUNCTION F_E2E_MARKER;\nCOMMIT;\n'
 } | fb_isql SYSDBA target_fb_sysdba_password || fail "the SYSDBA marker statements failed ($(client_error_code))"
+
+# M3: a literal cut at max_sql_length (65 000 in fbtrace.conf): nine literals of 8 000 characters
+# (each under the 32 765-byte literal bound in UTF-8; compared with a constant, not cast to a
+# column) make a text of about 72 000 characters, the marker at the start of the first, inside the
+# part the trace keeps.
+log "Audit: a statement cut at max_sql_length, a marker in its literal, as E2E_ANALYST"
+python3 -I -c 'import sys
+m = sys.argv[1]
+lits = [m + "a" * (8000 - len(m))] + [chr(98 + i) * 8000 for i in range(8)]
+print("SELECT COUNT(*) FROM CUSTOMERS WHERE \x27z\x27 IN (" + ", ".join("\x27%s\x27" % l for l in lits) + ");")' \
+  "$MARK_CUT" | fb_isql E2E_ANALYST target_client_password || fail "the cut statement failed ($(client_error_code))"
+# M3: EXECUTE STATEMENT ... ON EXTERNAL with a marker password (wrong: the inner attachment fails,
+# the outer statement's text, marker included, is traced all the same).
+log "Audit: EXECUTE STATEMENT ON EXTERNAL with a marker password as SYSDBA (fails, as intended)"
+{
+  printf 'SET TERM ^ ;
+'
+  printf "EXECUTE BLOCK AS DECLARE X INTEGER; BEGIN EXECUTE STATEMENT 'SELECT 1 FROM RDB\$DATABASE' ON EXTERNAL '127.0.0.1/3050:%s' AS USER 'E2E_ANALYST' PASSWORD '%s' INTO X; END^\n" "$FB_DB" "$MARK_EXT"
+  printf 'SET TERM ; ^\n'
+} | fb_isql SYSDBA target_fb_sysdba_password && fail "EXECUTE STATEMENT ON EXTERNAL with a wrong password succeeded"
+log "Audit: ON EXTERNAL refused as expected ($(client_error_code))"
+# M3: a failed attachment whose user name is a marker (a wrong password for an unknown user).
+log "Audit: a failed attachment as a marker user name"
+# shellcheck disable=SC2016 # a Firebird name
+printf 'SELECT 1 FROM RDB$DATABASE;\n' | fb_isql "$MARK_USER" target_client_password \
+  && fail "the attachment as an unknown user succeeded"
+log "Audit: the marker user's attachment refused as expected ($(client_error_code))"
 rm -f -- "$E2E_WORK_DIR/client.err"
 phase_done traffic
 
@@ -587,12 +688,33 @@ for id in $LITERAL_IDS; do
     fail "Audit: literal $id not in the server's trace log (positive control)"
   fi
 done
-in_trace=""
+# Review M2 / M3: every marker of the #82 cases is in the server's trace log (matched without case:
+# the server prints user names in upper case), measured on 5.0.4: the passwords of CREATE / ALTER
+# USER and of ON EXTERNAL are not masked by the server, the cut text keeps its first 65 000
+# characters.
+# The failed attachment is the exception, measured on 5.0.4 and deterministic (ADR-0060 R10): the
+# authentication fails before any attachment to crm exists, so crm's section writes no record of it
+# and its user name is not in the log; the I2 scans still search every artifact for it.
+missing=""
 for m in "$NP"/*; do
-  if LC_ALL=C grep -qFf "$m" "$E2E_WORK_DIR/target-audit.log"; then in_trace+=" $(basename "$m")"; fi
+  [ "$(basename "$m")" = failed_user_marker ] && continue
+  LC_ALL=C grep -qiFf "$m" "$E2E_WORK_DIR/target-audit.log" || missing+=" $(basename "$m")"
 done
-grep -qF "$MARK_PROC" "$E2E_WORK_DIR/target-audit.log" || fail "Audit: the marker client path is not in the server's trace log (positive control)"
-log "Audit: the trace log holds the literals ($LITERAL_IDS) and the markers:${in_trace:- none} (positive controls; the agent must drop them all)"
+[ -z "$missing" ] || fail "Audit: marker(s) not in the server's trace log (positive control):${missing}"
+! LC_ALL=C grep -qiFf "$NP/failed_user_marker" "$E2E_WORK_DIR/target-audit.log" \
+  || fail "Audit: the failed attachment's user name is in crm's trace log (R10 expects no record): fingerprinting it is then untested here"
+# The cut record is the server's (the text ends with `...` at max_sql_length).
+grep -qE "^SELECT COUNT\\(\\*\\) FROM CUSTOMERS WHERE 'z' IN .*\\.\\.\\.\$" "$E2E_WORK_DIR/target-audit.log" \
+  || fail "Audit: the long statement is not cut at max_sql_length in the trace log (positive control)"
+# PLG$SRP_VIEW parameter records (the security database's user rows, written by CREATE / ALTER USER
+# with the password parameters) are not in this log: the trace configuration's only enabled database
+# section is crm's (proof 11), so the security database is never traced; the parser fixtures cover
+# that record. Checked: no record reads or writes PLG$SRP / PLG$SRP_VIEW (no table-block row, no
+# INSERT / UPDATE text); the relation's name appears only in the agent's own catalog reads (R9).
+# shellcheck disable=SC2016 # Firebird names
+! grep -qE '^PLG\$SRP(_VIEW)? |(INSERT INTO|UPDATE) "?PLG\$SRP' "$E2E_WORK_DIR/target-audit.log" \
+  || fail "Audit: a record reads or writes PLG\$SRP_VIEW: the security database is traced, which the crm-only configuration excludes"
+log "Audit: the trace log holds the literals ($LITERAL_IDS) and $(( $(find "$NP" -type f | wc -l) - 1 )) markers (positive controls; the agent must drop them all); no record of the failed attachment (R10) and no PLG\$SRP_VIEW record (security database not traced)"
 rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out"
 phase_done audit
 
@@ -646,15 +768,19 @@ ctl="$(status_after "$AGENT_ID" "$STEP_T")"
 [[ " ${ctl##*|} " != *" ${READERS_NOTE} "* ]] || fail "control: the main agent's status already has ${READERS_NOTE}"
 log "negative steps: control holds (readers check holds; level ${ctl%%|*}; no ${READERS_NOTE})"
 
-# step NAME SERVICE AGENT_ID CONFIG PASSWD_MODE REASON: one negative step.
+# step NAME SERVICE AGENT_ID CONFIG PASSWD_MODE REASON EXPECTED_WITHHOLDING: one negative step. It
+# watches at least the main agent's time to Partial plus a minute (PARTIAL_WINDOW_S, review M1): the
+# level is never partial in that window, and at its end the notes that withhold Partial are exactly
+# EXPECTED_WITHHOLDING.
 step() {
-  local name="$1" svc="$2" id="$3" config="$4" mode="$5" reason="$6" deadline line why st cid
+  local name="$1" svc="$2" id="$3" config="$4" mode="$5" reason="$6" expected="$7" deadline line why st cid end t_start
   dump_agent
   timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
   STEP="$name" AGENT_SVC="$svc"
   hostid_yml "$svc" "$mode"
   export E2E_FB_AGENT_CONFIG="$config"
   STEP_T="$(console_sql "SELECT now()")"
+  t_start="$(date +%s)"
   timeout 60 docker compose "${COMPOSE_ARGS[@]}" --profile tools up -d --no-deps "$svc" >/dev/null
   cid="$(compose --profile tools ps -q "$svc")"
   [ -n "$cid" ] || fail "step ${name}: the agent's container did not start"
@@ -674,14 +800,24 @@ step() {
     sleep 3
   done
   [ "$why" = "$reason" ] || fail "step ${name}: the readers check fails with '${why}', expected '${reason}'"
-  [ "${st%%|*}" != partial ] || fail "step ${name}: the target is Partial"
+  end=$(( t_start + PARTIAL_WINDOW_S ))
+  while :; do
+    st="$(status_after "$id" "$STEP_T")"
+    [ "${st%%|*}" != partial ] || fail "step ${name}: the target became Partial"
+    why="$(readers_detail "$(last_checked "$svc")")"
+    [ "$why" = "$reason" ] || fail "step ${name}: the readers check now gives '${why}', expected '${reason}'"
+    [ "$(date +%s)" -lt "$end" ] || break
+    sleep 3
+  done
   [[ " ${st##*|} " == *" ${READERS_NOTE} "* ]] || fail "step ${name}: no ${READERS_NOTE} note (${st##*|})"
-  log "step ${name}: level ${st%%|*}, ${READERS_NOTE}, local reason '${why}'"
+  [ "$(withholding "${st##*|}")" = "$expected" ] \
+    || fail "step ${name}: the notes withholding Partial are '$(withholding "${st##*|}")', expected '${expected}'"
+  log "step ${name}: never partial over ${PARTIAL_WINDOW_S} s; level ${st%%|*}; withholding notes '${expected}'; local reason '${why}'"
   inspect_scan "step ${name}"
 }
-step no-host-identity agent "$AGENT_ID" agent-noid.yaml ro agent_in_container
-step image-file agent "$AGENT_ID" agent-image.yaml ro "host_identity_refused (passwd: mount)"
-step passwd-rw agent "$AGENT_ID" agent.yaml rw "host_identity_refused (passwd: mount)"
+step no-host-identity agent "$AGENT_ID" agent-noid.yaml ro agent_in_container "$READERS_NOTE"
+step image-file agent "$AGENT_ID" agent-image.yaml ro "host_identity_refused (passwd: mount)" "$READERS_NOTE"
+step passwd-rw agent "$AGENT_ID" agent.yaml rw "host_identity_refused (passwd: mount)" "$READERS_NOTE"
 
 # The uid step: its own enrollment, state and secrets volumes owned by that uid (0700, files 0600).
 log "step uid-collision: enrolling a second agent identity running as uid ${COLLISION_UID}"
@@ -706,18 +842,58 @@ AGENT2_ID="$(jq -r '.agent_id' <<<"$identity")"
 register_secret agent_secret_uid "$(jq -r '.agent_secret' <<<"$identity")"
 unset identity
 [[ "$AGENT2_ID" =~ $UUID_RE ]] || fail "no agent id (uid step)"
-step uid-collision agent-uid "$AGENT2_ID" agent-uid.yaml ro uid_collision
+# The uid step's agent cannot read the log either (the layout grants uid 10001 only), so it also
+# reports audit.log_not_readable and never reads a record (audit.partial_pending_first_record).
+step uid-collision agent-uid "$AGENT2_ID" agent-uid.yaml ro uid_collision \
+  "audit.log_not_readable ${READERS_NOTE} audit.partial_pending_first_record"
+dump_agent
+# Positive control of the steps (review M1): the main agent again, its own configuration and the
+# read-only host files, Partial within the same window.
+log "positive control: the main agent with host_identity again, Partial within ${PARTIAL_WINDOW_S} s"
+timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
+STEP=final AGENT_SVC=agent
+hostid_yml agent ro
+export E2E_FB_AGENT_CONFIG=agent.yaml
+STEP_T="$(console_sql "SELECT now()")"
+T_FINAL="$(date +%s)"
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps agent >/dev/null
+layout "$(compose ps -q agent)" "$AGENT_UID"
+while :; do
+  st="$(status_after "$AGENT_ID" "$STEP_T")"
+  if [ "${st%%|*}" = partial ] && [ -z "$(withholding "${st##*|}")" ]; then break; fi
+  [ "$(date +%s)" -lt $(( T_FINAL + PARTIAL_WINDOW_S )) ] \
+    || fail "positive control: not Partial within ${PARTIAL_WINDOW_S} s of the restart (status '${st}', readers check '$(readers_detail "$(last_checked agent)")')"
+  sleep 3
+done
+log "positive control: Partial again $(( $(date +%s) - T_FINAL )) s after the restart"
 dump_agent
 phase_done negative-steps
 
-# The steps' logs and their agents' states: no secret, marker or ground-truth value either.
+# After the steps (review L2): the console side again (a second database dump, the pages, the main
+# agent's state), the uid step's agent state and every log: no ground-truth value, marker or secret.
 for f in "$E2E_LOG_DIR"/agent-*.log; do [ -s "$f" ] || fail "$(basename "$f") is empty"; done
+dump_logs "${SERVICES[@]}"
+D="$E2E_WORK_DIR/dump2"
+collect_console_side "$D" "$TARGET"
+mkdir -p "$E2E_WORK_DIR/state-uid"
+files_uid 'tar -C /state-uid -cf - .' | tar -C "$E2E_WORK_DIR/state-uid" -xf - \
+  || fail "cannot read the uid step's agent state"
+[ -f "$E2E_WORK_DIR/state-uid/identity.json" ] || fail "no identity.json in the uid step's state: the scan would prove nothing"
 i2_failed=0
-timeout 300 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine "$ENGINE" --label "firebird step logs" \
-  "$E2E_LOG_DIR" --exclude 'firebird.log' >&2 || i2_failed=1
-[ "$i2_failed" = 0 ] || fail "invariant I2: a ground-truth value in a step's log"
-if ! leaked="$(leak_scan "$E2E_LOG_DIR" "$P")"; then
-  while IFS= read -r l; do log "LEAK (logs): $l"; done <<<"$leaked"
-  fail "a secret reached a step's log (names above)"
-fi
+timeout 300 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine "$ENGINE" --label "firebird after the steps" \
+  --exclude 'firebird.log' "$D" "$E2E_WORK_DIR/state-uid" "$E2E_LOG_DIR" >&2 || i2_failed=1
+timeout 300 python3 "$I2_CHECK" scan --label "firebird #82 markers after the steps" "${secret_files[@]}" \
+  --exclude 'firebird.log' "$D" "$E2E_WORK_DIR/state-uid" "$E2E_LOG_DIR" >&2 || i2_failed=1
+[ "$i2_failed" = 0 ] || fail "invariant I2: a ground-truth value or a marker after the negative steps"
+leaks=0
+secret_hygiene "$D" 'firebird.log' || leaks=1
+rm -f -- "$E2E_WORK_DIR/state-uid/identity.json"
+for pdir in "$P" "$NP"; do
+  if ! leaked="$(leak_scan "$E2E_WORK_DIR/state-uid" "$pdir")"; then
+    while IFS= read -r l; do log "LEAK (uid step's state): $l"; done <<<"$leaked"
+    leaks=1
+  fi
+done
+[ "$leaks" = 0 ] || fail "a secret or a marker after the negative steps (names above)"
+rm -rf -- "$D" "$E2E_WORK_DIR/state-uid"
 log "all checks passed (full read -> incident ${FULL_LATENCY_MS} ms)"

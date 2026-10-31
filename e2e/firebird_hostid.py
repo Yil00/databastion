@@ -298,6 +298,9 @@ def main(argv: list[str]) -> int:
     c.add_argument("--present-uid", type=int)
     c.add_argument("--list", metavar="FILE", help="write the paths to mount, one per line")
     args = p.parse_args(argv)
+    if args.list and os.path.realpath(args.root) != "/":
+        # The listed paths are the ones mounted into the agent: only the host's own files.
+        p.error("--list is only for --root /")
     errors, mounts = check(args.root, args.uid or [84, 10001], args.present_uid, sys.stdout)
     for e in errors:
         print(f"hostid: FAIL {e}")

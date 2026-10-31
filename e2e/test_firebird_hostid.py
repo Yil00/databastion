@@ -150,5 +150,13 @@ class FileRules(unittest.TestCase):
             self.assertEqual(h.file_problem(os.path.join(d, "none"), 100)[0], "missing")
 
 
+class Main(unittest.TestCase):
+    def test_list_refused_with_another_root(self):
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit) as e, \
+                mock.patch("sys.stderr", io.StringIO()):
+            h.main(["check", "--root", d, "--list", os.path.join(d, "out")])
+        self.assertEqual(e.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

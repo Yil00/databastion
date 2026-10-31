@@ -35,6 +35,9 @@
 #   agent-uid            the negative step "the agent as the runner's uid" (R52 item 2: uid 1001,
 #                        `uid_collision`): the same image and layout as `agent`, its own state and
 #                        secrets volumes and its own enrollment (`tools` profile).
+#   firebird-root-probe  one-shot (`tools`): as the agent's uid 10001, the Firebird root as the
+#                        agent sees it (read-only): its security database and SYSDBA.password are not
+#                        readable (security review L3 of #394). No network, no capability.
 #   firebird-acl-inspect one-shot (`tools`): the ACLs of the log volume (getfacl, as the server's
 #                        uid 84, no capability, no network): whether the volume's file system keeps
 #                        them (R52 item 1).
@@ -152,6 +155,18 @@ services:
       - agent-secrets:/secrets
       - agent-state-uid:/state-uid
       - agent-secrets-uid:/secrets-uid
+
+  firebird-root-probe:
+    profiles: [tools]
+    image: databastion-dev/firebird-acl-init:5.0.4
+    user: "10001:10001"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-euc"]
+    volumes:
+      - firebird-root:/opt/firebird:ro
 
   firebird-acl-inspect:
     profiles: [tools]

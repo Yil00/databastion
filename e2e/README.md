@@ -843,7 +843,8 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   the subordinate and systemd ranges and not reserved (R48); the collision step's uid (1001 in CI)
   present. Otherwise the run fails: it never edits a file and never picks other uids. Counts and
   verdicts only are printed, never a name or a line. Linux 5.8 or later (`openat2`,
-  `STATX_MNT_ID`).
+  `STATX_MNT_ID`). The sha256, inode, mode, owner and mtime of each of these files are recorded
+  here and compared at exit: the run fails if any changed.
 - **The log volume's ACLs** (R52 item 1): `firebird-audit-init` (the dev step,
   [`dev/firebird/acl-init`](../dev/firebird/acl-init/layout.sh)) gives the log and its directory
   to the server (84), no group or other access, and uid 10001 read through named-user ACLs, with the
@@ -858,19 +859,23 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   entrypoint and seed (`crm`), plus the test accounts of
   [`target-initdb/firebird-20-clients.sh`](target-initdb/firebird-20-clients.sh) (first start
   only, over an embedded connection, emptied from the log with the seed's): `E2E_EXPORTER` and
-  `E2E_ANALYST` (`SELECT` on `CUSTOMERS` and `PAYMENT_CARDS` through a role), `E2E_ADMIN` (the
-  `USER_MANAGEMENT` system privilege, no table). Passwords from Docker secrets, read by a wrapper
+  `E2E_ANALYST` (`SELECT` on `CUSTOMERS` and `PAYMENT_CARDS` through a role), `E2E_ADMIN` (the security database's admin role, used with the role `RDB$ADMIN` for the
+  password-bearing DCL; no grant in `crm`, so no table). Passwords from Docker secrets, read by a wrapper
   for the entrypoint only (never in `docker inspect`). The Firebird root `/opt/firebird` is the
   volume `firebird-root`, filled from the image, so that the agent sees it at the same path. The
-  run checks that every listening socket of the namespace is on the loopback (the server on
-  127.0.0.1:3050; Docker's embedded resolver listens on 127.0.0.11 in every user network).
+  run checks, after the start and again with the agent, that every listening socket of the
+  namespace is on the loopback (the server on 127.0.0.1:3050; Docker's embedded resolver listens on
+  127.0.0.11 in every user network) and owned by uid 84 or 0, never the agent's or a host user's;
+  and, as uid 10001 with the root mounted as the agent sees it (`firebird-root-probe`), that the
+  security database and the image's `SYSDBA.password` are not readable.
 - **The agent's container** (R52 item 2, R50): `network_mode` and `pid: service:firebird`, every
   capability dropped (as the server's: no container of that namespace keeps `NET_RAW` or
   `NET_ADMIN`; checked with `docker inspect` at every start), read-only root file system, no
   supplementary group, uid 10001. Read-only at the server's paths: the Firebird root, its
   `firebird.conf`, the trace configuration and the log directory; not the data volume. The host's
   identity files as single-file read-only bind mounts under `/run/databastion/host`
-  (`create_host_path: false`), declared in `firebird.audit.host_identity` (`peer_uid: 84`, numeric).
+  (`create_host_path: false`), declared in `firebird.audit.host_identity` (`peer_uid: 84`, numeric);
+  `no-new-privileges` set.
 - **Checks**: enrollment; the readers check holding with the declared files from the first check
   (the agent's local detail, its "Firebird checked" line, names no readers-check reason), never
   Partial before the stream runs; Discovery against [`dev/ground-truth.json`](../dev/ground-truth.json)
@@ -881,23 +886,46 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   (`shape.full_table_read`) raising a critical incident (read -> incident time printed, limit
   120 s); filtered `SELECT`s whose literals are ground-truth values by `E2E_ANALYST`, from an `isql`
   copied to a marker path (the client process name in the trace); the #82 marker cases:
-  `CREATE` / `ALTER USER` with marker passwords and `DROP USER` by `E2E_ADMIN`, and as `SYSDBA` a
-  function returning a marker and an `EXECUTE STATEMENT` with a marker inner text; the events name
-  the tables read, all from `firebird_audit_trace`, none of the agent's account; positive controls:
-  the server's trace log holds the literals and the marker path (read as uid 84 into the private run
-  directory, never uploaded), and which other markers it holds is logged. Then I2: no ground-truth
+  `CREATE` / `ALTER USER` with marker passwords and `DROP USER` by `E2E_ADMIN`; as `SYSDBA` a
+  function returning a marker and an `EXECUTE STATEMENT` with a marker inner text; a statement of
+  about 72 000 characters cut at `max_sql_length` (65 000), a marker at the start of its first
+  literal; `EXECUTE STATEMENT … ON EXTERNAL` with a marker password (refused, as intended: the
+  outer text is traced all the same); a failed attachment whose user name is a marker. The events
+  name the tables read, all from `firebird_audit_trace`, none of the agent's account. Positive
+  controls, in the server's trace log (read as uid 84 into the private run directory, never
+  uploaded): the literals, and every marker (matched without case), measured on 5.0.4: the server
+  does not mask the passwords of `CREATE` / `ALTER USER` or `ON EXTERNAL`, and keeps the cut text's
+  first 65 000 characters ending in `...`. Two deterministic exceptions, asserted: the failed
+  attachment leaves no record in `crm`'s section (ADR-0060 R10: authentication fails before an
+  attachment to the database exists), so its user name is not in the log, and fingerprinting a
+  failed attachment's user name is covered by the parser fixtures, not here; and no record reads or
+  writes `PLG$SRP` / `PLG$SRP_VIEW` (the user rows `CREATE` / `ALTER USER` write, with their
+  password parameters, are in the security database, which the crm-only configuration never
+  traces, proof 11), so the parameter record of that case stays a parser fixture (for docs-keeper:
+  the ADR's list of end-to-end #82 cases). Then I2: no ground-truth
   value (the e-mail-named table included), literal or marker in the console database, the pages,
   the agent's state or any log (whole, windows, encoded forms), no path of the target's files in the
   agent's log, and the secret hygiene of the other runs.
 - **Negative steps** (R52 item 2, security review L7), after the gate's checks, on the real kernel:
   a control first (the main agent's readers check holds, its status has no
-  `audit.log_readable_by_others`), then each step replaces the agent's container and waits for a
-  check and a heartbeat after its start, asserting: not Partial, the note
-  `audit.log_readable_by_others`, and the local reason: without `host_identity`
+  `audit.log_readable_by_others`), then each step replaces the agent's container and watches it for
+  the main agent's measured time to Partial plus 60 s: the level is never `partial` in that window,
+  the local reason stays the expected one, and at its end the notes that withhold Partial are
+  exactly `audit.log_readable_by_others`. The steps: without `host_identity`
   (`agent_in_container`); `host_identity.passwd` naming the agent image's own `/etc/passwd`, not a
-  mount (`host_identity_refused (passwd: mount)`); the host's passwd mounted read-write (the same
+  mount (`host_identity_refused (passwd: mount)`); a passwd file mounted read-write (the same
   reason); the agent run as the collision uid, a host user's (`agent-uid`: its own enrollment, its
-  own state and secrets volumes owned by that uid, `uid_collision`).
+  own state and secrets volumes owned by that uid, `uid_collision`; that uid cannot read the log,
+  so `audit.log_not_readable` and `audit.partial_pending_first_record` are expected too). The
+  read-write step binds a root-owned copy of the host's passwd file (`install -o 0 -g 0 -m 0644`,
+  with `sudo -n` in CI) rather than the host's own file read-write, which R52 item 2's text names:
+  the refused rule (`mount`) is the same (for docs-keeper: an ADR-0060 note). Then a positive
+  control: the main agent with its own configuration and the read-only host files again, Partial
+  within the same window. Last, the console side again (a second database dump, the pages, the main
+  agent's state), the uid step's agent state and every log: no ground-truth value, marker or
+  secret.
+
+
 The CI job is `e2e-firebird` in [`ci.yml`](../.github/workflows/ci.yml) (50 min budget,
 `firebird.sh` at most 2700 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`,
 `deploy/initdb/`, `dev/firebird/`, the Firebird seed, `dev/ground-truth.json`,
