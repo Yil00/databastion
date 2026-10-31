@@ -847,18 +847,13 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
 - **The log volume's ACLs** (R52 item 1): `firebird-audit-init` (the dev step,
   [`dev/firebird/acl-init`](../dev/firebird/acl-init/layout.sh)) gives the log and its directory
   to the server (84), no group or other access, and uid 10001 read through named-user ACLs, with the
-  directory's default ACL for the next log file; `firebird-acl-inspect` reads them back (`getfacl`,
-  as uid 84, no capability, no network): the volume's file system must keep them. And on a
-  throwaway embedded engine of the same image (`firebird-rotation`, no network, its own volume
-  prepared the same way, `max_log_size = 1`, 8 000 statements), what the server's rotation does:
-  the rotated files' names and the next `audit.log`'s ACL, written to `acl.md` and the job summary
-  (measured, not asserted beyond the inherited `user:10001` entry). Measured on 5.0.4 on an ext4
-  Docker root (local run of 2026-10-31): the volume keeps the ACLs; the server names its rotated
-  files `audit.<timestamp>.log`, which the agent's readers check, looking at `audit.log.*` and
-  `audit.log-*` (ADR-0060 R4), does not examine; and it creates the next `audit.log` with mode
-  `0600`, so the inherited `user:10001:r--` entry is masked (`mask::---`, effective `---`): with
-  this layout the agent cannot read the log written after a rotation. The run warns about it
-  (a job annotation) rather than failing.
+  directory's default ACL; `firebird-acl-inspect` reads them back (`getfacl`, as uid 84, no
+  capability, no network): the volume's file system must keep them (written to `acl.md` and the
+  job summary). The trace configuration (the dev one) must have `max_log_size = 0` (absent: the
+  server's default, 0) in every section that writes the declared log, one of them explicitly,, checked before anything starts: Partial requires it and
+  server rotation is not supported for Partial (ADR-0060 refinement of 2026-10-31 c, R54: the
+  server creates every new log file `0600`, which masks the ACL entry; `dev/firebird/it.sh`
+  measures it).
 - **The server** (`firebird`): the dev service's image, `firebird.conf`, `fbtrace.conf`,
   entrypoint and seed (`crm`), plus the test accounts of
   [`target-initdb/firebird-20-clients.sh`](target-initdb/firebird-20-clients.sh) (first start
@@ -903,18 +898,6 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   mount (`host_identity_refused (passwd: mount)`); the host's passwd mounted read-write (the same
   reason); the agent run as the collision uid, a host user's (`agent-uid`: its own enrollment, its
   own state and secrets volumes owned by that uid, `uid_collision`).
-- **Depends on the console listing `engine.firebird`** (ROADMAP P10-E, Firebird part): without it
-  the agent holds every item of a `firebird` target (ADR-0042), so `firebird.sh` checks
-  `CONSOLE_ACCEPTS` in the console sources first and fails at once.
-- **Depends on the agent's live stream keeping the trace's empty lines**: the core tailer's
-  `Framing::Lines` (`agent/crates/core/src/audit/tail.rs`) drops empty lines, which separate the
-  parts of a Firebird trace record, so every `EXECUTE_STATEMENT_FINISH` record reaches the parser
-  without them and is defective (`Shape`): ambiguous, `audit.log_records_ambiguous`, Limited, the
-  agent's own `check()` statements reported as reads of `*`. Found by the first local run of this
-  job (the connector's integration tests feed the parser directly); until the agent is fixed the
-  run fails at the Partial wait. A local run with a tailer that keeps empty lines passed every
-  step.
-
 The CI job is `e2e-firebird` in [`ci.yml`](../.github/workflows/ci.yml) (50 min budget,
 `firebird.sh` at most 2700 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`,
 `deploy/initdb/`, `dev/firebird/`, the Firebird seed, `dev/ground-truth.json`,

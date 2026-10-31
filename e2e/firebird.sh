@@ -10,8 +10,8 @@
 #     before anything starts: uids 84 and 10001 absent from its passwd file, outside its
 #     subordinate and systemd ranges; its nsswitch.conf accepted (R47); the uid of the collision
 #     step (1001 in CI) present. The run fails otherwise; it never edits a file nor picks other uids.
-#   - The log volume's ACLs (R52 item 1): the file system keeps them; and, on a throwaway engine
-#     with a 1 MB max_log_size, what the next log file gets after a rotation (measured, recorded).
+#   - The log volume's ACLs (R52 item 1): its file system keeps them. The trace configuration (the
+#     dev one) has max_log_size = 0 in every section writing the log (R54: no server rotation).
 #   - The layout (R52 item 2, R50): the agent in its container in the server's network and pid
 #     namespaces, every container of that namespace without NET_RAW / NET_ADMIN, the Firebird root,
 #     configuration and log directory read-only at the server's paths, the host identity files as
@@ -144,14 +144,18 @@ if [ "$kmaj" -lt 5 ] || { [ "$kmaj" -eq 5 ] && [ "${kmin%%[!0-9]*}" -lt 8 ]; }; 
 fi
 phase_done preconditions
 
-# P10-E: the console must list `engine.firebird`, or the agent holds the target's items (ADR-0042)
-# and the run cannot pass. Checked on the console sources the image is built from (a local run with
-# a prebuilt E2E_CONSOLE_IMAGE trusts that image instead), after the preconditions above.
-if [ -z "${E2E_CONSOLE_IMAGE:-}" ] \
-    && ! sed -n '/^export const CONSOLE_ACCEPTS = \[/,/\]/p' "$HERE/../console/src/server/agent-api/capabilities.ts" \
-      | grep -qF '"engine.firebird"'; then
-  fail "the console does not list engine.firebird in CONSOLE_ACCEPTS (ROADMAP P10-E, Firebird part): the agent holds every item of a firebird target until it does (ADR-0042)"
-fi
+# R54 (ADR-0060 refinement of 2026-10-31 c): Partial needs max_log_size = 0 (absent: the server's
+# default, 0) in every section of the trace configuration that writes the declared log (no server
+# rotation); the database section of crm sets it explicitly.
+awk -v log_file="$FB_LOG" '
+  /^[[:space:]]*\{/ { in_s = 1; writes = 0; size = 0; next }
+  /^[[:space:]]*\}/ { if (in_s && writes && size != 0) bad = 1; if (in_s && writes) n++; in_s = 0; next }
+  in_s && $1 == "log_filename" && $3 == log_file { writes = 1 }
+  in_s && $1 == "max_log_size" { size = $3; if ($3 == "0") explicit++ }
+  END { if (bad || n == 0 || !explicit) exit 1; print n }
+' "$HERE/../dev/firebird/fbtrace.conf" >"$E2E_WORK_DIR/r54.txt" \
+  || fail "dev/firebird/fbtrace.conf: a section writing ${FB_LOG} has a max_log_size other than 0, or none sets 0 (ADR-0060 R54)"
+log "trace configuration: max_log_size = 0 in the $(cat "$E2E_WORK_DIR/r54.txt") section(s) writing the declared log (R54)"
 
 # I2 scanner positive control: every searchable value of the engine is in the committed seed.
 timeout 60 python3 "$I2_CHECK" coverage --ground-truth "$GROUND_TRUTH" --engine "$ENGINE" \
@@ -174,7 +178,6 @@ register_value routine_marker "$MARK_RET"
 register_value execute_statement_marker "$MARK_ES"
 register_value process_marker "$MARK_PROC"
 test_ca "e2e Firebird"
-mkdir -p "$E2E_WORK_DIR/firebird"
 
 # agent_yaml FILE HOST_IDENTITY: the agent's configuration; HOST_IDENTITY: `declared` (the mounted
 # files), `image` (passwd naming the agent image's own /etc/passwd) or `none` (no block).
@@ -247,22 +250,6 @@ hostid_yml() {
 }
 hostid_yml agent ro
 
-# The rotation measurement's trace configuration (firebird-rotation): every database of the
-# throwaway engine, 1 MB per log file.
-cat >"$E2E_WORK_DIR/firebird/rotation-fbtrace.conf" <<'EOF'
-database
-{
-	enabled = true
-	log_filename = /var/lib/firebird/audit/audit.log
-	max_log_size = 1
-	log_statement_finish = true
-	print_perf = true
-	time_threshold = 0
-}
-EOF
-chmod 0755 "$E2E_WORK_DIR/firebird"
-chmod 0644 "$E2E_WORK_DIR/firebird/rotation-fbtrace.conf"
-
 # --------------------------------------------------------------------------- helpers
 # fb_isql USER SECRET [ISQL_ARGS...] < SQL: the image's isql inside the server's container (its
 # account, uid 84; no capability), over loopback TCP to crm (wire encryption required by the
@@ -317,52 +304,6 @@ else
 fi
 phase_done build
 
-# --------------------------------------------------------------------------- ACLs of the volume
-# R52 item 1: whether the log volume's file system keeps ACLs (the layout's entries read back), and,
-# on a throwaway embedded engine of the same image with a 1 MB max_log_size, what the next log file
-# gets from the directory's default ACL after a rotation (measured and recorded in acl.md).
-log "ACLs: a rotation on a throwaway engine (firebird-rotation, no network)"
-timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T firebird-rotation-init \
-  >"$E2E_LOG_DIR/firebird-rotation-init.log" 2>&1 || fail "firebird-rotation-init failed"
-# shellcheck disable=SC2016 # the container shell's script
-timeout 300 docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T firebird-rotation '
-  printf "CREATE DATABASE '\''/tmp/rotation.fdb'\'';\nEXIT;\n" | /opt/firebird/bin/isql -q -b -user SYSDBA
-  for i in $(seq 1 8000); do echo "SELECT $i FROM RDB\$DATABASE;"; done \
-    | /opt/firebird/bin/isql -q -b -user SYSDBA /tmp/rotation.fdb >/dev/null
-  echo "rotation directory:"; ls -ln /var/lib/firebird/audit | sed "s/^/  /"' \
-  >"$E2E_LOG_DIR/firebird-rotation.log" 2>&1 || fail "the rotation run failed (firebird-rotation.log)"
-# shellcheck disable=SC2016 # the container shell's script
-acls="$(timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T firebird-acl-inspect '
-  for d in /r; do
-    echo "fs $(stat -f -c %T "$d")"
-    for f in "$d"/*; do echo "file $(basename "$f") $(stat -c "%a %u %g %s" "$f")"; getfacl -cpn "$f" | sed "s/^/  /"; done
-    echo "dir"; getfacl -cpn "$d" | sed "s/^/  /"
-  done' 2>&1)" || fail "cannot read the rotation volume's ACLs"
-printf '%s\n' "$acls" >>"$E2E_LOG_DIR/firebird-rotation.log"
-rotated="$(grep -E '^file ' <<<"$acls" | grep -cvE '^file audit\.log ' || true)"
-# The rotated files' names, digits masked (the agent examines `<log>.*` and `<log>-*` next to it, R4).
-rot_names="$(grep -E '^file ' <<<"$acls" | grep -vE '^file audit\.log ' | awk '{print $2}' | sed 's/[0-9]/N/g' | sort -u | tr '\n' ' ')"
-[ "$rotated" -ge 1 ] || fail "the throwaway engine did not rotate its log at max_log_size = 1 (firebird-rotation.log)"
-# The next log file (audit.log, created by the engine after the rotation) and its named entry.
-next="$(awk '/^file audit\.log /{f=1; next} /^(file|dir)/{f=0} f' <<<"$acls")"
-grep -qE '^  user:10001:r--' <<<"$next" || fail "the next log file after a rotation has no user:10001 entry: the default ACL was not inherited"
-eff="r--"
-if grep -qE '^  user:10001:r--[[:space:]]+#effective:' <<<"$next"; then
-  eff="$(sed -n 's/^  user:10001:r--[[:space:]]*#effective:\(...\).*/\1/p' <<<"$next" | head -n 1)"
-fi
-# shellcheck disable=SC2016 # Markdown code spans
-{
-  printf '### e2e-firebird: audit log ACLs (ADR-0060 R52 item 1)\n\n'
-  printf -- '- Rotation on a throwaway 5.0.4 engine (`max_log_size = 1`): %s rotated file(s); the next `audit.log` inherits `user:10001:r--` from the default ACL, effective `%s` (`%s`).\n' \
-    "$rotated" "$eff" "$(grep -E '^  (user::|mask::|group::|other::)' <<<"$next" | tr -d ' ' | tr '\n' ' ')"
-  # shellcheck disable=SC2016 # Markdown code spans
-  printf -- '- Rotated file names (digits as N): `%s`; the agent examines `audit.log.*` and `audit.log-*` next to the log (ADR-0060 R4).\n' "${rot_names% }"
-} >"$E2E_LOG_DIR/acl.md"
-log "ACLs: after a rotation the next log file inherits user:10001:r-- (effective ${eff}); ${rotated} rotated file(s): ${rot_names}"
-if [ "$eff" != "r--" ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
-  echo "::warning title=e2e-firebird ACLs::the next log file after a rotation inherits user:10001 with effective rights ${eff} (the server's create mode masks the default ACL)"
-fi
-
 log "starting the console and Firebird (first start: the ACL layout, the seed, the accounts)"
 timeout 600 docker compose "${COMPOSE_ARGS[@]}" up -d db web worker proxy firebird
 start_console
@@ -389,7 +330,7 @@ for bad in 'group::r' 'other::r' 'default:group::r' 'default:other::r'; do
   ! grep -q "^${bad}" <<<"$acls" || fail "the log volume grants ${bad} (firebird-acl.log)"
 done
 # shellcheck disable=SC2016 # Markdown code spans
-printf -- '- The log volume (`%s`) keeps the named-user ACLs of the layout (access and default entries read back).\n' "$fs" >>"$E2E_LOG_DIR/acl.md"
+printf -- '### e2e-firebird: audit log ACLs (ADR-0060 R52 item 1)\n\n- The log volume (`%s`) keeps the named-user ACLs of the layout (access and default entries read back).\n' "$fs" >"$E2E_LOG_DIR/acl.md"
 log "ACLs: the log volume's file system (${fs}) keeps the layout's named-user ACLs"
 # Loopback only (decision 3): every listening TCP socket of the namespace is on 127.0.0.0/8 (the
 # server on 127.0.0.1, Docker's embedded DNS resolver on 127.0.0.11) or ::1.

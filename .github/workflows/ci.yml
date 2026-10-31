@@ -1238,15 +1238,14 @@ jobs:
   # read-only bind mounts, never edited. Preconditions first (e2e/firebird_hostid.py: uids 84 and
   # 10001 absent from the runner's passwd and outside its subordinate and systemd ranges, its
   # nsswitch.conf accepted, uid 1001 present): the job fails rather than picking other uids. Then
-  # the log volume's ACLs (kept by its file system; the next log file after a rotation, measured
-  # and written to the job summary), Discovery against dev/ground-truth.json, `firebird.audit`
+  # the log volume's ACLs (kept by its file system; written to the job summary) and max_log_size = 0
+  # in the trace configuration (R54), Discovery against dev/ground-truth.json, `firebird.audit`
   # reaching Partial through `firebird.audit.host_identity`, a full read of seeded tables raising a
   # critical incident, the #82 marker cases, I2, and the four real-kernel negative steps (no
   # host_identity, a file of the agent image, the passwd file mounted read-write, the agent as uid
   # 1001), each not Partial with its local reason. Fake random passwords in files of a private
   # 0700 directory, never on a command line nor in a container's configuration; logs redacted.
-  # Needs the console to list `engine.firebird` (ROADMAP P10-E, Firebird part): the script fails at
-  # once without it. Required through ci-result, like the other e2e jobs.
+  # Required through ci-result, like the other e2e jobs.
   e2e-firebird:
     name: E2E Firebird target
     needs: detect
@@ -1278,8 +1277,8 @@ jobs:
         # Within the job budget (50 min, checkout and unit tests included): cleanup always completes.
         run: timeout 2700 e2e/firebird.sh
       # firebird.sh redacts every generated secret and the #82 markers from the logs on exit, whatever
-      # the result (and masks them in the job log). The ACL measurement and the event census are in
-      # the job summary too.
+      # the result (and masks them in the job log). The ACL check and the event census are in the job
+      # summary too.
       - name: Upload event census
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
