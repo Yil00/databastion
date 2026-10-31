@@ -373,18 +373,23 @@ pub(crate) fn parse_nsswitch(b: &[u8]) -> Result<Nss, Kind> {
             .split(u8::is_ascii_whitespace)
             .filter(|t| !t.is_empty())
         {
-            if in_action {
-                if tok.contains(&b'[') {
-                    return Err(Kind::Malformed);
-                }
-                in_action = !tok.ends_with(b"]");
-                continue;
+            // An action item: `[` only as a token's first byte, `]` only as
+            // its last, nothing after `]` (security review L1: a source
+            // glued after `]` is never hidden in an item).
+            let opens = tok.first() == Some(&b'[');
+            if opens && in_action {
+                return Err(Kind::Malformed);
             }
-            if let Some(rest) = tok.strip_prefix(b"[") {
-                if rest.contains(&b'[') {
+            if opens || in_action {
+                let body = if opens { &tok[1..] } else { tok };
+                if body.contains(&b'[') {
                     return Err(Kind::Malformed);
                 }
-                in_action = !rest.ends_with(b"]");
+                match body.iter().position(|c| *c == b']') {
+                    Some(i) if i + 1 == body.len() => in_action = false,
+                    Some(_) => return Err(Kind::Malformed),
+                    None => in_action = true,
+                }
                 continue;
             }
             if !tok

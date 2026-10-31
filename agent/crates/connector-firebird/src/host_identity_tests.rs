@@ -541,6 +541,11 @@ fn malformed_files() {
         "passwd:\n",
         "passwd: files [NOTFOUND=return\n",
         "passwd: files [a=[b]]\n",
+        "passwd: files [NOTFOUND=return]sss systemd]\n",
+        "passwd: files\ngroup: files [NOTFOUND=return]ldap x]\n",
+        "passwd: files [ NOTFOUND=return ]sss\n",
+        "passwd: files [NOTFOUND=return] ]\n",
+        "passwd: files sss]\n",
         "pass wd: files\n",
         "passwd: fi/les\n",
     ] {
