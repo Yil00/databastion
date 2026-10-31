@@ -980,6 +980,18 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         if eff.number("time_threshold").unwrap_or(100) != 0 {
             add(&mut missing, "time_threshold");
         }
+        // ADR-0060 refinement of 2026-10-31 c, R54: the server rotates
+        // its log at max_log_size and creates every new file 0600, which
+        // the agent cannot read; Partial requires no rotation.
+        if eff.number("max_log_size").unwrap_or(0) != 0 {
+            // Sent as `other` until the label set has `max_log_size`.
+            add(&mut missing, "max_log_size");
+            detail.push(format!(
+                "{}: max_log_size is not 0 (the server would rotate the log into files the \
+                 agent cannot read)",
+                db.label
+            ));
+        }
         log_connections &= eff.flag("log_connections");
         let sql_length = eff.number("max_sql_length").unwrap_or(DEFAULT_SQL_LENGTH);
         if sql_length > MAX_SQL_LENGTH_CARRIED {
@@ -1034,6 +1046,18 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         }
         _ => false,
     };
+    // R54: the services section that writes the declared log rotates it
+    // too.
+    for s in &services {
+        if writes_here(&s.settings) && s.settings.number("max_log_size").unwrap_or(0) != 0 {
+            add(&mut missing, "max_log_size");
+            detail.push(
+                "services: max_log_size is not 0 (the server would rotate the log into files \
+                 the agent cannot read)"
+                    .to_owned(),
+            );
+        }
+    }
     let mut notes = Vec::new();
     if !svc_ok {
         add(&mut missing, "log_services");

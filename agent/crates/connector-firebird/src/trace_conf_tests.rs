@@ -329,6 +329,47 @@ fn statement_text_limits() {
     assert!(!eval(&t, Some(&empty_map()), &crm()).partial);
 }
 
+/// ADR-0060 refinement of 2026-10-31 c, R54: Partial requires
+/// `max_log_size = 0` in the declared database's section and in the
+/// services section that writes the log (label `other` until the label
+/// set has `max_log_size`).
+#[test]
+fn a_rotating_log_is_not_partial() {
+    assert!(eval(DEV_TRACE, Some(&empty_map()), &crm()).partial);
+    let t = DEV_TRACE.replace("\tmax_log_size = 0\n", "\tmax_log_size = 1\n");
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert_eq!(codes(&v.notes), [NoteCode::AuditTraceSettingsMissing]);
+    assert_eq!(
+        labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
+        ["other"]
+    );
+    assert!(v.detail.iter().any(|d| d.starts_with("crm: max_log_size")));
+    // Absent: the server's default, 0.
+    let t = DEV_TRACE.replace("\tmax_log_size = 0\n", "");
+    assert!(eval(&t, Some(&empty_map()), &crm()).partial);
+    // The services section writing the log.
+    let t = DEV_TRACE.replace(
+        "\tlog_services = true\n",
+        "\tlog_services = true\n\tmax_log_size = 10\n",
+    );
+    assert_ne!(t, DEV_TRACE);
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert!(
+        v.detail
+            .iter()
+            .any(|d| d.starts_with("services: max_log_size"))
+    );
+    // Only the default section rotates, and it is disabled: no effect.
+    let t = DEV_TRACE.replace(
+        "database\n{\n\tenabled = false\n",
+        "database\n{\n\tenabled = false\n\tmax_log_size = 5\n",
+    );
+    assert_ne!(t, DEV_TRACE);
+    assert!(eval(&t, Some(&empty_map()), &crm()).partial);
+}
+
 /// R2 rule 4: every alias mapping to the database is evaluated; differing
 /// effective settings are Limited.
 #[test]

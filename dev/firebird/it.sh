@@ -579,7 +579,8 @@ timeout 600 $SUDO unshare --mount --propagation private -- /bin/sh -eu -c '
     "$M/bin/it" it::host_identity::checks --exact --nocapture
 ' sh "$EXE"
 
-# 6. Rotation (a measurement, ADR-0060 obligation 6; nothing here fails the run but a setup step):
+# 6. Rotation (a measurement, ADR-0060 obligation 6; nothing here fails the run but a setup step
+# and the check that the rotating configuration is Limited, R54):
 # the main server restarted with max_log_size = 1 (MiB) on a host directory laid out as the user
 # guide says (owner the server, no group or other access, the agent's uid 10001 reading through
 # named-user ACLs, a default ACL for the next file; the ACL xattrs written directly, the host may
@@ -628,6 +629,11 @@ PY
 sed 's/^\tmax_log_size = 0$/\tmax_log_size = 1/' "$WORK/fbtrace.conf" > "$WORK/fbtrace-rot.conf"
 grep -F 'max_log_size = 1' "$WORK/fbtrace-rot.conf" >/dev/null || { echo "[it] rotation: no max_log_size" >&2; exit 1; }
 chmod 0644 "$WORK/fbtrace-rot.conf"
+# ADR-0060 R54: that configuration is Limited (max_log_size not 0); checked, not measured.
+timeout 120 env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+  FIREBIRD_IT_ROTATION_TRACE_CONF="$WORK/fbtrace-rot.conf" \
+  FIREBIRD_IT_DATABASES_CONF="$WORK/databases.conf" \
+  "$EXE" it::audit::the_rotation_measurement_configuration_is_limited --exact --nocapture >&2
 rotation_case() { # label umask(image|NNN) default-acl(yes|no)
   local label="$1" mask="$2" def="$3" C="$ROT/$1" start=(--entrypoint /opt/firebird/bin/firebird)
   install -d -m 0711 "$C"

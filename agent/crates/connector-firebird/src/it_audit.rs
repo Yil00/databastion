@@ -96,6 +96,59 @@ fn the_server_configuration_proves_partial() {
     assert!(v.partial, "{:?} {:?}", v.notes, v.detail);
 }
 
+/// ADR-0060 refinement of 2026-10-31 c, R54, on the configuration the
+/// rotation measurement of `dev/firebird/it.sh` (step 6) runs the server
+/// with (`max_log_size = 1`): not Partial, `max_log_size` the only missing
+/// setting (label `other` until the label set has it).
+#[test]
+fn the_rotation_measurement_configuration_is_limited() {
+    let (Some(trace), Some(dbconf)) = (
+        file("FIREBIRD_IT_ROTATION_TRACE_CONF"),
+        file("FIREBIRD_IT_DATABASES_CONF"),
+    ) else {
+        return;
+    };
+    let map = parse_databases_conf(&dbconf, ROOT).expect("the image's databases.conf parses");
+    let trace = parse_trace_conf(&trace).expect("the trace configuration parses");
+    let dbs = [
+        DeclaredDb {
+            label: "app",
+            resolved: Some(APP),
+            alias: None,
+        },
+        DeclaredDb {
+            label: "crm",
+            resolved: Some(CRM),
+            alias: None,
+        },
+    ];
+    let v = evaluate(&Inputs {
+        trace: &trace,
+        aliases: Some(&map),
+        databases: &dbs,
+        log: LOG,
+        root: ROOT,
+        longest_own_text: longest_own_text(),
+    });
+    assert!(!v.partial);
+    let codes: Vec<_> = v
+        .notes
+        .iter()
+        .map(databastion_core::TargetNote::code)
+        .collect();
+    assert_eq!(
+        codes,
+        [databastion_core::NoteCode::AuditTraceSettingsMissing]
+    );
+    let max_log: Vec<_> = v
+        .detail
+        .iter()
+        .filter(|d| d.contains("max_log_size"))
+        .collect();
+    assert_eq!(max_log.len(), 2, "{:?}", v.detail);
+    eprintln!("[measure] rotation configuration: Limited, {max_log:?}");
+}
+
 /// The test databases' catalog classes (in production: `check()`'s read).
 struct Cat;
 
