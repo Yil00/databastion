@@ -720,7 +720,10 @@ pub(crate) struct MountFacts {
     pub(crate) mount_root: Option<bool>,
     pub(crate) fs_rdonly: bool,
     /// `STATX_MNT_ID_UNIQUE` before and after the `mountinfo` read
-    /// (`None` where the kernel does not offer it).
+    /// (`None` where the kernel does not offer it). The open handle pins
+    /// its mount, so its mount id cannot be reused while the check runs:
+    /// the comparison cannot detect a reuse and does not need to (R45 item 5
+    /// asks for it; it is harmless).
     pub(crate) unique_before: Option<u64>,
     pub(crate) unique_after: Option<u64>,
 }
