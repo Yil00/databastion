@@ -79,7 +79,7 @@ cleanup() {
   timeout 60 docker volume rm "$VOLUME" "$AUDIT_VOLUME" >/dev/null 2>&1 || true
   timeout 60 docker rmi "$LOCAL_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
-  [ -z "${ROT:-}" ] || rm -rf "$ROT"
+  [ -z "${ROT:-}" ] || timeout 60 $SUDO rm -rf "$ROT"
 }
 trap cleanup EXIT
 
@@ -592,11 +592,13 @@ timeout 600 $SUDO unshare --mount --propagation private -- /bin/sh -eu -c '
 echo "[it] rotation: max_log_size = 1" >&2
 timeout 60 docker stop "$NAME" >/dev/null
 # Not under /tmp: the stream's open check refuses a log below a directory the agent can write.
-ROT="$(mktemp -d -p /var/lib databastion-it-rotation.XXXXXX)"
-chmod 0711 "$ROT"
-install -m 0755 "$EXE" "$ROT/it"
+# Root (or sudo, as for the namespaces above) for the directory, the server's and the agent's
+# ownership, the ACLs and the agent's uid; the files are removed at exit.
+ROT="$($SUDO mktemp -d -p /var/lib databastion-it-rotation.XXXXXX)"
+$SUDO chmod 0711 "$ROT"
+$SUDO install -m 0755 "$EXE" "$ROT/it"
 acl() { # set DIR AGENT_UID DEFAULT(yes|no) | show FILE...
-  python3 -I - "$@" <<'PY'
+  $SUDO python3 -I - "$@" <<'PY'
 import os, struct, sys
 U, TAGS = 0xFFFFFFFF, {1: "u", 2: "u", 4: "g", 8: "g", 0x10: "m", 0x20: "o"}
 def enc(entries):
@@ -636,10 +638,11 @@ timeout 120 env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1
   "$EXE" it::audit::the_rotation_measurement_configuration_is_limited --exact --nocapture >&2
 rotation_case() { # label umask(image|NNN) default-acl(yes|no)
   local label="$1" mask="$2" def="$3" C="$ROT/$1" start=(--entrypoint /opt/firebird/bin/firebird)
-  install -d -m 0711 "$C"
-  install -d -o 84 -g 84 -m 0700 "$C/audit"
-  install -o 84 -g 84 -m 0600 /dev/null "$C/audit/audit.log"
-  install -d -o 10001 -g 10001 -m 0700 "$C/agent"
+  local out="$WORK/rotation-$label.out"
+  $SUDO install -d -m 0711 "$C"
+  $SUDO install -d -o 84 -g 84 -m 0700 "$C/audit"
+  $SUDO install -o 84 -g 84 -m 0600 /dev/null "$C/audit/audit.log"
+  $SUDO install -d -o 10001 -g 10001 -m 0700 "$C/agent"
   acl set "$C/audit" 10001 "$def"
   # shellcheck disable=SC2016 # The inner shell's variable.
   [ "$mask" = image ] || start=(--entrypoint /bin/sh "$LOCAL_IMAGE" -c 'umask "$1"; umask; exec /opt/firebird/bin/firebird' sh "$mask")
@@ -660,14 +663,15 @@ rotation_case() { # label umask(image|NNN) default-acl(yes|no)
   echo "[measure] rotation $label: server umask $(timeout 30 docker exec "$NAME-rot" sh -c \
     'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = firebird ] && \
      awk "/^Umask/ {print \$2}" "$p/status"; done; true' | head -n 1)" >&2
-  setpriv --reuid 10001 --regid 10001 --clear-groups -- \
+  $SUDO setpriv --reuid 10001 --regid 10001 --clear-groups -- \
     env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
     FIREBIRD_IT_ROTATION_LOG="$C/audit/audit.log" FIREBIRD_IT_ROTATION_READY="$C/agent/ready" \
     timeout 300 "$ROT/it" it::rotation::the_stream_across_a_server_rotation --exact --nocapture \
-    > "$C/test.out" 2>&1 &
+    > "$out" 2>&1 &
   local test_pid=$!
-  for _ in $(seq 1 60); do [ -e "$C/agent/ready" ] && break; sleep 1; done
-  [ -e "$C/agent/ready" ] || { cat "$C/test.out" >&2; echo "[it] rotation: the stream did not start" >&2; exit 1; }
+  ready() { $SUDO test -e "$C/agent/ready"; }
+  for _ in $(seq 1 60); do ready && break; sleep 1; done
+  ready || { cat "$out" >&2; echo "[it] rotation: the stream did not start" >&2; exit 1; }
   # 40 statements of about 60 KB each (a multi-line comment of 600 lines; max_sql_length 65000):
   # about 2.4 MiB of trace, so at least two rotations.
   {
@@ -683,13 +687,13 @@ rotation_case() { # label umask(image|NNN) default-acl(yes|no)
     "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" >/dev/null
   sleep 3
   wait "$test_pid" || echo "[it] rotation $label: the measurement test failed" >&2
-  grep -F '[measure]' "$C/test.out" | sed "s/\[measure\] rotation:/[measure] rotation $label:/" >&2 \
-    || cat "$C/test.out" >&2
+  grep -F '[measure]' "$out" | sed "s/\[measure\] rotation:/[measure] rotation $label:/" >&2 \
+    || cat "$out" >&2
   local files
-  mapfile -t files < <(find "$C/audit" -mindepth 1 -maxdepth 1 | sort)
+  mapfile -t files < <($SUDO find "$C/audit" -mindepth 1 -maxdepth 1 | sort)
   acl show "$C/audit" "${files[@]}" | sed "s/^/[measure] rotation $label: after: /" >&2
   for f in "${files[@]}"; do
-    echo "[measure] rotation $label: $(basename "$f"): $(wc -l < "$f") lines"
+    echo "[measure] rotation $label: $(basename "$f"): $($SUDO wc -l "$f" | awk '{print $1}') lines"
   done >&2
   timeout 60 docker rm -f -v "$NAME-rot" >/dev/null
 }
