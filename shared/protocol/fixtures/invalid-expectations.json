@@ -126,6 +126,7 @@
   "HeartbeatRequest.firebird-edition.json": "false schema",
   "HeartbeatRequest.firebird-name-case.json": "enum",
   "HeartbeatRequest.firebird-raw-system-privilege-label.json": "enum",
+  "HeartbeatRequest.firebird-trace-setting-with-value-label.json": "enum",
   "HeartbeatRequest.firebird-unknown-process.json": "enum",
   "HeartbeatRequest.malformed-capability.json": "pattern",
   "HeartbeatRequest.name-case-bad-value.json": "enum",

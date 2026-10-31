@@ -4427,7 +4427,7 @@ Revisions:
   whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
   read, so records lost to a failing audit target are not counted.
 - `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6, and its refinements of
-  2026-10-25 and 2026-10-26 b): the Firebird
+  2026-10-25, 2026-10-26 b and 2026-10-31 c): the Firebird
   labels below `on_failure_probe`. Firebird system privileges are lowercased as written
   in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
   `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
@@ -4450,7 +4450,10 @@ Revisions:
   60 s within one hour waiting for server run confirmations); and the trace configuration
   settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
   `audit.trace_settings_missing` and `audit.services_not_audited`; `log_transactions`,
-  `log_initfini` and `log_sweep` from the refinement of 2026-10-26 b, R21). Firebird
+  `log_initfini` and `log_sweep` from the refinement of 2026-10-26 b, R21; `max_log_size`
+  (not 0: the server rotates the log into files the agent cannot read) and
+  `max_sql_length` (above the longest statement text line the agent reads) from the
+  refinement of 2026-10-31 c, R54 and R57). Firebird
   object rights and DDL rights whose name is already a value above (`insert`, `update`,
   `delete`, `references`, `execute`, `create`, `alter`, `drop`) use that value, with no
   token.
@@ -4989,6 +4992,10 @@ pub enum TargetNoteLabel {
     ExcludeFilter,
     #[serde(rename = "connection_id")]
     ConnectionId,
+    #[serde(rename = "max_log_size")]
+    MaxLogSize,
+    #[serde(rename = "max_sql_length")]
+    MaxSqlLength,
 }
 impl ::std::fmt::Display for TargetNoteLabel {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -5322,6 +5329,8 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::IncludeFilter => f.write_str("include_filter"),
             Self::ExcludeFilter => f.write_str("exclude_filter"),
             Self::ConnectionId => f.write_str("connection_id"),
+            Self::MaxLogSize => f.write_str("max_log_size"),
+            Self::MaxSqlLength => f.write_str("max_sql_length"),
         }
     }
 }
@@ -5620,6 +5629,8 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "include_filter" => Ok(Self::IncludeFilter),
             "exclude_filter" => Ok(Self::ExcludeFilter),
             "connection_id" => Ok(Self::ConnectionId),
+            "max_log_size" => Ok(Self::MaxLogSize),
+            "max_sql_length" => Ok(Self::MaxSqlLength),
             _ => Err("invalid value".into()),
         }
     }

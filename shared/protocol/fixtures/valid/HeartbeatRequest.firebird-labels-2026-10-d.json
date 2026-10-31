@@ -66,7 +66,9 @@
             "log_transactions",
             "log_initfini",
             "log_sweep",
-            "exclude_filter"
+            "exclude_filter",
+            "max_log_size",
+            "max_sql_length"
           ]
         },
         {

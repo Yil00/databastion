@@ -984,7 +984,8 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         // its log at max_log_size and creates every new file 0600, which
         // the agent cannot read; Partial requires no rotation.
         if eff.number("max_log_size").unwrap_or(0) != 0 {
-            // Sent as `other` until the label set has `max_log_size`.
+            // The label `max_log_size` of revision `2026_10_d` (R57),
+            // `other` until the console lists it.
             add(&mut missing, "max_log_size");
             detail.push(format!(
                 "{}: max_log_size is not 0 (the server would rotate the log into files the \
@@ -995,8 +996,8 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         log_connections &= eff.flag("log_connections");
         let sql_length = eff.number("max_sql_length").unwrap_or(DEFAULT_SQL_LENGTH);
         if sql_length > MAX_SQL_LENGTH_CARRIED {
-            // Sent as `other` until the label set has `max_sql_length`
-            // (a contract revision).
+            // The label `max_sql_length` of revision `2026_10_d` (R57),
+            // `other` until the console lists it.
             add(&mut missing, "max_sql_length");
             detail.push(format!(
                 "{}: max_sql_length {sql_length} above {MAX_SQL_LENGTH_CARRIED} bytes, the \

@@ -84,8 +84,8 @@ describe("Firebird target notes (ADR-0060 decision 8)", () => {
 });
 
 describe("Firebird note labels (revision target_status.note_labels.2026_10_d)", () => {
-  it("covers the revision: 27 system privileges, 4 identities, usage, 4 relations and probes, 9 reasons, 1 stall reason, 18 settings", () => {
-    expect(REVISION_D).toHaveLength(64);
+  it("covers the revision: 27 system privileges, 4 identities, usage, 4 relations and probes, 9 reasons, 1 stall reason, 20 settings", () => {
+    expect(REVISION_D).toHaveLength(66);
     expect(REVISION_D[0]).toBe("user_management");
   });
 
@@ -134,6 +134,8 @@ describe("Firebird note labels (revision target_status.note_labels.2026_10_d)", 
       "include_filter",
       "exclude_filter",
       "connection_id",
+      "max_log_size",
+      "max_sql_length",
     ]) {
       expect(labelDisplayName(label), label).toBe(label);
     }
@@ -162,7 +164,7 @@ describe("Firebird note labels (revision target_status.note_labels.2026_10_d)", 
     expect(refused.text).toContain("SYSDBA, RDB$ADMIN, TRACE_ANY_ATTACHMENT, verifier_relation_readable");
     const texts = (crm?.notes ?? []).map((n) => renderTargetNote(n, "firebird").text);
     expect(texts.join("\n")).toContain("SELECT_ANY_OBJECT_IN_DATABASE, credential_relation_readable, server_config_readable");
-    expect(texts.join("\n")).toContain("time_threshold, print_perf, log_blr_requests, log_transactions, log_initfini, log_sweep, exclude_filter");
+    expect(texts.join("\n")).toContain("time_threshold, print_perf, log_blr_requests, log_transactions, log_initfini, log_sweep, exclude_filter, max_log_size, max_sql_length");
     expect(texts.join("\n")).toContain("INSERT, USAGE, CREATE");
   });
 });

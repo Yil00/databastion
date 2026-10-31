@@ -184,6 +184,8 @@ export const FIREBIRD_VERBATIM_LABELS: ReadonlySet<string> = new Set([
   "include_filter",
   "exclude_filter",
   "connection_id",
+  "max_log_size",
+  "max_sql_length",
 ]);
 
 /**
