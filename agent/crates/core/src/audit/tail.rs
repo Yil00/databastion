@@ -32,7 +32,9 @@
 //!   path is reopened. When the new file cannot be opened (not readable,
 //!   a symlink, refused by the open check), the records read from the end
 //!   of the old file are returned first (`more` set) and the next poll
-//!   fails; no cursor is saved while no file is open, so once the new
+//!   fails (the same for a read error after some records were read); the
+//!   closed file is reported once by [`Tailer::take_ended`], so that a
+//!   source ends what it holds of it; no cursor is saved while no file is open, so once the new
 //!   file opens it is read from its start through the saved cursor, as
 //!   after a restart (without a cursor store: from its end, as at a first
 //!   start, unchanged).
@@ -155,10 +157,11 @@ fn csv_record_start(seg: &[u8]) -> bool {
 
 /// Most bytes read per poll.
 pub const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
-/// With [`Framing::LinesKeepingEmpty`], a poll also stops after the chunk
-/// that brings it to this many records: an empty line is a record there,
+/// With the line framings ([`Framing::Lines`], [`Framing::LinesKeepingEmpty`]),
+/// a poll also stops after the chunk that brings it to this many records:
+/// an empty line (or, with [`Framing::Lines`], a bare `\r\n`) is a record,
 /// so [`MAX_POLL_BYTES`] alone would let a poll hold millions of them.
-pub const MAX_POLL_RECORDS_KEEPING_EMPTY: usize = 64 * 1024;
+pub const MAX_POLL_LINE_RECORDS: usize = 64 * 1024;
 /// Read chunk.
 const CHUNK: usize = 256 * 1024;
 /// Bytes before the offset compared at each poll (in-place rewrite).
@@ -781,8 +784,9 @@ pub struct Polled {
     /// Position of each record (same order as `records`).
     pub positions: Vec<RecordPos>,
     /// More data is waiting (the poll stopped at its byte or record
-    /// bound), or the poll stopped at a rotation whose new file could not
-    /// be opened, after the end of the old file (the next poll fails).
+    /// bound), or the poll stopped at an error after reading records (a
+    /// rotation whose new file could not be opened, a read error): those
+    /// records are returned and the next poll meets the error.
     pub more: bool,
     /// Records skipped for their size ([`MAX_RECORD_BYTES`], counted in
     /// [`Tailer::oversized`]): for each, the index in `records` of the
@@ -814,6 +818,11 @@ pub struct Tailer {
     pub rotations: u64,
     /// The source's checks of every opened file.
     open_check: Option<OpenCheck>,
+    /// See [`Self::take_ended`].
+    ended: Option<(u64, u64)>,
+    /// Tests: reads that succeed before every later read fails.
+    #[cfg(test)]
+    reads_before_failure: Option<u32>,
 }
 
 /// Test support only: accept log files the agent's user could write
@@ -962,6 +971,9 @@ impl Tailer {
             replay: None,
             oversized: 0,
             rotations: 0,
+            ended: None,
+            #[cfg(test)]
+            reads_before_failure: None,
             open_check: None,
         }
     }
@@ -1110,11 +1122,48 @@ impl Tailer {
     /// readable.
     pub fn poll(&mut self) -> Result<Polled, TailError> {
         self.ensure_open()?;
-        let mut records = Vec::new();
-        let mut positions = Vec::new();
-        let mut skipped = Vec::new();
+        let mut out = Polled {
+            records: Vec::new(),
+            positions: Vec::new(),
+            more: false,
+            skipped: Vec::new(),
+        };
+        match self.read_into(&mut out) {
+            Ok(more) => {
+                out.more = more;
+                Ok(out)
+            }
+            // What this poll read before the error (the end of a file
+            // rotated away whose successor cannot be opened, or the bytes
+            // read before a read error) is handed on first: the offset has
+            // moved past it, so it would be lost otherwise (security review
+            // M1 and N8 of #392). The next poll meets the error again.
+            Err(e) if out.records.is_empty() && out.skipped.is_empty() => Err(e),
+            Err(_) => {
+                tracing::warn!(
+                    "audit log read stopped by an error; the records read before it are handed \
+                     on first"
+                );
+                out.more = true;
+                Ok(out)
+            }
+        }
+    }
+
+    /// The body of [`Self::poll`]: whether more data waits.
+    fn read_into(&mut self, out: &mut Polled) -> Result<bool, TailError> {
+        let Polled {
+            records,
+            positions,
+            skipped,
+            ..
+        } = out;
         let mut read_total: u64 = 0;
         let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
+        let bound = match self.framing {
+            Framing::Lines | Framing::LinesKeepingEmpty => MAX_POLL_LINE_RECORDS,
+            Framing::Csv | Framing::JsonObjects => usize::MAX,
+        };
         while let Some((file, dev, ino)) = self.file.as_mut() {
             let (dev, ino) = (*dev, *ino);
             // Truncated (or rewritten) in place?
@@ -1139,10 +1188,14 @@ impl Tailer {
                 self.splitter.reset();
             }
             let mut eof = false;
-            while read_total < MAX_POLL_BYTES
-                && (self.framing != Framing::LinesKeepingEmpty
-                    || records.len() < MAX_POLL_RECORDS_KEEPING_EMPTY)
-            {
+            while read_total < MAX_POLL_BYTES && records.len() < bound {
+                #[cfg(test)]
+                if let Some(left) = self.reads_before_failure.as_mut() {
+                    if *left == 0 {
+                        return Err(TailError::Unreadable(std::io::ErrorKind::Other));
+                    }
+                    *left -= 1;
+                }
                 let n = file
                     .read(&mut buf[..])
                     .map_err(|e| TailError::Unreadable(e.kind()))?;
@@ -1153,7 +1206,7 @@ impl Tailer {
                 let base = self.offset;
                 self.offset += n as u64;
                 read_total += n as u64;
-                self.splitter.feed(&buf[..n], &mut records);
+                self.splitter.feed(&buf[..n], records);
                 skipped.extend(self.splitter.last_skips().iter().map(|&k| (k, (dev, ino))));
                 for &(i, len) in self.splitter.last_ends() {
                     let end = base + i as u64;
@@ -1169,12 +1222,7 @@ impl Tailer {
             }
             self.oversized = self.splitter.oversized;
             if !eof {
-                return Ok(Polled {
-                    records,
-                    positions,
-                    more: true,
-                    skipped,
-                });
+                return Ok(true);
             }
             // At the end of the open file: has the path moved to a new file?
             // `lstat`: a symlink put in its place is a change too, and the
@@ -1187,44 +1235,31 @@ impl Tailer {
                     self.rotations += 1;
                     tracing::info!("audit log rotated; following the new file");
                     self.file = None;
-                    match open_regular(&self.path, self.open_check.as_ref()) {
-                        Ok((file, dev, ino, _)) => {
-                            self.file = Some((file, dev, ino));
-                            self.offset = 0;
-                            self.tail.clear();
-                            self.splitter.reset();
-                        }
-                        // The records already read from the end of the
-                        // old file are handed on first (they are lost
-                        // otherwise: the old file is no longer open); the
-                        // next poll reopens the path and fails then. No
-                        // cursor is saved while no file is open, so the
-                        // saved one stays in the old file, and the new
-                        // file is read from its start once it opens.
-                        Err(e) if records.is_empty() => return Err(e),
-                        Err(_) => {
-                            tracing::warn!(
-                                "audit log rotated and the new file cannot be opened; the end \
-                                 of the old file is handed on first"
-                            );
-                            return Ok(Polled {
-                                records,
-                                positions,
-                                more: true,
-                                skipped,
-                            });
-                        }
-                    }
+                    // The old file is read to its end and closed: a source
+                    // holding records of it ends them now, whether or not
+                    // the new file opens (security review M1 of #392). No
+                    // cursor is saved while no file is open, so the saved
+                    // one stays in the old file, and the new file is read
+                    // from its start once it opens.
+                    self.ended = Some((dev, ino));
+                    let (file, dev, ino, _) = open_regular(&self.path, self.open_check.as_ref())?;
+                    self.file = Some((file, dev, ino));
+                    self.offset = 0;
+                    self.tail.clear();
+                    self.splitter.reset();
                 }
                 _ => break,
             }
         }
-        Ok(Polled {
-            records,
-            positions,
-            more: false,
-            skipped,
-        })
+        Ok(false)
+    }
+
+    /// The file a rotation closed after reading it to its end, once (see
+    /// [`Self::poll`]): set whether or not the new file could be opened,
+    /// also when the poll that met it failed. A source holding records of
+    /// that file ends them (they can no longer be re-read).
+    pub fn take_ended(&mut self) -> Option<(u64, u64)> {
+        self.ended.take()
     }
 
     /// The replay found in the saved cursor when the file was opened
@@ -1956,7 +1991,7 @@ mod tests {
         loop {
             let p = t.poll().unwrap();
             polls += 1;
-            assert!(p.records.len() <= MAX_POLL_RECORDS_KEEPING_EMPTY + CHUNK);
+            assert!(p.records.len() <= MAX_POLL_LINE_RECORDS + CHUNK);
             assert_eq!(p.records.len(), p.positions.len());
             total += p.records.len();
             if !p.more {
@@ -2143,6 +2178,106 @@ mod tests {
         s.feed(b"{\"a\":1}\n{\"long\":\"value\"}\n{\"b\":2}\n", &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(s.last_skips(), [1]);
+    }
+
+    /// Security review M1 of #392: the closed file is reported once,
+    /// whether the new file opened, could not be opened with records read
+    /// (handed on), or could not be opened with nothing read (the poll
+    /// fails). L1: a poll that only skipped a record is handed on too.
+    #[test]
+    fn a_rotation_reports_the_ended_file() {
+        let d = Dir::new("ended");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        assert_eq!(t.take_ended(), None);
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        // The new file opens.
+        let first = ino(&log);
+        std::fs::rename(&log, d.0.join("audit.1.log")).unwrap();
+        append(&log, "n1\n");
+        assert_eq!(lines(t.poll().unwrap()), ["n1"]);
+        assert_eq!(t.take_ended().map(|f| f.1), Some(first));
+        assert_eq!(t.take_ended(), None);
+        // Nothing read, the new file refused: the poll fails, the old file
+        // is reported ended all the same.
+        let second = ino(&log);
+        std::fs::rename(&log, d.0.join("audit.2.log")).unwrap();
+        let elsewhere = d.0.join("other");
+        append(&elsewhere, "x\n");
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        assert!(t.poll().is_err());
+        assert_eq!(t.take_ended().map(|f| f.1), Some(second));
+        assert!(t.poll().is_err());
+        assert_eq!(t.take_ended(), None);
+        // Only a record skipped for its size before the refusal (L1).
+        std::fs::remove_file(&log).unwrap();
+        append(&log, "");
+        assert!(t.poll().unwrap().records.is_empty());
+        let third = ino(&log);
+        append(&log, &format!("{}\n", "y".repeat(MAX_RECORD_BYTES + 1)));
+        std::fs::rename(&log, d.0.join("audit.3.log")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        let p = t.poll().unwrap();
+        assert!(p.records.is_empty());
+        assert_eq!(p.skipped, [(0, (p_dev(&d.0), third))]);
+        assert!(p.more);
+        assert_eq!(t.take_ended().map(|f| f.1), Some(third));
+        assert!(t.poll().is_err());
+    }
+
+    fn p_dev(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p).unwrap().dev()
+    }
+
+    /// Security review N8 of #392: a read error after some records were
+    /// read in the poll hands them on (the offset is past them); the next
+    /// poll meets the error; nothing is read twice once reads work again.
+    #[test]
+    fn a_read_error_hands_on_what_was_read() {
+        let d = Dir::new("readerr");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        // More than one chunk, so that the second read fails.
+        let line = format!("{}\n", "z".repeat(1023));
+        append(&log, &line.repeat(CHUNK / 1024 + 8));
+        t.reads_before_failure = Some(1);
+        let p = t.poll().unwrap();
+        assert_eq!(p.records.len(), CHUNK / 1024);
+        assert!(p.more);
+        assert!(matches!(t.poll(), Err(TailError::Unreadable(_))));
+        t.reads_before_failure = None;
+        let p = t.poll().unwrap();
+        assert_eq!(p.records.len(), 8);
+        assert_eq!(t.take_ended(), None);
+    }
+
+    /// Security review N1 of #392: a flood of `\r\n` (an empty record each
+    /// with `Lines`) is bounded in records per poll as with
+    /// `LinesKeepingEmpty`; ordinary lines are not affected.
+    #[test]
+    fn lines_polls_are_bounded_in_records() {
+        let d = Dir::new("crlf-flood");
+        let log = d.0.join("audit.log");
+        append(&log, "");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&log, &"\r\n".repeat(600_000));
+        let (mut total, mut polls) = (0, 0);
+        loop {
+            let p = t.poll().unwrap();
+            polls += 1;
+            assert!(p.records.len() <= MAX_POLL_LINE_RECORDS + CHUNK);
+            total += p.records.len();
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(total, 600_000);
+        assert!(polls >= 3, "{polls}");
     }
 
     #[test]
