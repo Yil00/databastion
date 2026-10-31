@@ -281,8 +281,9 @@ decision 8); an agent that learned a new token from an upgraded replica sends th
 replica, an older replica answers `400`, and the agent resends those items without the field, so
 they lose it (for example the overflowed-objects flag of an event, the name case of a target, the
 "altered by normalization" marker of a finding). An engine token is worse: a 0.9 replica answers
-`400` to every heartbeat that reports a SQLite target and to every SQLite findings batch, once an
-agent learned `engine.sqlite` from an upgraded replica. To avoid that, hold the new tokens back with
+`400` to every heartbeat that reports a SQLite or Firebird target and to every SQLite or Firebird
+findings or events batch, once an agent learned `engine.sqlite` or `engine.firebird` from an
+upgraded replica. To avoid that, hold the new tokens back with
 `DATABASTION_AGENT_TOKENS_HOLD` ([console/README.md](../console/README.md#configuration)) until no
 older replica remains:
 
@@ -314,8 +315,8 @@ older replica remains:
    depend on them do not apply (for 0.9: overflowed event objects reaching object- and
    sensitivity-scoped policies, ADR-0053; exceptions following the server's name case, ADR-0055;
    exceptions not covering names altered by normalization, ADR-0056; after 0.9: SQLite targets,
-   ADR-0059, which the agents report only once `engine.sqlite` is listed and whose findings wait
-   in their spool until then). Check that every replica's
+   ADR-0059, and Firebird targets, ADR-0060, which the agents report only once `engine.sqlite` or
+   `engine.firebird` is listed and whose findings and events wait in their spool until then). Check that every replica's
    `databastion_console_agent_tokens_hold` is back to `0`; alerting on it staying `1` is a good idea.
 4. Upgrade the agents. They send the new fields once a heartbeat answer lists their tokens.
 

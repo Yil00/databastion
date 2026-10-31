@@ -580,7 +580,10 @@ export function handleRequestScan(req: Request, agentId: string, targetId: strin
  * `409 confirmation_required` with the counts and the `digest` to send back as `confirm`; nothing is
  * queued until then. `202 {job_id, ...counts}` when the `audit.configure` job is queued. Audited.
  * Both answers carry `min_rows_warning` (`"no_row_counts"` for `min_rows` on a Redis / Valkey
- * target, #235 review N2, else `null`): a warning, never a refusal. A Discovery-only target
+ * target, #235 review N2, else `null`) and `schema_warning` (`"schema_never_matches"` for manual
+ * objects naming a schema on a MySQL / MariaDB or MongoDB target, review L2 of #391, else `null`):
+ * warnings, never a refusal. Manual objects naming a schema on a Firebird target answer
+ * `400 invalid_params`. A Discovery-only target
  * (SQLite, ADR-0059 decision 7) answers `409 audit_unsupported`, nothing queued (audited).
  */
 export function handleConfigureAudit(req: Request, agentId: string, targetId: string): Promise<Response> {
@@ -609,6 +612,7 @@ export function handleConfigureAudit(req: Request, agentId: string, targetId: st
             truncated_objects: r.truncated,
             skipped_key_patterns: r.skippedKeyPatterns,
             min_rows_warning: r.minRowsWarning,
+            schema_warning: r.schemaWarning,
           },
           202,
         );
@@ -620,6 +624,7 @@ export function handleConfigureAudit(req: Request, agentId: string, targetId: st
             truncated_objects: r.truncated,
             skipped_key_patterns: r.skippedKeyPatterns,
             min_rows_warning: r.minRowsWarning,
+            schema_warning: r.schemaWarning,
             digest: r.digest,
           },
           409,

@@ -16,7 +16,7 @@ export interface AgentListItem {
   lastSeenAt: Date | null;
   revokedAt: Date | null;
   lockedAt: Date | null;
-  targets: { targetId: string; auditLevel: string; present: boolean; notes?: readonly StoredTargetNote[] }[];
+  targets: { targetId: string; engine?: string; auditLevel: string; present: boolean; notes?: readonly StoredTargetNote[] }[];
 }
 
 /**
@@ -62,7 +62,7 @@ export function AgentsTable({ agents, now }: { agents: AgentListItem[]; now: num
                   <Badge
                     key={t.targetId}
                     variant="outline"
-                    title={t.notes && t.notes.length > 0 ? t.notes.map((n) => renderTargetNote(n).text).join("\n") : undefined}
+                    title={t.notes && t.notes.length > 0 ? t.notes.map((n) => renderTargetNote(n, t.engine ?? null).text).join("\n") : undefined}
                   >
                     {t.targetId}: {t.auditLevel}
                     {t.notes && t.notes.length > 0 && (

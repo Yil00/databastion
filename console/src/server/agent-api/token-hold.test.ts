@@ -36,11 +36,13 @@ const LISTED_BY_0_8 = [
 /** Tokens added after 0.8.2, held by `0.8`. */
 const ADDED_AFTER_0_8 = [
   "access_event.objects_overflowed",
+  "engine.firebird",
   "engine.sqlite",
   "location.altered",
   "object_ref.altered",
   "target_status.name_case",
   "target_status.note_labels.2026_10_c",
+  "target_status.note_labels.2026_10_d",
 ];
 
 /** The tokens listed by 0.9.0 (`git show 0.9.0:console/src/server/agent-api/capabilities.ts`). */
@@ -61,8 +63,8 @@ const LISTED_BY_0_9 = [
   "target_status.notes",
 ];
 
-/** Tokens added after 0.9.0, held by `0.9` (P10-E). */
-const ADDED_AFTER_0_9 = ["engine.sqlite"];
+/** Tokens added after 0.9.0, held by `0.9` (P10-E: SQLite, then Firebird with its label revision). */
+const ADDED_AFTER_0_9 = ["engine.firebird", "engine.sqlite", "target_status.note_labels.2026_10_d"];
 
 const held = { DATABASTION_AGENT_TOKENS_HOLD: "0.8" };
 const held09 = { DATABASTION_AGENT_TOKENS_HOLD: "0.9" };
@@ -87,12 +89,23 @@ describe("token hold: listing (unit)", () => {
     expect(heldAccepts(held).filter((t) => LISTED_BY_0_8.includes(t))).toEqual([]);
   });
 
-  it("0.9 lists exactly the 0.9.0 list and holds engine.sqlite (P10-E: a 0.9 replica refuses sqlite values)", () => {
+  it("0.9 lists exactly the 0.9.0 list and holds the SQLite and Firebird tokens (P10-E: a 0.9 replica refuses their values)", () => {
     expect(listedAccepts(held09)).toEqual(LISTED_BY_0_9);
     expect(heldAccepts(held09)).toEqual(ADDED_AFTER_0_9);
     expect([...listedAccepts(held09), ...heldAccepts(held09)].sort()).toEqual([...CONSOLE_ACCEPTS]);
     // Each release line lists at least what the previous one listed.
     for (const t of LISTED_BY_0_8) expect(listedAccepts(held09)).toContain(t);
+  });
+
+  it("holds engine.firebird and target_status.note_labels.2026_10_d together, on every release line (ADR-0060, P10-E)", () => {
+    for (const env of [held, held09]) {
+      expect(heldAccepts(env)).toContain("engine.firebird");
+      expect(heldAccepts(env)).toContain("target_status.note_labels.2026_10_d");
+      expect(listedAccepts(env)).not.toContain("engine.firebird");
+      expect(listedAccepts(env)).not.toContain("target_status.note_labels.2026_10_d");
+    }
+    expect(listedAccepts({})).toContain("engine.firebird");
+    expect(listedAccepts({})).toContain("target_status.note_labels.2026_10_d");
   });
 
   it("every release list is a sorted, duplicate-free subset of CONSOLE_ACCEPTS and a valid CapabilityList", () => {
@@ -132,8 +145,8 @@ describe("token hold: startup checks (unit)", () => {
     expect(startupFatal(env({ ...base, ...held09 }))).toBeNull();
     const warning09 = agentTokensHoldWarning(env({ ...base, ...held09 }));
     expect(warning09).toContain("DATABASTION_AGENT_TOKENS_HOLD=0.9");
-    expect(warning09).toContain("not engine.sqlite;");
-    expect(warning09).toContain("(ADR-0059)");
+    expect(warning09).toContain("not engine.firebird, engine.sqlite, target_status.note_labels.2026_10_d;");
+    expect(warning09).toContain("(ADR-0059, ADR-0060)");
   });
 });
 
@@ -143,7 +156,7 @@ describe("token hold: recurring signals (unit, review L1)", () => {
     const t0 = 1_000_000_000_000;
     const first = tokensHoldWarningDue(t0, held);
     expect(first).toContain("DATABASTION_AGENT_TOKENS_HOLD=0.8");
-    expect(first).toContain("ADR-0053, ADR-0055, ADR-0056");
+    expect(first).toContain("ADR-0053, ADR-0055, ADR-0056, ADR-0059, ADR-0060");
     expect(tokensHoldWarningDue(t0 + 1, held)).toBeNull();
     expect(tokensHoldWarningDue(t0 + TOKENS_HOLD_WARNING_INTERVAL_MS - 1, held)).toBeNull();
     expect(tokensHoldWarningDue(t0 + TOKENS_HOLD_WARNING_INTERVAL_MS, held)).toBe(first);
@@ -252,6 +265,28 @@ describe.skipIf(!hasDb)("token hold: a held console still accepts and stores eve
     expect(out.accepts).toEqual(LISTED_BY_0_9);
     const rows = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
     expect(rows.filter((r) => r.engine === "sqlite").length).toBe(body.targets.filter((t) => t.engine === "sqlite").length);
+  });
+
+  it("0.8 and 0.9: do not list engine.firebird nor 2026_10_d, yet accept and store a firebird heartbeat with its labels (P10-E)", async () => {
+    for (const [hold, listed] of [
+      ["0.8", LISTED_BY_0_8],
+      ["0.9", LISTED_BY_0_9],
+    ] as const) {
+      vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", hold);
+      for (const name of ["HeartbeatRequest.firebird.json", "HeartbeatRequest.firebird-labels-2026-10-d.json"]) {
+        const auth = await enroll();
+        const body = fixture<{ targets: { target_id: string; engine: string; notes?: unknown[] }[] }>(name);
+        const res = await heartbeat(auth, body);
+        expect(res.status, `${hold} ${name}`).toBe(200);
+        const out = (await res.json()) as { accepts: string[] };
+        expect(out.accepts, `${hold} ${name}`).toEqual(listed);
+        const rows = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+        const fb = body.targets.filter((t) => t.engine === "firebird");
+        expect(rows.filter((r) => r.engine === "firebird").length, `${hold} ${name}`).toBe(fb.length);
+        for (const t of fb) expect(rows.find((r) => r.targetId === t.target_id)?.notes ?? null).toEqual(t.notes ?? null);
+      }
+      vi.unstubAllEnvs();
+    }
   });
 
   it("stores objects_overflowed and ObjectRef.altered of an events batch", async () => {

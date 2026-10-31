@@ -29,6 +29,10 @@ import type { AuditSource, Engine } from "@/lib/protocol/enums";
  * name for the file's own database, the same on every target), no schema, `object` the table and
  * `field` the column. The views show the target, the table and the column, never `main` as if it
  * told files apart: the target id does (`locationDatabaseShown`).
+ *
+ * Firebird (ADR-0060 decision 5, contract `Location` text): database (the name declared in
+ * `agent.yaml`, never a file path or alias), table, column; no schema (the contract refuses one).
+ * Shown on one line, as for MySQL, without a schema part.
  */
 
 export interface LocationPartLabels {
@@ -45,6 +49,7 @@ const CAS_AUDIT: LocationPartLabels = { database: "store", schema: "schema", obj
 const SQL_SERVER: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
 const KEY_VALUE: LocationPartLabels = { database: "database", schema: "type", object: "key pattern", field: "field" };
 const SQLITE: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
+const FIREBIRD: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
 
 /**
  * Display names of the contract engines. Exhaustive: a new contract engine fails `tsc` until it is
@@ -124,6 +129,7 @@ export function locationPartLabels(engine: string | null | undefined, database: 
   if (engine === "sqlserver") return SQL_SERVER;
   if (isKeyPatternEngine(engine)) return KEY_VALUE;
   if (isSqliteEngine(engine)) return SQLITE;
+  if (engine === "firebird") return FIREBIRD;
   return GENERIC;
 }
 

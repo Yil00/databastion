@@ -2,7 +2,15 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { agents, agentTargets, auditConfigs, findings, jobs } from "@/db/schema";
-import { minRowsWarning, type AuditWarning, type MinRowsWarning } from "@/lib/audit-warning";
+import {
+  minRowsWarning,
+  objectsWithSchema,
+  SCHEMA_REFUSED_ENGINES,
+  schemaObjectsWarning,
+  type AuditWarning,
+  type MinRowsWarning,
+  type SchemaObjectsWarning,
+} from "@/lib/audit-warning";
 import { objectSensitivity } from "@/lib/event-model";
 import { isDiscoveryOnlyEngine, isKeyPatternEngine } from "@/lib/location-labels";
 import { logger } from "@/lib/logger";
@@ -343,7 +351,15 @@ export async function auditSummaries(db: Database, agentId: string): Promise<Map
 }
 
 export type AuditConfigureOutcome =
-  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number; skippedKeyPatterns: number; minRowsWarning: MinRowsWarning | null }
+  | {
+      outcome: "queued";
+      jobId: string;
+      change: AuditChange;
+      truncated: number;
+      skippedKeyPatterns: number;
+      minRowsWarning: MinRowsWarning | null;
+      schemaWarning: SchemaObjectsWarning | null;
+    }
   /** A narrowing change without (or with an outdated) confirmation: nothing is queued. */
   | {
       outcome: "confirmation_required";
@@ -352,6 +368,7 @@ export type AuditConfigureOutcome =
       truncated: number;
       skippedKeyPatterns: number;
       minRowsWarning: MinRowsWarning | null;
+      schemaWarning: SchemaObjectsWarning | null;
     }
   | { outcome: "not_found" }
   | { outcome: "invalid" }
@@ -392,6 +409,7 @@ export async function configureAudit(
               next_objects: result.change.nextCount,
               removed_objects: result.change.removed,
               min_rows_warning: result.minRowsWarning,
+              schema_warning: result.schemaWarning,
             }
           : {}),
       },
@@ -430,6 +448,11 @@ async function queueAuditSettings(
     const rowsWarning = minRowsWarning(keyPatternTarget, input.minRows);
     // A key pattern names a Redis / Valkey object only (contract `SensitiveObject`, as `ObjectRef`).
     if (!keyPatternTarget && input.manualObjects.some((o) => !validateSchema("Identifier", o.object).ok)) return { outcome: "invalid" };
+    // Security review L2 of #391: Firebird and SQLite locations have no schema (the contract refuses
+    // one), so a manual object naming one is refused; on MySQL / MariaDB and MongoDB it is saved
+    // with a warning, since earlier consoles stored such objects (src/lib/audit-warning.ts).
+    if (SCHEMA_REFUSED_ENGINES.includes(target.engine) && objectsWithSchema(input.manualObjects) > 0) return { outcome: "invalid" };
+    const schemaWarning = schemaObjectsWarning(target.engine, input.manualObjects);
     // Key patterns go only to an agent that listed the token (ADR-0022 decision 3); otherwise
     // they are left out and counted (M3), from the findings and from the manual objects alike.
     const keyPatterns = keyPatternTarget && agentAcceptsKeyPatterns(agent.accepts);
@@ -454,7 +477,7 @@ async function queueAuditSettings(
     );
     const digest = settingsDigest(params);
     if (change.warning !== null && input.confirm !== digest) {
-      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
+      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning, schemaWarning };
     }
     // The settings replace the previous ones as a whole: jobs not delivered yet are superseded.
     await tx
@@ -495,10 +518,11 @@ async function queueAuditSettings(
         ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true),
         skipped_key_patterns: skippedKeyPatterns,
         min_rows_warning: rowsWarning,
+        schema_warning: schemaWarning,
       },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
-    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
+    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning, schemaWarning };
 }
 
 /**
