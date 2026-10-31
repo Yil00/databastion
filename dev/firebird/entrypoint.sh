@@ -8,7 +8,8 @@
 #      security database lives in the container, not in the data volume): SYSDBA (seeding and
 #      inspection only, never the agent), DATABASTION_AGENT (the minimal variant, decision 4) and
 #      AGENT_SYSDBA_MAPPED (mapped to SYSDBA in the database: refused, for the refusal tests);
-#   2. on the first start, the database `crm` from the generated seed (dev/firebird/seed.sh).
+#   2. on the first start, the database `crm` from the generated seed (dev/firebird/seed.sh),
+#      then the scripts of /databastion/initdb.d/ when that directory is mounted (e2e only).
 # Then the SuperServer in the foreground. Dev-only fake passwords (dev/.env).
 set -euo pipefail
 
@@ -51,6 +52,14 @@ echo "[firebird] accounts ready"
 
 if [ ! -f "$DATA/.databastion-seeded" ]; then
   FIREBIRD_SEED_DATABASE="$DATA/crm.fdb" bash /databastion/seed.sh
+  # Optional first-start scripts (none in dev; the e2e-firebird test accounts, e2e/README.md
+  # "Firebird target"): run in name order, over embedded connections like the seed, so that their
+  # statements are emptied from the audit log with the seed's below.
+  for f in /databastion/initdb.d/*.sh; do
+    [ -f "$f" ] || continue
+    echo "[firebird] running $(basename "$f")"
+    FIREBIRD_SEED_DATABASE="$DATA/crm.fdb" bash "$f"
+  done
   # The seed ran over an embedded connection, whose engine reads the same AuditTraceConfigFile and
   # wrote the seed's statements (fake values) to the audit log under its own pid (ADR-0060 8e):
   # emptied once, before the server starts and before any agent reads it (dev only; never on a
