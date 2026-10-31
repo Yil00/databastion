@@ -600,6 +600,63 @@ fn the_firebird_connector_has_its_own_client_only() {
     }
 }
 
+/// ADR-0060 refinement of 2026-10-31, R52 item 5 (security review N4):
+/// the agent image ships nothing under `/run/databastion`, the directory of
+/// the default declared host identity files. The image build checks the
+/// base image's tree in its `image-check` stage, which the runtime stage
+/// depends on; here, that the stage is there and wired, and that no
+/// `COPY` / `ADD` / `WORKDIR` / `VOLUME` of the runtime stage writes
+/// under `/run`.
+#[test]
+fn the_agent_image_ships_nothing_under_run_databastion() {
+    let dockerfile = std::fs::read_to_string(workspace_root().join("Dockerfile")).unwrap();
+    let lines: Vec<&str> = dockerfile
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("FROM build AS image-check"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("RUN test ! -e /image-root/run/databastion")),
+        "the image check is gone"
+    );
+    let runtime = lines
+        .iter()
+        .position(|l| l.starts_with("FROM ") && l.ends_with(" AS runtime"))
+        .expect("a runtime stage");
+    let stage = &lines[runtime..];
+    assert!(
+        stage
+            .iter()
+            .any(|l| l.starts_with("COPY --from=image-check ")
+                && l.ends_with("/usr/local/bin/databastion-agent")),
+        "the runtime stage must take its binary from the checked stage"
+    );
+    for l in stage {
+        let mut words = l.split_whitespace();
+        let Some(op) = words.next() else { continue };
+        if !["COPY", "ADD", "WORKDIR", "VOLUME", "RUN"].contains(&op) {
+            continue;
+        }
+        assert!(
+            op != "RUN",
+            "a RUN step in the shell-less runtime stage: {l}"
+        );
+        let dest = l.split_whitespace().last().unwrap_or_default();
+        let dest = dest.trim_matches(|c| c == '[' || c == ']' || c == '"');
+        assert!(
+            !dest.starts_with("/run") && !dest.starts_with("/var/run") && dest != "/",
+            "the runtime stage writes {dest}"
+        );
+    }
+}
+
 /// The resolved graph: `(package name, links, [(dependency name, normal,
 /// build)]], resolved features)` per node.
 type Node = (
