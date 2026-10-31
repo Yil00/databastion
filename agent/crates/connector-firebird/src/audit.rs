@@ -263,6 +263,8 @@ struct Target {
     stream: StreamFacts,
     probe_sent: Option<SystemTime>,
     generation: u64,
+    /// The identity files the last readers check used (R44 item 6).
+    identity_source: Option<crate::host_identity::Source>,
 }
 
 impl AuditState {
@@ -461,9 +463,26 @@ pub(crate) fn evaluate(
     }
     // R4 (R39 (i)): the server's uid from the server process proof 2
     // finds, or the declared `peer_uid`, never a default.
+    // R44 item 3: container detection at every check.
     let in_container = databastion_core::config::firebird::agent_in_container();
+    let source = crate::host_identity::Source::of(in_container, cfg.host_identity.is_some());
+    // R44 item 6 (N7): one local line when the source switches.
+    let previous = state.with(target_id, |t| {
+        std::mem::replace(&mut t.identity_source, source)
+    });
+    if let Some(now) = crate::host_identity::switched(previous, source) {
+        tracing::info!(
+            target_id = %target_id,
+            source = now.as_str(),
+            "Firebird readers check: identity files source"
+        );
+    }
     let server = input.server_pid.and_then(crate::fsread::server_ids);
-    if let Err(why) = crate::fsread::readers_check(&cfg.log, server, input.peer_uid, in_container) {
+    let place = crate::fsread::Place {
+        in_container,
+        host_identity: cfg.host_identity.as_ref(),
+    };
+    if let Err(why) = crate::fsread::readers_check(&cfg.log, server, input.peer_uid, place) {
         notes.add(TargetNote::new(NoteCode::AuditLogReadableByOthers));
         detail.push(format!("readers check: {why}"));
         proven = false;
@@ -1507,6 +1526,7 @@ mod tests {
             firebird_conf: "/nonexistent/fb/firebird.conf".into(),
             root: "/nonexistent/fb".into(),
             databases_conf: Some("/nonexistent/fb/databases.conf".into()),
+            host_identity: None,
         };
         let db = DbFacts {
             attach: "/data/app.fdb".to_owned(),

@@ -343,6 +343,81 @@ pub fn trace_conf(data: &[u8]) {
     }
 }
 
+/// The identity files of the readers check (ADR-0060 refinement of
+/// 2026-10-31, R52 item 4): the first byte selects the parser (passwd,
+/// group, subuid, nsswitch, mountinfo), the next eight a mount id; the
+/// mount entry found for an id is the only entry with that id, or none,
+/// and an identity built from the parsed files answers every gid.
+pub fn host_identity(data: &[u8]) {
+    use crate::host_identity as hi;
+    let [which, rest @ ..] = data else {
+        return;
+    };
+    match which % 6 {
+        0 => {
+            if let Ok(users) = hi::parse_passwd(rest) {
+                let id = hi::Identity::assemble(
+                    users,
+                    Vec::new(),
+                    Some(&hi::Nss {
+                        passwd: Some(vec![b"files".to_vec()]),
+                        group: Some(vec![b"files".to_vec()]),
+                        ..hi::Nss::default()
+                    }),
+                    hi::SubFile::Absent,
+                    hi::SubFile::Absent,
+                    hi::Place::Container,
+                );
+                if let Ok(id) = id {
+                    let _ = id.uid_rules(84, 10_001, Some((Some("firebird"), None)));
+                }
+            }
+        }
+        1 => {
+            if let Ok(groups) = hi::parse_group(rest) {
+                let id = hi::Identity {
+                    users: Vec::new(),
+                    groups: Some(groups.clone()),
+                    sub_uid: hi::Ranges::Unprovable,
+                    sub_gid: hi::Ranges::Known(Vec::new()),
+                };
+                for g in groups.iter().take(64) {
+                    let _ = id.group_open(g.gid, &|u| u == 0);
+                }
+            }
+        }
+        2 => {
+            if let Ok(r) = hi::parse_subid(rest) {
+                let r = hi::Ranges::Known(r);
+                for probe in [0, 84, 99_999, 100_000, u32::MAX] {
+                    let _ = r.contains(probe);
+                }
+            }
+        }
+        3 => {
+            let _ = hi::parse_nsswitch(rest);
+        }
+        _ => {
+            let (id, text) = if rest.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&rest[..8]);
+                (u64::from_le_bytes(b) % 4096, &rest[8..])
+            } else {
+                (0, rest)
+            };
+            if let Ok(table) = hi::parse_mountinfo(text) {
+                assert!(table.len() < hi::MOUNTINFO_BOUNDS.lines);
+                let n = table.iter().filter(|e| e.id == id).count();
+                match hi::find_mount(&table, id) {
+                    Some(e) => assert!(e.id == id && n == 1),
+                    None => assert!(n != 1),
+                }
+            }
+            let _ = hi::decode_octal(text);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +435,7 @@ mod tests {
             catalog,
             trace_log,
             trace_conf,
+            host_identity,
         ] {
             f(&[]);
             f(&[0]);

@@ -11,10 +11,11 @@
 //!   directory, or the next log file through the directory's default ACL,
 //!   from the mode bits, the owner and group, the POSIX ACLs (mask
 //!   applied) and the members of every group with read access
-//!   (`/etc/group`, `/etc/passwd`). The server's uid is the server
-//!   process's (`/proc/<pid>/status`) or the declared `peer_uid`, never a
-//!   default. An agent whose identity files are not the host's (a
-//!   container, a user namespace) proves nothing.
+//!   (the identity files of [`crate::host_identity`]: the bare host's own,
+//!   or in a container the declared host files, R44 to R50). The server's
+//!   uid is the server process's (`/proc/<pid>/status`) or the declared
+//!   `peer_uid`, never a default. An agent in a container without
+//!   declared host files proves nothing.
 //! - [`process_start`] (R1 rule 1, R5): field 22 of `/proc/<pid>/stat`,
 //!   converted with the boot time and the clock ticks.
 //!
@@ -27,8 +28,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use databastion_core::config::firebird::FirebirdHostIdentity;
 use rustix::fs::{Access, AtFlags, CWD, Mode, OFlags};
 use zeroize::Zeroizing;
+
+use crate::host_identity::{self, Fail, Identity};
 
 /// Why a file is refused (kinds only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +100,16 @@ fn names(path: &Path, meta: &std::fs::Metadata) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|now| {
         now.file_type().is_file() && (now.dev(), now.ino()) == (meta.dev(), meta.ino())
     })
+}
+
+/// Whether the agent could write the file `path` names (`meta` from
+/// `fstat` on its handle): owner, mode bits, `faccessat(W_OK)`, a
+/// writable ancestor directory (ADR-0060 R45 item 3).
+pub(crate) fn agent_can_write(path: &Path, meta: &std::fs::Metadata) -> bool {
+    strict()
+        && (writable_by(meta.uid(), meta.gid(), meta.mode())
+            || access_writable(path)
+            || ancestor_writable(path))
 }
 
 /// The checks of an opened file (`meta` from `fstat` on its handle).
@@ -271,43 +285,81 @@ pub(crate) fn binary_dir(cmdline: &[u8]) -> Option<std::path::PathBuf> {
 /// Rotated files examined at most next to the log (R4).
 const MAX_DIR_ENTRIES: usize = 4096;
 
+/// Where the readers check runs (ADR-0060 R44 item 3): whether a
+/// container is detected at this check, and the declared host identity
+/// files.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Place<'a> {
+    pub(crate) in_container: bool,
+    pub(crate) host_identity: Option<&'a FirebirdHostIdentity>,
+}
+
 /// Who can read `path` (R4, proof 1): `Ok` when no uid other than root,
 /// the server's and the agent's can read the log, the files rotated from
 /// it (`<name>.*` and `<name>-*` next to it: the files the server may
 /// still write and the ones the agent may still be reading), or its
 /// directory, nor will the next log file through the directory's
-/// default ACL; otherwise the reason. `server`: the server's uid and gid
-/// as `/proc` shows them, `peer`: the declared `peer_uid`; neither, or
-/// both differing, is a refusal (never a default uid).
+/// default ACL; otherwise the reason (local detail only). `server`: the
+/// server's uid and gid as `/proc` shows them, `peer`: the declared
+/// `peer_uid`; neither, or both differing, is a refusal (never a default
+/// uid). The identity files are the bare host's own or, in a container,
+/// the declared ones (refinement of 2026-10-31, R44 to R50), read at this
+/// check.
 pub(crate) fn readers_check(
     path: &Path,
     server: Option<(u32, u32)>,
     peer: Option<u32>,
-    in_container: bool,
-) -> Result<(), &'static str> {
-    if in_container {
-        return Err("agent_in_container");
-    }
+    place: Place<'_>,
+) -> Result<(), String> {
+    let declared = match (place.in_container, place.host_identity) {
+        (false, Some(_)) => return Err(host_identity::not_in_container().reason()),
+        (true, None) => return Err("agent_in_container".to_owned()),
+        (true, Some(h)) => Some(h),
+        (false, None) => None,
+    };
     let (server_uid, server_gid) = match (server, peer) {
         (Some((u, g)), Some(p)) if u == p => (u, Some(g)),
-        (Some(_), Some(_)) => return Err("server_uid_mismatch"),
+        (Some(_), Some(_)) => return Err("server_uid_mismatch".to_owned()),
         (Some((u, g)), None) => (u, Some(g)),
         (None, Some(p)) => (p, None),
-        (None, None) => return Err("server_uid_unknown"),
+        (None, None) => return Err("server_uid_unknown".to_owned()),
     };
     let agent = rustix::process::geteuid().as_raw();
-    let passwd = std::fs::read_to_string("/etc/passwd").ok();
-    let group = std::fs::read_to_string("/etc/group").ok();
-    let (Some(passwd), Some(group)) = (passwd, group) else {
-        return Err("identity_files_unreadable");
-    };
+    let identity = match declared {
+        Some(h) => host_identity::load_declared(h),
+        None => host_identity::load_bare_host(),
+    }
+    .map_err(Fail::reason)?;
+    identity
+        .uid_rules(
+            server_uid,
+            agent,
+            declared.map(|h| (h.server_account.as_deref(), h.agent_account.as_deref())),
+        )
+        .map_err(Fail::reason)?;
+    readers_with(path, server_uid, server_gid, agent, &identity).map_err(str::to_owned)
+}
+
+/// The permission part of the readers check, with the identity read.
+/// Every file is examined without following links (`symlink_metadata`,
+/// `lgetxattr`; security review N6): a symbolic link counts as open.
+pub(crate) fn readers_with(
+    path: &Path,
+    server_uid: u32,
+    server_gid: Option<u32>,
+    agent: u32,
+    identity: &Identity,
+) -> Result<(), &'static str> {
     let allowed = |uid: u32| uid == 0 || uid == server_uid || uid == agent;
     let check = |p: &Path, need: u32| -> bool {
-        let Ok(m) = std::fs::metadata(p) else {
+        let Ok(m) = std::fs::symlink_metadata(p) else {
             return true;
         };
+        if m.file_type().is_symlink() {
+            return true;
+        }
         let acl = acl_entries(p, "system.posix_acl_access");
-        others_can(&m, need, acl.as_deref(), &passwd, &group, &allowed)
+        others_can(&m, need, acl.as_deref(), identity, &allowed)
     };
     if check(path, 0o4) {
         return Err("log_readable_by_others");
@@ -320,11 +372,11 @@ pub(crate) fn readers_check(
     }
     // The next log file's access, from the directory's default ACL.
     if let Some(def) = acl_entries(dir, "system.posix_acl_default") {
-        let Ok(dm) = std::fs::metadata(dir) else {
+        let Ok(dm) = std::fs::symlink_metadata(dir) else {
             return Err("log_directory_unreadable");
         };
         let gids: Vec<u32> = server_gid.into_iter().chain([dm.gid()]).collect();
-        if default_acl_open(&def, &gids, &passwd, &group, &allowed) {
+        if default_acl_open(&def, &gids, identity, &allowed) {
             return Err("log_directory_default_acl");
         }
     }
@@ -357,33 +409,32 @@ pub(crate) fn readers_check(
 /// Whether a default ACL gives read to a uid outside `allowed` on the
 /// files created in the directory: named users and groups and other
 /// (under the mask), the owning group (the creating server's group or
-/// the directory's) when one of its members is not allowed. The owner
-/// entry is the creating server's own.
+/// the directory's) when it is open. The owner entry is the creating
+/// server's own.
 fn default_acl_open(
     entries: &[(u16, u16, u32)],
     gids: &[u32],
-    passwd: &str,
-    group: &str,
+    identity: &Identity,
     allowed: &dyn Fn(u32) -> bool,
 ) -> bool {
-    let group_ok =
-        |gid: u32| members(group, passwd, gid).is_none_or(|u| u.iter().any(|x| !allowed(*x)));
+    let group_open = |gid: u32| identity.group_open(gid, allowed);
     let mask = entries.iter().find(|e| e.0 == 0x10).map_or(7, |e| e.1);
     entries.iter().any(|&(tag, perm, id)| match tag {
         0x02 => perm & mask & 4 != 0 && !allowed(id),
-        0x04 => perm & mask & 4 != 0 && gids.iter().any(|g| group_ok(*g)),
-        0x08 => perm & mask & 4 != 0 && group_ok(id),
+        0x04 => perm & mask & 4 != 0 && gids.iter().any(|g| group_open(*g)),
+        0x08 => perm & mask & 4 != 0 && group_open(id),
         0x20 => perm & 4 != 0,
         _ => false,
     })
 }
 
 /// The ACL entries `(tag, perm, id)` of `xattr` (`system.posix_acl_access`
-/// or `system.posix_acl_default`), `None` without one; an ACL that does
-/// not parse, or an error other than "no ACL", counts as open.
+/// or `system.posix_acl_default`) of `path` itself, never following a
+/// link (`lgetxattr`), `None` without one; an ACL that does not parse, or
+/// an error other than "no ACL", counts as open.
 fn acl_entries(path: &Path, xattr: &str) -> Option<Vec<(u16, u16, u32)>> {
     let mut buf = vec![0u8; 4096];
-    match rustix::fs::getxattr(path, xattr, &mut buf) {
+    match rustix::fs::lgetxattr(path, xattr, &mut buf) {
         Ok(n) => parse_acl(&buf[..n]).or(Some(vec![(0x20, 7, 0)])),
         Err(e) if e == rustix::io::Errno::NODATA || e == rustix::io::Errno::NOTSUP => None,
         Err(_) => Some(vec![(0x20, 7, 0)]),
@@ -414,39 +465,11 @@ pub(crate) fn parse_acl(b: &[u8]) -> Option<Vec<(u16, u16, u32)>> {
     )
 }
 
-fn members(group: &str, passwd: &str, gid: u32) -> Option<Vec<u32>> {
-    let mut out = Vec::new();
-    let mut found = false;
-    for l in group.lines() {
-        let f: Vec<&str> = l.split(':').collect();
-        if f.len() == 4 && f[2].parse() == Ok(gid) {
-            found = true;
-            for name in f[3].split(',').filter(|n| !n.is_empty()) {
-                let uid = passwd.lines().find_map(|p| {
-                    let pf: Vec<&str> = p.split(':').collect();
-                    (pf.len() >= 4 && pf[0] == name).then(|| pf[2].parse::<u32>().ok())?
-                })?;
-                out.push(uid);
-            }
-        }
-    }
-    // Users whose primary group it is.
-    for p in passwd.lines() {
-        let pf: Vec<&str> = p.split(':').collect();
-        if pf.len() >= 4 && pf[3].parse() == Ok(gid) {
-            out.push(pf[2].parse().ok()?);
-        }
-    }
-    // A group not in /etc/group (NSS): not enumerable, open.
-    found.then_some(out)
-}
-
 fn others_can(
     m: &std::fs::Metadata,
     need: u32,
     acl: Option<&[(u16, u16, u32)]>,
-    passwd: &str,
-    group: &str,
+    identity: &Identity,
     allowed: &dyn Fn(u32) -> bool,
 ) -> bool {
     let mode = m.mode();
@@ -454,21 +477,20 @@ fn others_can(
         // Other.
         return true;
     }
-    let group_ok =
-        |gid: u32| members(group, passwd, gid).is_none_or(|u| u.iter().any(|x| !allowed(*x)));
+    let group_open = |gid: u32| identity.group_open(gid, allowed);
     let need16 = u16::try_from(need).unwrap_or(4);
     match acl {
         None => {
             (!allowed(m.uid()) && mode & (need << 6) != 0)
-                || (mode & (need << 3) != 0 && group_ok(m.gid()))
+                || (mode & (need << 3) != 0 && group_open(m.gid()))
         }
         Some(entries) => {
             let mask = entries.iter().find(|e| e.0 == 0x10).map_or(7, |e| e.1);
             entries.iter().any(|&(tag, perm, id)| match tag {
                 0x01 => perm & need16 != 0 && !allowed(m.uid()),
                 0x02 => perm & mask & need16 != 0 && !allowed(id),
-                0x04 => perm & mask & need16 != 0 && group_ok(m.gid()),
-                0x08 => perm & mask & need16 != 0 && group_ok(id),
+                0x04 => perm & mask & need16 != 0 && group_open(m.gid()),
+                0x08 => perm & mask & need16 != 0 && group_open(id),
                 0x20 => perm & need16 != 0,
                 _ => false,
             })
@@ -521,27 +543,78 @@ mod tests {
         assert_eq!(server_ids(std::process::id()), None);
     }
 
+    fn identity(passwd: &str, group: &str) -> Identity {
+        crate::host_identity::identity_for_tests(
+            passwd,
+            group,
+            Some("passwd: files\ngroup: files\n"),
+            None,
+            None,
+            crate::host_identity::Place::BareHost,
+        )
+        .unwrap()
+    }
+
+    const BARE: Place<'static> = Place {
+        in_container: false,
+        host_identity: None,
+    };
+
     /// R39 (i): no default uid; a mismatch between the process and the
     /// declared account refuses; a default ACL that gives the next log to
-    /// another account refuses.
+    /// another account refuses. R44 items 3 and 5: in a container, the
+    /// declared files or nothing; the block without a container refuses.
     #[test]
     fn the_readers_check_needs_the_servers_uid() {
         let p = Path::new("/nonexistent/fb/audit.log");
         assert_eq!(
-            readers_check(p, None, None, false),
-            Err("server_uid_unknown")
+            readers_check(p, None, None, BARE),
+            Err("server_uid_unknown".to_owned())
         );
         assert_eq!(
-            readers_check(p, Some((84, 84)), Some(85), false),
-            Err("server_uid_mismatch")
+            readers_check(p, Some((84, 84)), Some(85), BARE),
+            Err("server_uid_mismatch".to_owned())
         );
+        let container = Place {
+            in_container: true,
+            host_identity: None,
+        };
         assert_eq!(
-            readers_check(p, Some((84, 84)), Some(84), true),
-            Err("agent_in_container")
+            readers_check(p, Some((84, 84)), Some(84), container),
+            Err("agent_in_container".to_owned())
+        );
+        let h = FirebirdHostIdentity {
+            passwd: "/run/databastion/host/passwd".into(),
+            group: "/run/databastion/host/group".into(),
+            nsswitch: "/run/databastion/host/nsswitch.conf".into(),
+            subuid: None,
+            subgid: None,
+            server_account: None,
+            agent_account: None,
+        };
+        let bare_with_block = Place {
+            in_container: false,
+            host_identity: Some(&h),
+        };
+        assert_eq!(
+            readers_check(p, Some((84, 84)), Some(84), bare_with_block),
+            Err("host_identity_refused (host_identity: not_in_container)".to_owned())
+        );
+        // In a container with the block, files that are not mounts (here
+        // missing) are refused before anything is read.
+        let declared = Place {
+            in_container: true,
+            host_identity: Some(&h),
+        };
+        let why = readers_check(p, Some((84, 84)), Some(84), declared).unwrap_err();
+        assert!(
+            why.starts_with("host_identity_refused (") || why == "user_namespace",
+            "{why}"
         );
         let passwd =
             "root:x:0:0::/:/bin/sh\nfirebird:x:84:84::/:/bin/false\neve:x:1002:1002::/:/bin/sh\n";
         let group = "firebird:x:84:\nstaff:x:50:eve\n";
+        let id = identity(passwd, group);
         let allowed = |u: u32| u == 0 || u == 84;
         // Owner and owning group of server-only membership: closed.
         let closed = [
@@ -550,37 +623,73 @@ mod tests {
             (0x10, 4, u32::MAX),
             (0x20, 0, u32::MAX),
         ];
-        assert!(!default_acl_open(&closed, &[84], passwd, group, &allowed));
+        assert!(!default_acl_open(&closed, &[84], &id, &allowed));
         // A named user, a named group with another member, other: open.
-        assert!(default_acl_open(
-            &[(2, 4, 1002)],
-            &[84],
-            passwd,
-            group,
-            &allowed
-        ));
-        assert!(default_acl_open(
-            &[(8, 4, 50)],
-            &[84],
-            passwd,
-            group,
-            &allowed
-        ));
+        assert!(default_acl_open(&[(2, 4, 1002)], &[84], &id, &allowed));
+        assert!(default_acl_open(&[(8, 4, 50)], &[84], &id, &allowed));
         assert!(default_acl_open(
             &[(0x20, 4, u32::MAX)],
             &[84],
-            passwd,
-            group,
+            &id,
             &allowed
         ));
         // Under a mask without read: closed.
         assert!(!default_acl_open(
             &[(2, 4, 1002), (0x10, 0, u32::MAX)],
             &[84],
-            passwd,
-            group,
+            &id,
             &allowed
         ));
+        // R52 item 1: the dev layout's default ACL (u::rw, g::---, m::r,
+        // o::---, u:10001:r) with the agent as 10001: closed.
+        let agent = |u: u32| u == 0 || u == 84 || u == 10_001;
+        let dev = [
+            (1u16, 6u16, u32::MAX),
+            (2, 4, 10_001),
+            (4, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ];
+        assert!(!default_acl_open(&dev, &[84], &id, &agent));
+        // Groups not provable (R47): an owning group with read is open.
+        let open_groups = crate::host_identity::identity_for_tests(
+            passwd,
+            group,
+            Some("passwd: files systemd\ngroup: files systemd\n"),
+            None,
+            None,
+            crate::host_identity::Place::BareHost,
+        )
+        .unwrap();
+        assert!(default_acl_open(&closed, &[84], &open_groups, &allowed));
+        assert!(!default_acl_open(&dev, &[84], &open_groups, &agent));
+    }
+
+    /// R48 item 3 (and N6): the readers check on real files, with an
+    /// injected identity; a symbolic link among the rotated files counts
+    /// as open.
+    #[test]
+    fn rotated_symlinks_count_as_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fb-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"x").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let id = identity("root:x:0:0::/:/bin/sh\n", "root:x:0:\n");
+        assert_eq!(readers_with(&log, me, None, me, &id), Ok(()));
+        let target = dir.join("other");
+        std::fs::write(&target, b"y").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("audit.log.1")).unwrap();
+        assert_eq!(
+            readers_with(&log, me, None, me, &id),
+            Err("rotated_log_readable_by_others")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review H3: the log check opens and checks without reading, and a
@@ -611,14 +720,5 @@ mod tests {
             Err(Refusal::NotReadable)
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn group_members() {
-        let passwd = "root:x:0:0::/:/bin/sh\nfirebird:x:84:84::/:/bin/false\nagent:x:1001:1001::/:/bin/false\neve:x:1002:84::/:/bin/sh\n";
-        let group = "firebird:x:84:\naudit:x:900:agent\n";
-        assert_eq!(members(group, passwd, 900), Some(vec![1001]));
-        assert_eq!(members(group, passwd, 84), Some(vec![84, 1002]));
-        assert_eq!(members(group, passwd, 5), None);
     }
 }

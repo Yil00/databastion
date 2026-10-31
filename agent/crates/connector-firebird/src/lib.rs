@@ -40,6 +40,9 @@ mod crypt;
 mod discover;
 mod error;
 mod fsread;
+mod host_identity;
+#[cfg(test)]
+mod host_identity_tests;
 mod idents;
 #[cfg_attr(not(test), allow(dead_code))]
 mod own;
