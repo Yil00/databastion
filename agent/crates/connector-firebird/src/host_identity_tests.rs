@@ -149,7 +149,8 @@ fn bare_host_chains() {
     let me = rustix::process::geteuid().as_raw();
     let rules = ChainRules {
         base: &d,
-        owner: me,
+        dir_owner: me,
+        link_owner: me,
     };
     let real = d.join("authselect");
     std::fs::create_dir(&real).unwrap();
@@ -174,14 +175,35 @@ fn bare_host_chains() {
             "{n}"
         );
     }
-    // A link of another owner.
-    let other = ChainRules {
-        base: &d,
-        owner: me.wrapping_add(1),
+    // Security review L2: a `..` in a link target, even one that stays
+    // under the base, is refused.
+    std::os::unix::fs::symlink("authselect/../authselect/nsswitch.conf", d.join("dotdot")).unwrap();
+    assert_eq!(
+        open_bare_host(&d.join("dotdot"), rules).unwrap_err(),
+        OpenError::Refused(Kind::Links)
+    );
+    // A link of another owner, in directories of the expected owner.
+    let link_owner = ChainRules {
+        link_owner: me.wrapping_add(1),
+        ..rules
     };
     assert_eq!(
-        open_bare_host(&d.join("nsswitch.conf"), other).unwrap_err(),
+        open_bare_host(&d.join("nsswitch.conf"), link_owner).unwrap_err(),
         OpenError::Refused(Kind::Links)
+    );
+    // Directories of another owner, with links of the expected owner:
+    // refused for a link and for a file reached without any link.
+    let dir_owner = ChainRules {
+        dir_owner: me.wrapping_add(1),
+        ..rules
+    };
+    assert_eq!(
+        open_bare_host(&d.join("nsswitch.conf"), dir_owner).unwrap_err(),
+        OpenError::Refused(Kind::Owner)
+    );
+    assert_eq!(
+        open_bare_host(&real.join("nsswitch.conf"), dir_owner).unwrap_err(),
+        OpenError::Refused(Kind::Owner)
     );
     // A link in a group-writable directory.
     let gw = d.join("gw");
@@ -190,8 +212,27 @@ fn bare_host_chains() {
     std::os::unix::fs::symlink(real.join("nsswitch.conf"), gw.join("l")).unwrap();
     assert_eq!(
         open_bare_host(&gw.join("l"), rules).unwrap_err(),
-        OpenError::Refused(Kind::Links)
+        OpenError::Refused(Kind::Mode)
     );
+    // Security review L2: a file in a group-writable directory under the
+    // base, reached without any link, and a link target in one.
+    std::fs::write(gw.join("passwd"), PASSWD).unwrap();
+    assert_eq!(
+        open_bare_host(&gw.join("passwd"), rules).unwrap_err(),
+        OpenError::Refused(Kind::Mode)
+    );
+    std::os::unix::fs::symlink(gw.join("passwd"), d.join("to-gw")).unwrap();
+    assert_eq!(
+        open_bare_host(&d.join("to-gw"), rules).unwrap_err(),
+        OpenError::Refused(Kind::Mode)
+    );
+    // A group-writable base itself.
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        open_bare_host(&real.join("nsswitch.conf"), rules).unwrap_err(),
+        OpenError::Refused(Kind::Mode)
+    );
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
     // A link in an ancestor is never followed.
     std::os::unix::fs::symlink(&real, d.join("dirlink")).unwrap();
     assert_eq!(
@@ -224,7 +265,8 @@ fn bare_host_files_on_disk() {
     let me = rustix::process::geteuid().as_raw();
     let rules = ChainRules {
         base: &d,
-        owner: me,
+        dir_owner: me,
+        link_owner: me,
     };
     for (n, c) in [("passwd", PASSWD), ("group", GROUP)] {
         std::fs::write(d.join(n), c).unwrap();

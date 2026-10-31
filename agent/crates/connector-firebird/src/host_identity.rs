@@ -769,20 +769,25 @@ pub(crate) fn open_no_links(path: &Path) -> Result<OwnedFd, OpenError> {
     })
 }
 
-/// The rules of the bare host's symbolic link chains (R45 item 2,
-/// option (a)): every link owned by `owner` in a directory owned by
-/// `owner` without a group or other write bit, every step under `base`.
+/// The rules of the bare host's files and symbolic link chains (R45 item
+/// 2, option (a); security review L2): every directory component from
+/// `base` down to the final file and to each link owned by `dir_owner`
+/// without a group or other write bit, every link owned by `link_owner`,
+/// every step under `base`, no `..` in a link target. The owners are 0 in
+/// production; tests set their own uid.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChainRules<'a> {
     pub(crate) base: &'a Path,
-    pub(crate) owner: u32,
+    pub(crate) dir_owner: u32,
+    pub(crate) link_owner: u32,
 }
 
 /// The production rules: root-owned links under `/etc`.
 pub(crate) fn etc_chain() -> ChainRules<'static> {
     ChainRules {
         base: Path::new("/etc"),
-        owner: 0,
+        dir_owner: 0,
+        link_owner: 0,
     }
 }
 
@@ -790,7 +795,7 @@ pub(crate) fn etc_chain() -> ChainRules<'static> {
 const MAX_HOPS: usize = 8;
 
 /// The lexical resolution of a link target against the link's
-/// directory, canonical (no `.` or `..` left), or `None`.
+/// directory, canonical, or `None` (a `..` component is refused).
 fn lexical(dir: &Path, target: &Path) -> Option<PathBuf> {
     let joined = if target.is_absolute() {
         target.to_path_buf()
@@ -801,11 +806,8 @@ fn lexical(dir: &Path, target: &Path) -> Option<PathBuf> {
     for c in joined.components() {
         match c {
             Component::RootDir | Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
+            // Security review L2: a `..` in a link target is refused.
+            Component::ParentDir => return None,
             Component::Normal(n) => out.push(n),
             Component::Prefix(_) => return None,
         }
@@ -830,33 +832,28 @@ pub(crate) fn open_bare_host(
         if !under(&cur, rules.base) {
             return Err(OpenError::Refused(Kind::Links));
         }
+        let Some(dir) = cur.parent() else {
+            return Err(OpenError::Refused(Kind::NotReadable));
+        };
         match rustix::fs::openat2(CWD, &cur, oflags(), Mode::empty(), resolve()) {
-            Ok(fd) => return Ok((fd, cur)),
+            Ok(fd) => {
+                dirs_ok(dir, rules)?;
+                return Ok((fd, cur));
+            }
             Err(e) if e == rustix::io::Errno::NOENT => return Err(OpenError::Missing),
             Err(e) if e == rustix::io::Errno::LOOP => {}
             Err(_) => return Err(OpenError::Refused(Kind::NotReadable)),
         }
         // A link somewhere on the path: only the last component may be
         // one, and only under the rules.
-        let (Some(dir), Some(name)) = (cur.parent(), cur.file_name()) else {
+        let Some(name) = cur.file_name() else {
             return Err(OpenError::Refused(Kind::NotReadable));
         };
-        let dfd = rustix::fs::openat2(
-            CWD,
-            dir,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            resolve(),
-        )
-        .map_err(|_| OpenError::Refused(Kind::Links))?;
-        let d = rustix::fs::fstat(&dfd).map_err(|_| OpenError::Refused(Kind::NotReadable))?;
-        if d.st_uid != rules.owner || d.st_mode & 0o022 != 0 {
-            return Err(OpenError::Refused(Kind::Links));
-        }
+        let dfd = dirs_ok(dir, rules)?;
         let l = rustix::fs::statat(&dfd, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| OpenError::Refused(Kind::NotReadable))?;
         if rustix::fs::FileType::from_raw_mode(l.st_mode) != rustix::fs::FileType::Symlink
-            || l.st_uid != rules.owner
+            || l.st_uid != rules.link_owner
         {
             return Err(OpenError::Refused(Kind::Links));
         }
@@ -868,6 +865,42 @@ pub(crate) fn open_bare_host(
         cur = lexical(dir, target).ok_or(OpenError::Refused(Kind::Links))?;
     }
     Err(OpenError::Refused(Kind::Links))
+}
+
+/// Security review L2: every directory component from `rules.base` down
+/// to `dir` (both included), each opened `O_PATH` without links and
+/// checked on its handle: owned by `rules.dir_owner`, no group or other
+/// write bit (`owner`, `mode`; a link among them, `links`). Returns the
+/// handle of `dir`.
+fn dirs_ok(dir: &Path, rules: ChainRules<'_>) -> Result<OwnedFd, OpenError> {
+    if !dir.starts_with(rules.base) {
+        return Err(OpenError::Refused(Kind::Links));
+    }
+    let mut last = None;
+    let mut chain: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|a| a.starts_with(rules.base))
+        .collect();
+    chain.reverse();
+    for a in chain {
+        let fd = rustix::fs::openat2(
+            CWD,
+            a,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            resolve(),
+        )
+        .map_err(|_| OpenError::Refused(Kind::Links))?;
+        let st = rustix::fs::fstat(&fd).map_err(|_| OpenError::Refused(Kind::NotReadable))?;
+        if st.st_uid != rules.dir_owner {
+            return Err(OpenError::Refused(Kind::Owner));
+        }
+        if st.st_mode & 0o022 != 0 {
+            return Err(OpenError::Refused(Kind::Mode));
+        }
+        last = Some(fd);
+    }
+    last.ok_or(OpenError::Refused(Kind::NotReadable))
 }
 
 /// The facts of an opened handle, the path re-resolved without links.
