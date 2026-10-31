@@ -208,6 +208,74 @@ pub(crate) struct Session {
     /// The outcome of the last `op_cancel` (the client deadline's
     /// backstop): what the server answered and how long it took.
     pub(crate) last_cancel: Option<CancelOutcome>,
+    /// The account of the last statement's fetch, for its execution
+    /// credit (ADR-0060 R22 item 1).
+    pub(crate) last_fetch: FetchAccount,
+    /// A cancel was sent and the pending request was answered by rows or
+    /// its end rather than by `isc_cancelled` (R22 item 3, a stale
+    /// cancel): the next request may meet it.
+    stale_cancel: bool,
+    /// The agent's own attachment (decision 6): the ledger of the
+    /// endpoint, the declared `attach`, the attachment id once
+    /// `CURRENT_CONNECTION` was read, and the credits of executions run
+    /// before it (moved to the ledger then).
+    own: Own,
+}
+
+/// A session's place in the ledger of its endpoint ([`crate::own`]).
+#[derive(Default)]
+struct Own {
+    ledger: Option<std::sync::Arc<crate::own::Ledger>>,
+    attach: String,
+    id: Option<u64>,
+    early: Vec<(String, Option<String>, FetchAccount)>,
+    closed: bool,
+    /// The table of the built statement being run (its credit names it).
+    table: Option<String>,
+}
+
+/// How the fetch of one execution ended (ADR-0060 R22 item 1, R35).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FetchEnd {
+    /// No fetch ran (prepared or executed only, or not yet ended).
+    #[default]
+    NotRun,
+    /// The server's end-of-result answer was read.
+    End,
+    /// Stopped before the end: the byte budget, the row-limit cut, or the
+    /// client deadline with the answer to every request sent read.
+    Early,
+    /// The attachment was dropped while an answer was still unread.
+    Lost,
+    /// The server's statement timeout (`isc_cancelled` and the timeout
+    /// code).
+    Failed,
+    /// The connector's `op_cancel` was answered by `isc_cancelled` (R35).
+    Cancelled,
+    /// Any other server error.
+    Error,
+}
+
+/// What one execution requested and counted (ADR-0060 R22 item 1): the
+/// bounds of its record's `records fetched` follow from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FetchAccount {
+    /// Rows received from the server (C).
+    pub(crate) counted: u64,
+    /// The sum of the row counts of the `op_fetch` messages written (Q).
+    pub(crate) requested: u64,
+    /// The row count of the last `op_fetch` (L).
+    pub(crate) last: u32,
+    /// The largest row count of one `op_fetch` (M, at most 64).
+    pub(crate) largest: u32,
+    /// How the fetch ended.
+    pub(crate) end: FetchEnd,
+    /// The stale cancel's `isc_cancelled` answered the `DSQL_drop` that
+    /// followed (R22 item 3: a follow-up of the same credit).
+    pub(crate) stale_cancel_follow_up: bool,
+    /// The session was ended cleanly after a stale cancel whose
+    /// `DSQL_drop` succeeded (R22 item 3, review L7).
+    pub(crate) session_retired: bool,
 }
 
 /// What the server answered to the client's `op_cancel` (decision 4).
@@ -257,6 +325,7 @@ pub(crate) async fn connect(
     )
     .await?;
     s.local = Some(local);
+    s.own.ledger = Some(crate::own::ledger_for(endpoint.addr));
     Ok(s)
 }
 
@@ -390,6 +459,12 @@ pub(crate) async fn handshake(
         statement_timeout,
         broken: false,
         last_cancel: None,
+        last_fetch: FetchAccount::default(),
+        stale_cancel: false,
+        own: Own {
+            attach: attach.to_owned(),
+            ..Own::default()
+        },
     };
     session
         .request(&wire::attach(attach, login), deadline, Stage::SessionSetup)
@@ -484,6 +559,7 @@ impl Session {
         if !sql::checked(text) {
             return Err(FbError::new(FailureCode::Internal, Stage::Check));
         }
+        self.own.table = None;
         self.query_text(text, shape, max_rows, deadline).await
     }
 
@@ -497,6 +573,20 @@ impl Session {
         deadline: Instant,
     ) -> Result<Rows, FbError> {
         self.query_text(text, shape, max_rows, deadline).await
+    }
+
+    /// Test support: any text, each row to `on_row`.
+    #[cfg(test)]
+    pub(crate) async fn fetch_for_tests(
+        &mut self,
+        text: &str,
+        shape: &[Col],
+        max_rows: usize,
+        deadline: Instant,
+        on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
+    ) -> Result<Fetched, FbError> {
+        self.statement(text, shape, max_rows, deadline, on_row)
+            .await
     }
 
     /// Whether nothing more can be sent on this attachment.
@@ -537,6 +627,7 @@ impl Session {
         deadline: Instant,
         on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
     ) -> Result<Fetched, FbError> {
+        self.own.table = Some(stmt.table().to_owned());
         self.statement(stmt.text(), shape, max_rows, deadline, on_row)
             .await
     }
@@ -549,6 +640,7 @@ impl Session {
         max_rows: usize,
         deadline: Instant,
     ) -> Result<Rows, FbError> {
+        self.own.table = Some(stmt.table().to_owned());
         self.query_text(stmt.text(), shape, max_rows, deadline)
             .await
     }
@@ -561,6 +653,8 @@ impl Session {
         deadline: Instant,
         on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
     ) -> Result<Fetched, FbError> {
+        self.last_fetch = FetchAccount::default();
+        self.stale_cancel = false;
         self.begin(deadline).await?;
         let tx = self.tx.unwrap_or(0);
         let stmt = self
@@ -570,19 +664,114 @@ impl Session {
         let result = self
             .run((tx, stmt), text, shape, max_rows, deadline, on_row)
             .await;
+        if result.is_err() && self.last_fetch.end == FetchEnd::NotRun {
+            self.last_fetch.end = FetchEnd::Error;
+        }
         if !self.broken {
             // `DSQL_drop` closes the cursor and releases the handle; after
             // a statement cancelled at the deadline, within the cancel's
             // own bound (decision 4: 5 s).
             let cleanup = deadline.max(Instant::now() + CANCEL_WAIT);
-            let free = self
-                .request(&wire::free(stmt, wire::DSQL_DROP), cleanup, Stage::Check)
-                .await;
+            let free = self.free_after(stmt, cleanup).await;
             if let (Ok(_), Err(e)) = (&result, free) {
+                self.record_credit(text);
                 return Err(e);
             }
         }
+        self.record_credit(text);
         result
+    }
+
+    /// One execution's credit (decision 6, R22 item 1): to the ledger once
+    /// the attachment id is known, held until then.
+    fn record_credit(&mut self, text: &str) {
+        let account = self.last_fetch;
+        let table = self.own.table.take();
+        match (&self.own.ledger, self.own.id) {
+            (Some(l), Some(id)) => l.credit(&self.own.attach, id, text, table.as_deref(), account),
+            (Some(_), None) if self.own.early.len() < 64 => {
+                self.own.early.push((text.to_owned(), table, account));
+            }
+            _ => {}
+        }
+    }
+
+    /// The attachment id read from `CURRENT_CONNECTION` and the server pid
+    /// (decision 6, R1 rule 1): the session's attachment enters the
+    /// ledger, with the credits of the executions before it.
+    pub(crate) fn register_own(&mut self, id: u64, pid: u32) {
+        let (Some(l), Some(local)) = (self.own.ledger.clone(), self.local) else {
+            return;
+        };
+        if self.own.id.is_some() {
+            return;
+        }
+        l.register(&self.own.attach, id, local.port(), pid);
+        self.own.id = Some(id);
+        for (text, table, account) in std::mem::take(&mut self.own.early) {
+            l.credit(&self.own.attach, id, &text, table.as_deref(), account);
+        }
+    }
+
+    /// `DSQL_drop` of a statement handle (R22 item 3). After a stale
+    /// cancel, the drop may meet it: an `isc_cancelled` answer is its
+    /// expected follow-up (the drop is sent once more, and the attachment
+    /// stays usable); a successful drop may leave the cancel pending on
+    /// the server, so the session ends cleanly (rolled back and detached,
+    /// review L7) and the caller reconnects; any other answer, or none,
+    /// drops the attachment (`lost`).
+    async fn free_after(&mut self, stmt: u16, until: Instant) -> Result<(), FbError> {
+        let stale = std::mem::take(&mut self.stale_cancel);
+        let free = self
+            .request(&wire::free(stmt, wire::DSQL_DROP), until, Stage::Check)
+            .await;
+        if !stale {
+            return free.map(|_| ());
+        }
+        match free {
+            Err(e) if e.gds == Some(crate::error::gds::CANCELLED) && !self.broken => {
+                self.last_fetch.stale_cancel_follow_up = true;
+                self.request(&wire::free(stmt, wire::DSQL_DROP), until, Stage::Check)
+                    .await
+                    .map(|_| ())
+                    .inspect_err(|_| {
+                        self.broken = true;
+                        self.last_fetch.end = FetchEnd::Lost;
+                    })
+            }
+            Ok(_) => {
+                self.end_cleanly().await;
+                self.last_fetch.session_retired = true;
+                Ok(())
+            }
+            Err(e) => {
+                self.broken = true;
+                self.last_fetch.end = FetchEnd::Lost;
+                Err(e)
+            }
+        }
+    }
+
+    /// Rolls back and detaches, then marks the session unusable: no later
+    /// request of this attachment can meet a cancel still pending on the
+    /// server (R22 item 3, review L7).
+    async fn end_cleanly(&mut self) {
+        let deadline = Instant::now() + CANCEL_WAIT;
+        if let Some(tx) = self.tx.take() {
+            let _ = self
+                .request(
+                    &wire::release(wire::op::ROLLBACK, tx),
+                    deadline,
+                    Stage::Check,
+                )
+                .await;
+        }
+        if !self.broken {
+            let _ = self
+                .request(&wire::release(wire::op::DETACH, 0), deadline, Stage::Check)
+                .await;
+        }
+        self.broken = true;
     }
 
     /// Runs a statement that returns no rows (the session-management
@@ -595,6 +784,7 @@ impl Session {
         if !sql::checked(text) {
             return Err(FbError::new(FailureCode::Internal, Stage::Check));
         }
+        self.own.table = None;
         self.begin(deadline).await?;
         let tx = self.tx.unwrap_or(0);
         let stmt = self
@@ -621,6 +811,15 @@ impl Session {
                 .request(&wire::free(stmt, wire::DSQL_DROP), deadline, Stage::Check)
                 .await;
         }
+        self.last_fetch = FetchAccount {
+            end: if result.is_ok() {
+                FetchEnd::NotRun
+            } else {
+                FetchEnd::Error
+            },
+            ..FetchAccount::default()
+        };
+        self.record_credit(text);
         result
     }
 
@@ -703,6 +902,14 @@ impl Session {
         let mut out = Fetched::default();
         let mut first = true;
         loop {
+            // R22 item 3: the client deadline is checked before each
+            // `op_fetch`. Past it, nothing more is requested and the
+            // caller closes the cursor (`DSQL_drop`): no request is
+            // pending, so no `op_cancel` is sent. The fetch ends early.
+            if Instant::now() >= deadline {
+                self.last_fetch.end = FetchEnd::Early;
+                return Err(FbError::new(FailureCode::Timeout, Stage::Check));
+            }
             let want = u32::try_from((max_rows + 1).saturating_sub(out.rows))
                 .unwrap_or(FETCH_ROWS)
                 .clamp(1, FETCH_ROWS);
@@ -713,14 +920,21 @@ impl Session {
                 .await
                 .inspect_err(|_| {
                     self.broken = true;
+                    self.last_fetch.end = FetchEnd::Lost;
                 })?;
+            let account = &mut self.last_fetch;
+            account.requested += u64::from(want);
+            account.last = want;
+            account.largest = account.largest.max(want);
             let until = self.statement_deadline(deadline);
             let mut received = 0u32;
             loop {
                 match self.next(until, Some(columns)).await {
                     Ok(Next::Row(row)) => {
                         received += 1;
+                        self.last_fetch.counted += 1;
                         if received > want {
+                            self.last_fetch.end = FetchEnd::Lost;
                             return Err(self.fail(Stage::Check));
                         }
                         if out.stopped {
@@ -735,30 +949,44 @@ impl Session {
                         }
                     }
                     Ok(Next::End { more }) => {
-                        if !more || out.cut || out.stopped {
+                        if !more {
+                            self.last_fetch.end = FetchEnd::End;
+                            return Ok(out);
+                        }
+                        if out.cut || out.stopped {
+                            self.last_fetch.end = FetchEnd::Early;
                             return Ok(out);
                         }
                         break;
                     }
                     Ok(Next::Response(r)) if r.status.failed() => {
+                        self.last_fetch.end = server_end(&r.status.codes);
                         let e = FbError::server(&r.status.codes, Stage::Check);
                         self.broken |= e.fatal;
                         return Err(e);
                     }
-                    Ok(Next::Response(_)) => return Err(self.fail(Stage::Check)),
+                    Ok(Next::Response(_)) => {
+                        self.last_fetch.end = FetchEnd::Lost;
+                        return Err(self.fail(Stage::Check));
+                    }
                     Err(e) => return Err(self.after_client_failure(e, Some(columns)).await),
                 }
             }
         }
     }
 
-    /// After a client-side failure while a statement runs: on the client
-    /// deadline, `op_cancel`, then at most [`CANCEL_WAIT`] for the
-    /// statement's answer (rows still in flight are read and dropped);
-    /// otherwise, or without an answer, the attachment is unusable.
+    /// After a client-side failure while a request is pending: on the
+    /// client deadline, `op_cancel`, then at most [`CANCEL_WAIT`] until the
+    /// pending request's answer is complete (rows still in flight read and
+    /// dropped) or the cancelled answer arrives (R22 item 3). An
+    /// `isc_cancelled` answer ends the fetch `cancelled` (R35); an answer
+    /// by rows or the end of the result leaves a stale cancel, which the
+    /// following `DSQL_drop` may meet ([`Self::free_after`]). Otherwise, or
+    /// without an answer, the attachment is unusable (`lost`).
     async fn after_client_failure(&mut self, e: FbError, columns: Option<&[Column]>) -> FbError {
         if e.code != FailureCode::Timeout || self.broken {
             self.broken = true;
+            self.last_fetch.end = FetchEnd::Lost;
             return e;
         }
         let sent = Instant::now();
@@ -770,6 +998,7 @@ impl Session {
             .is_err()
         {
             self.broken = true;
+            self.last_fetch.end = FetchEnd::Lost;
             return e;
         }
         loop {
@@ -785,11 +1014,33 @@ impl Session {
                         "statement cancelled at the client deadline"
                     );
                     self.last_cancel = Some(outcome);
+                    // Cancelled only when `isc_cancelled` is the sole code
+                    // (R35; review of part 1, L4): with the timeout code
+                    // too it is the server's own timeout.
+                    if r.status.codes == [crate::error::gds::CANCELLED] {
+                        self.last_fetch.end = FetchEnd::Cancelled;
+                    } else if r.status.failed() {
+                        self.last_fetch.end = server_end(&r.status.codes);
+                    } else {
+                        // `op_execute` answered before the cancel arrived.
+                        self.stale_cancel = true;
+                        self.last_fetch.end = FetchEnd::Early;
+                    }
                     return e;
                 }
-                Ok(Next::Row(_) | Next::End { .. }) => {}
+                Ok(Next::Row(_)) => {
+                    self.last_fetch.counted += 1;
+                }
+                Ok(Next::End { .. }) => {
+                    // The pending fetch was answered in full: the cancel
+                    // is stale (R22 item 3).
+                    self.stale_cancel = true;
+                    self.last_fetch.end = FetchEnd::Early;
+                    return e;
+                }
                 Err(_) => {
                     self.broken = true;
+                    self.last_fetch.end = FetchEnd::Lost;
                     return e;
                 }
             }
@@ -832,6 +1083,41 @@ impl Session {
                 .await;
         }
         self.conn.shutdown().await;
+        self.end_own();
+    }
+
+    /// The attachment's end in the ledger: clean when nothing failed.
+    fn end_own(&mut self) {
+        if std::mem::replace(&mut self.own.closed, true) {
+            return;
+        }
+        if let (Some(l), Some(id)) = (&self.own.ledger, self.own.id) {
+            l.close(&self.own.attach, id, self.broken, self.statement_timeout);
+        }
+    }
+}
+
+impl Drop for Session {
+    /// A session dropped without `close` (an error path): its attachment
+    /// lives on in the ledger for the statement timeout plus 5 s (R22).
+    fn drop(&mut self) {
+        if !self.own.closed {
+            self.broken = true;
+            self.end_own();
+        }
+    }
+}
+
+/// How a server error ends a fetch (R22 item 1): `isc_cancelled` with the
+/// statement-timeout code is the server's own timeout, anything else an
+/// error (a cancel the connector did not send included, R35).
+fn server_end(codes: &[u32]) -> FetchEnd {
+    use crate::error::gds;
+    if codes.len() == 2 && codes.contains(&gds::CANCELLED) && codes.contains(&gds::REQ_STMT_TIMEOUT)
+    {
+        FetchEnd::Failed
+    } else {
+        FetchEnd::Error
     }
 }
 

@@ -35,17 +35,46 @@ pub(crate) const CHECK_STATEMENT: Duration = Duration::from_secs(3);
 /// Whole `check()` budget (decision 4: 9 s, under the core's 10 s).
 pub(crate) const CHECK_TOTAL: Duration = Duration::from_secs(9);
 /// Most catalog rows read by one privilege statement.
-const MAX_CATALOG_ROWS: usize = 16_384;
+pub(crate) const MAX_CATALOG_ROWS: usize = 16_384;
 /// Supported majors (decision 2).
 const MAJORS: [u32; 2] = [4, 5];
 
 /// Shared state of the connector.
 #[derive(Default)]
 pub(crate) struct CheckState {
+    /// The Audit facts per target (lot 3): what the stream needs from
+    /// `check()`, and what it reports back for the level.
+    pub(crate) audit: std::sync::Arc<crate::audit::AuditState>,
     versions: Mutex<HashMap<String, String>>,
     /// Per target: whether the last check blocks Discovery and Audit (a
     /// refused right, or a refusal list not evaluated completely).
     blocked: Mutex<HashMap<String, bool>>,
+    /// Per target: the declared `attach` of each database the last check
+    /// excluded as its own security database, or not shown not to be one
+    /// (R9): Discovery does not scan them.
+    excluded: Mutex<HashMap<String, Vec<String>>>,
+    /// Per target: checks running now (R11 8d: an early check is never
+    /// started while one runs).
+    running: Mutex<HashMap<String, u32>>,
+}
+
+/// Counts a running check of a target for its lifetime.
+struct Running<'a> {
+    state: &'a CheckState,
+    id: String,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        let mut m = self
+            .state
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = m.get_mut(&self.id) {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 impl CheckState {
@@ -81,6 +110,44 @@ impl CheckState {
             .get(target_id)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// Whether a check of `target_id` is running.
+    pub(crate) fn running(&self, target_id: &str) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .is_some_and(|n| *n > 0)
+    }
+
+    fn start(&self, target_id: &str) -> Running<'_> {
+        *self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(target_id.to_owned())
+            .or_default() += 1;
+        Running {
+            state: self,
+            id: target_id.to_owned(),
+        }
+    }
+
+    /// Whether the last check excluded the database `attach` (R9).
+    pub(crate) fn excluded(&self, target_id: &str, attach: &str) -> bool {
+        self.excluded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .is_some_and(|v| v.iter().any(|a| a == attach))
+    }
+
+    pub(crate) fn set_excluded(&self, target_id: &str, attach: Vec<String>) {
+        self.excluded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target_id.to_owned(), attach);
     }
 
     pub(crate) fn set_blocked(&self, target_id: &str, blocked: bool) {
@@ -136,6 +203,7 @@ fn failed(e: FbError, target: &TargetConfig) -> TargetHealth {
 
 /// `check()` of one target.
 pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
+    let _running = state.start(&target.id);
     let deadline = Instant::now() + CHECK_TOTAL;
     let out = match tokio::time::timeout_at(deadline, run(state, target, deadline)).await {
         Ok(Ok(h)) => return h,
@@ -169,6 +237,22 @@ async fn run(
     let mut eval = Evaluation::default();
     let mut coverage = Coverage::default();
     let mut version: Option<String> = None;
+    let mut audit_dbs = Vec::new();
+    // R9 rule 3: where Audit is configured, the evaluated `databases.conf`
+    // (read and parsed; a failed read leaves it not evaluated).
+    let audit_cfg = settings.audit.clone().filter(|_| !settings.tunnel);
+    let map = match audit_cfg.clone() {
+        Some(cfg) => Some(
+            tokio::task::spawn_blocking(move || crate::audit::alias_map(&cfg))
+                .await
+                .map_err(|e| {
+                    let _ = databastion_core::resume_panic(e);
+                    FbError::new(FailureCode::Internal, Stage::Check)
+                })?,
+        ),
+        None => None,
+    };
+    let mut excluded: Vec<(String, &'static str)> = Vec::new();
     for db in &settings.databases {
         let mut s = conn::connect(
             &endpoint,
@@ -178,26 +262,136 @@ async fn run(
             CHECK_STATEMENT,
         )
         .await?;
-        let result = database(&mut s, settings.tunnel, settings.extended_grants, deadline).await;
-        let read = match &result {
-            Ok(_) => Some(catalog::read(&mut s, deadline).await),
-            Err(_) => None,
-        };
+        let rule3 = map.as_ref().map(|m| (m, audit_cfg.as_ref()));
+        // R41 item 8: the catalog reads below start after this.
+        let read_at = std::time::SystemTime::now();
+        let result = attached(
+            &mut s,
+            settings.tunnel,
+            settings.extended_grants,
+            &db.attach,
+            rule3.and_then(|(m, c)| c.map(|c| (m.as_ref(), c))),
+            deadline,
+        )
+        .await;
+        // Audit (lot 3): the view-dependency read (R12 item 5) and the
+        // read-back probe (proof 7), on databases that are not excluded.
+        let mut deps = crate::views::ViewDeps::default();
+        if audit_cfg.is_some() && matches!(result, Ok(Attached::Checked { .. })) {
+            deps = match crate::views::read(&mut s, deadline).await {
+                Ok(d) => d,
+                Err(e) => {
+                    s.close().await;
+                    return Err(e);
+                }
+            };
+            let _ = s
+                .query(sql::READ_BACK_PROBE, &[Col::Int], 1, deadline)
+                .await;
+        }
         s.close().await;
-        let (v, facts) = result?;
-        let read = read.transpose()?.unwrap_or_default();
-        detail.push(format!("Firebird {v}, wire encryption {}", facts.plugin));
+        let (v, file, read, reason) = match result? {
+            Attached::Checked {
+                version,
+                facts,
+                read,
+                file,
+            } => {
+                detail.push(format!(
+                    "Firebird {version}, wire encryption {}",
+                    facts.plugin
+                ));
+                eval.add(&facts.facts);
+                coverage.add(&read);
+                (version, file, read, None)
+            }
+            Attached::Excluded {
+                version,
+                file,
+                read,
+                reason,
+            } => {
+                excluded.push((db.attach.clone(), reason));
+                detail.push(format!(
+                    "{}: excluded from Discovery and Audit ({reason}: its own security database, \
+                     or not shown not to be one)",
+                    db.name
+                ));
+                (version, file, read, Some(reason))
+            }
+        };
+        audit_dbs.push(crate::audit::DbFacts {
+            attach: db.attach.clone(),
+            label: db.name.clone(),
+            resolved: file.0,
+            catalog: crate::audit::Classes::from_catalog(&read, deps),
+            excluded: reason.is_some(),
+            read_at: Some(read_at),
+        });
         version = Some(v);
-        eval.add(&facts.facts);
-        coverage.add(&read);
     }
+    let mut excluded: Vec<String> = excluded.into_iter().map(|(a, _)| a).collect();
     if let Some(v) = &version {
         state.set_version(&target.id, Some(v.clone()));
     }
     eval.notes(&mut notes);
     coverage.notes(&mut notes, &mut detail);
-    // Audit: lot 3 (decision 10).
-    notes.add(TargetNote::new(NoteCode::AuditSourceNotConfigured));
+    // Audit (decision 6, lot 3): the proofs, under the file rules, off
+    // the async threads.
+    let audit_level = match settings.audit.clone() {
+        Some(cfg) if !settings.tunnel => {
+            let state_audit = std::sync::Arc::clone(&state.audit);
+            let id = target.id.clone();
+            let server_pid = crate::own::ledger_for(endpoint.addr).server_pid();
+            let peer_uid = settings.peer_uid();
+            let (level, n, d) = tokio::task::spawn_blocking(move || {
+                let mut n = Notes::default();
+                let mut d = Vec::new();
+                let level = crate::audit::evaluate(
+                    &state_audit,
+                    &id,
+                    &cfg,
+                    crate::audit::CheckInputs {
+                        dbs: audit_dbs,
+                        server_pid,
+                        peer_uid,
+                    },
+                    &mut n,
+                    &mut d,
+                );
+                (level, n, d)
+            })
+            .await
+            .map_err(|e| {
+                let _ = databastion_core::resume_panic(e);
+                FbError::new(FailureCode::Internal, Stage::Check)
+            })?;
+            notes.extend(n.into_vec());
+            detail.extend(d);
+            level
+        }
+        _ => {
+            notes.add(TargetNote::new(NoteCode::AuditSourceNotConfigured));
+            AuditLevel::None
+        }
+    };
+    // R9: the databases excluded here and by the evaluation's
+    // `databases.conf` rule (re-review L-E), for Discovery; the note with
+    // Discovery or Audit.
+    if settings.audit.is_some() && !settings.tunnel {
+        for a in state.audit.excluded_attach(&target.id) {
+            if !excluded.contains(&a) {
+                excluded.push(a);
+            }
+        }
+    }
+    if !excluded.is_empty() {
+        notes.add(
+            TargetNote::new(NoteCode::CoverageSecurityDatabaseExcluded)
+                .with_count(excluded.len() as u64),
+        );
+    }
+    state.set_excluded(&target.id, excluded);
     let summary = eval.summary();
     if !summary.is_empty() {
         detail.push(summary);
@@ -206,7 +400,7 @@ async fn run(
     tracing::info!(target_id = %target.id, detail = %detail.join("; "), "Firebird checked");
     Ok(TargetHealth {
         reachable: true,
-        audit_level: AuditLevel::None,
+        audit_level,
         failure: None,
         detail: Some(detail.join("; ")),
         notes: notes.into_vec(),
@@ -438,6 +632,12 @@ pub(crate) async fn prepare(
         )
         .await?;
     let row = rows.rows.first().cloned().unwrap_or_default();
+    // The agent's own attachment (decision 6, R1 rule 1).
+    if let (Some(Value::Int(id)), Some(Value::Int(pid))) = (row.first(), row.get(3))
+        && let (Ok(id), Ok(pid)) = (u64::try_from(*id), u32::try_from(*pid))
+    {
+        s.register_own(id, pid);
+    }
     if !tunnel {
         let same = match (s.local, text(&row, 1), text(&row, 2)) {
             (Some(local), Some(protocol), Some(remote)) => {
@@ -455,13 +655,143 @@ pub(crate) async fn prepare(
     Ok((version, major))
 }
 
-pub(crate) async fn database(
+/// One declared database as the attachment shows it (R9): excluded as
+/// its own security database, or not shown not to be one, before any
+/// privilege probe runs on it; or checked (decision 4) with its catalog.
+pub(crate) enum Attached {
+    Excluded {
+        version: String,
+        file: (Option<String>, Option<String>),
+        read: catalog::Catalog,
+        reason: &'static str,
+    },
+    Checked {
+        version: String,
+        facts: Box<DatabaseFacts>,
+        read: catalog::Catalog,
+        file: (Option<String>, Option<String>),
+    },
+}
+
+/// R9 rules 1 and 2 (fail closed, security review L8): `MON$SEC_DATABASE`
+/// must read `Default` or `Other`; the catalog read must be complete and
+/// hold neither the security-database shape (a relation `PLG$SRP` with
+/// the columns `PLG$USER_NAME`, `PLG$VERIFIER` and `PLG$SALT`; with its
+/// column list not read, cut or incomplete, the name alone) nor a legacy
+/// user-manager relation name.
+pub(crate) fn excluded_by(sec: Option<&str>, read: &catalog::Catalog) -> Option<&'static str> {
+    match sec {
+        Some("Default" | "Other") => {}
+        Some(_) => return Some("mon_sec_database_not_default"),
+        None => return Some("mon_sec_database_not_read"),
+    }
+    let Some(rels) = &read.relations else {
+        return Some("catalog_not_read");
+    };
+    if read.relations_cut {
+        return Some("catalog_cut");
+    }
+    let named = |n: &str| rels.iter().any(|r| catalog::trimmed(&r.name) == n);
+    if named("PLG$SRP") {
+        let shape = match &read.columns {
+            Some(cols) if !read.columns_cut && !cols.incomplete.contains("PLG$SRP") => {
+                ["PLG$USER_NAME", "PLG$VERIFIER", "PLG$SALT"]
+                    .iter()
+                    .all(|c| {
+                        cols.list.iter().any(|x| {
+                            catalog::trimmed(&x.relation) == "PLG$SRP"
+                                && catalog::trimmed(&x.name) == *c
+                        })
+                    })
+            }
+            _ => true,
+        };
+        if shape {
+            return Some("security_database_shape");
+        }
+    }
+    if named("PLG$USERS") || named("PLG$VIEW_USERS") {
+        return Some("legacy_user_manager_relation");
+    }
+    None
+}
+
+/// The attachment's checks (decisions 2 to 4) with R9's exclusion first:
+/// the session checks, the database file and security-database kind
+/// (`MON$SEC_DATABASE`), the catalog, then, on a database that is not
+/// excluded, the privilege reads and probes. `rule3`: the evaluated map
+/// (`None` when not evaluated) and the Audit configuration, where Audit
+/// is configured (R9 rule 3).
+pub(crate) async fn attached(
     s: &mut Session,
     tunnel: bool,
     extended_grants: bool,
+    attach: &str,
+    rule3: Option<(
+        Option<&crate::trace_conf::AliasMap>,
+        &databastion_core::config::firebird::FirebirdAuditConfig,
+    )>,
     deadline: Instant,
-) -> Result<(String, DatabaseFacts), FbError> {
+) -> Result<Attached, FbError> {
     let (version, major) = prepare(s, tunnel, deadline).await?;
+    let file = match soft(
+        s.query(
+            sql::DATABASE_FILE,
+            &[Col::Text(4080), Col::Text(28)],
+            1,
+            deadline,
+        )
+        .await,
+    )? {
+        Some(rows) if !rows.cut => {
+            let row = rows.rows.first().cloned().unwrap_or_default();
+            (
+                text(&row, 0),
+                text(&row, 1).map(|t| t.trim_end().to_owned()),
+            )
+        }
+        _ => (None, None),
+    };
+    let read = catalog::read(s, deadline).await?;
+    let mut reason = excluded_by(file.1.as_deref(), &read);
+    if reason.is_none()
+        && let Some((map, cfg)) = rule3
+    {
+        let root = cfg.root.to_string_lossy();
+        let decl = crate::trace_conf::DeclaredDb {
+            label: "",
+            resolved: file.0.as_deref(),
+            alias: (!attach.starts_with('/')).then_some(attach),
+        };
+        if crate::trace_conf::own_security_database(map, &decl, &root) != Some(false) {
+            reason = Some("databases_conf_security_database");
+        }
+    }
+    if let Some(reason) = reason {
+        s.commit(deadline).await?;
+        return Ok(Attached::Excluded {
+            version,
+            file,
+            read,
+            reason,
+        });
+    }
+    let facts = Box::new(facts(s, major, extended_grants, deadline).await?);
+    Ok(Attached::Checked {
+        version,
+        facts,
+        read,
+        file,
+    })
+}
+
+/// The privilege reads and probes of one attachment (decision 4).
+async fn facts(
+    s: &mut Session,
+    major: u32,
+    extended_grants: bool,
+    deadline: Instant,
+) -> Result<DatabaseFacts, FbError> {
     let mut f = Facts {
         major,
         extended_grants,
@@ -606,13 +936,10 @@ pub(crate) async fn database(
     .and_then(|row| Some((row.first()?.as_int()?, row.get(1)?.as_int()?)));
     f.readable = credential_relations(s, deadline).await?;
     s.commit(deadline).await?;
-    Ok((
-        version,
-        DatabaseFacts {
-            facts: f,
-            plugin: s.plugin_name(),
-        },
-    ))
+    Ok(DatabaseFacts {
+        facts: f,
+        plugin: s.plugin_name(),
+    })
 }
 
 /// The one-bit probes of decision 4 (M5) and R3, on the relations of the

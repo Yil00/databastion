@@ -1054,3 +1054,424 @@ fn every_security_database_relation_is_never_sampled() {
         );
     }
 }
+
+/// The system audit trace of the main server (lot 3): its configuration
+/// and the log of the `dev/firebird/it.sh` workload.
+#[path = "it_audit.rs"]
+mod audit;
+
+/// The lot 3 texts on the agent's own attachment (R2 rule 1, R9, proof
+/// 7): the resolved path, `Default` as the security-database kind of an
+/// ordinary database, and one row for the read-back probe; the session's
+/// attachment and credits reach the endpoint's ledger.
+#[tokio::test]
+async fn the_lot_3_texts_and_the_ledger() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    crate::check::prepare(&mut s, false, deadline)
+        .await
+        .unwrap();
+    let rows = s
+        .query(
+            crate::sql::DATABASE_FILE,
+            &[crate::sql::Col::Text(4080), crate::sql::Col::Text(28)],
+            1,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let row = &rows.rows[0];
+    let text = |i: usize| match &row[i] {
+        crate::sql::Value::Text(t) => t.trim_end().to_owned(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(text(0), attach());
+    assert_eq!(text(1), "Default");
+    let probe = s
+        .query(
+            crate::sql::READ_BACK_PROBE,
+            &[crate::sql::Col::Int],
+            1,
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(probe.rows.len(), 1);
+    // R12 item 5: the two view-dependency texts run for the minimal
+    // account, complete (no view of the seed depends on an
+    // always-reported relation).
+    let deps = crate::views::read(&mut s, deadline).await.unwrap();
+    assert!(deps.complete, "{deps:?}");
+    assert!(deps.dependent.is_empty());
+    let ledger = crate::own::ledger_for(endpoint.addr);
+    assert!(ledger.latest_id(&attach()).is_some());
+    assert!(ledger.server_pid().is_some());
+    s.close().await;
+    // R9: the declared database is not excluded, before any probe.
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    let a = crate::check::attached(&mut s, false, false, &attach(), None, deadline)
+        .await
+        .unwrap();
+    assert!(matches!(a, crate::check::Attached::Checked { .. }));
+    s.close().await;
+}
+
+/// The engine-matrix own-statement test of R20, phase 1 (`dev/firebird/
+/// it.sh` runs it before it copies the server's trace log): `check()` and a
+/// Discovery scan of the main database as the agent account, then the
+/// view-dependency read and the read-back probe, every execution credited
+/// in the endpoint's ledger; the ledger is written to
+/// `FIREBIRD_IT_MATRIX_OUT` (attachment ids, ports, credit texts and
+/// counts: catalog names only, no value) for phase 2
+/// (`it_audit::the_agent_records_match_the_own_statement_table`).
+#[tokio::test]
+async fn own_reads_for_the_matrix() {
+    let Ok(out) = std::env::var("FIREBIRD_IT_MATRIX_OUT") else {
+        return;
+    };
+    if !enabled() {
+        return;
+    }
+    let c = FirebirdConnector::new();
+    let t = agent("");
+    let h = c.check(&t).await;
+    assert!(h.failure.is_none(), "{h:?}");
+    let scan = scan(&c, &t, unpaced()).await;
+    assert!(scan.result.is_ok(), "{:?}", scan.result);
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    crate::check::prepare(&mut s, false, deadline)
+        .await
+        .unwrap();
+    crate::views::read(&mut s, deadline).await.unwrap();
+    let _ = s
+        .query(
+            crate::sql::READ_BACK_PROBE,
+            &[crate::sql::Col::Int],
+            1,
+            deadline,
+        )
+        .await
+        .unwrap();
+    s.close().await;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(out)
+        .unwrap();
+    f.write_all(crate::own::ledger_for(endpoint.addr).dump().as_bytes())
+        .unwrap();
+}
+
+/// One text column of a test query (raw bytes, padding dropped).
+fn octets(row: &[crate::sql::Value], i: usize) -> String {
+    match row.get(i) {
+        Some(crate::sql::Value::Bytes(b)) => String::from_utf8_lossy(b).trim_end().to_owned(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Drift tests per image (item 5 of the lot 3 report, decision 9): the
+/// virtual relations (relation type 3) are exactly what the stream classes
+/// as virtual after a complete catalog read, every other system relation
+/// is a system relation (noise), and every word of the statement
+/// analysis's built-in list is a keyword of the server (`RDB$KEYWORDS`,
+/// where the version has it): a word the server does not know as built in
+/// could name user code the analysis would not report.
+#[tokio::test]
+async fn drift_of_the_virtual_relations_and_the_built_in_words() {
+    use crate::trace_events::{Catalog as _, RelClass};
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    let rows = s
+        .query_for_tests(
+            "SELECT CAST(RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), \
+             CAST(COALESCE(RDB$RELATION_TYPE, 0) AS INTEGER) FROM RDB$RELATIONS \
+             WHERE COALESCE(RDB$SYSTEM_FLAG, 0) <> 0",
+            &[crate::sql::Col::Octets(252), crate::sql::Col::Int],
+            4096,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let classes = crate::audit::Classes::from_catalog(
+        &crate::catalog::Catalog {
+            relations: Some(Vec::new()),
+            columns: Some(crate::catalog::Columns::default()),
+            ..crate::catalog::Catalog::default()
+        },
+        crate::views::ViewDeps::default(),
+    );
+    let mut virtual_n = 0;
+    let server_virtual: Vec<String> = rows
+        .rows
+        .iter()
+        .filter(|r| r.get(1).and_then(crate::sql::Value::as_int) == Some(3))
+        .map(|r| octets(r, 0))
+        .collect();
+    eprintln!("[measure] virtual relations {server_virtual:?}");
+    for row in &rows.rows {
+        let name = octets(row, 0);
+        let virtual_rel = row.get(1).and_then(crate::sql::Value::as_int) == Some(3);
+        let class = classes.class(&name);
+        let want = if virtual_rel {
+            virtual_n += 1;
+            RelClass::Virtual
+        } else {
+            RelClass::System
+        };
+        assert_eq!(class, want, "{name}");
+    }
+    assert!(virtual_n >= 10, "{virtual_n} virtual relations");
+    eprintln!(
+        "[measure] system relations {}, virtual {virtual_n}",
+        rows.rows.len()
+    );
+    match s
+        .query_for_tests(
+            "SELECT CAST(RDB$KEYWORD_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$KEYWORDS",
+            &[crate::sql::Col::Octets(252)],
+            4096,
+            deadline,
+        )
+        .await
+    {
+        Ok(k) => {
+            let words: std::collections::BTreeSet<String> =
+                k.rows.iter().map(|r| octets(r, 0)).collect();
+            let missing: Vec<&str> = databastion_classifiers::query::firebird::builtin_words()
+                .iter()
+                .copied()
+                .filter(|w| !words.contains(*w))
+                .collect();
+            eprintln!(
+                "[measure] keywords {}, built-in words not keywords {missing:?}",
+                words.len()
+            );
+            assert!(missing.is_empty(), "{missing:?}");
+        }
+        Err(e) => eprintln!(
+            "[measure] RDB$KEYWORDS not readable on this version: {:?}",
+            e.code
+        ),
+    }
+    // Re-review L-2: every word of the reserved list is reserved on this
+    // server: in `RDB$KEYWORDS` when readable (5.0), and refused as a
+    // relation name by the parser (not "table unknown") on both.
+    if let Ok(k) = s
+        .query_for_tests(
+            "SELECT CAST(RDB$KEYWORD_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$KEYWORDS \
+             WHERE RDB$KEYWORD_RESERVED",
+            &[crate::sql::Col::Octets(252)],
+            4096,
+            deadline,
+        )
+        .await
+    {
+        let reserved: std::collections::BTreeSet<String> =
+            k.rows.iter().map(|r| octets(r, 0)).collect();
+        let not: Vec<&str> = crate::idents::RESERVED
+            .iter()
+            .copied()
+            .filter(|w| !reserved.contains(*w))
+            .collect();
+        eprintln!(
+            "[measure] reserved keywords {}, listed words not reserved {not:?}",
+            reserved.len()
+        );
+        assert!(not.is_empty(), "{not:?}");
+    }
+    let mut accepted = Vec::new();
+    for w in crate::idents::RESERVED {
+        let text = format!("SELECT 1 FROM {w}");
+        match s
+            .query_for_tests(&text, &[crate::sql::Col::Int], 1, deadline)
+            .await
+        {
+            Err(e) if e.code != databastion_core::FailureCode::UnknownTarget && !e.fatal => {}
+            other => accepted.push((*w, other.map(|_| ()).map_err(|e| e.code))),
+        }
+    }
+    eprintln!(
+        "[measure] reserved words read as a relation name: {accepted:?} of {}",
+        crate::idents::RESERVED.len()
+    );
+    assert!(accepted.is_empty(), "{accepted:?}");
+    // The control: a non-reserved keyword reads as a relation name.
+    let control = s
+        .query_for_tests("SELECT 1 FROM NAME", &[crate::sql::Col::Int], 1, deadline)
+        .await;
+    assert_eq!(
+        control.map(|_| ()).map_err(|e| e.code),
+        Err(databastion_core::FailureCode::UnknownTarget)
+    );
+    s.close().await;
+}
+
+/// ADR-0060 R41 item 9 on the pinned servers: `dev/firebird/it.sh`
+/// creates `deps.fdb` (outside the trace) with the review's cases. The
+/// server records dependencies on virtual relations for procedures,
+/// computed columns, packaged functions, views and triggers (asserted:
+/// a kind with none would have to count as dependent wholesale), and the
+/// agent's read gives the expected set: the procedure over
+/// `MON$STATEMENTS`, the computed-column table, both members of the call
+/// cycle, the package, the view calling it, the two triggers and the
+/// table with an expression index; not the standalone `P` next to the
+/// packaged `PKG.P`, nor a plain procedure. Check constraints and domain
+/// checks are measured.
+#[tokio::test]
+async fn the_dependent_set_on_the_server() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        "/var/lib/firebird/data/deps.fdb",
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    crate::check::prepare(&mut s, false, deadline)
+        .await
+        .unwrap();
+    // The rows the mapping relies on (catalog identifiers only).
+    let o = crate::sql::Col::Octets(252);
+    let rows = s
+        .query(
+            crate::sql::DEPENDENCIES,
+            &[o, crate::sql::Col::Int, o, crate::sql::Col::Int, o],
+            65_536,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let txt = |v: &crate::sql::Value| match v {
+        crate::sql::Value::Bytes(b) => String::from_utf8_lossy(b).trim_end().to_owned(),
+        crate::sql::Value::Int(i) => i.to_string(),
+        crate::sql::Value::Null => "NULL".to_owned(),
+        other => format!("{other:?}"),
+    };
+    for r in &rows.rows {
+        let line: Vec<String> = r.iter().map(txt).collect();
+        if line
+            .iter()
+            .any(|c| c.contains("PKG") || c.contains("IX_") || c == "6")
+        {
+            eprintln!("[measure] dependency row {line:?}");
+        }
+    }
+    // Re-review L-4: the field sources read are user columns with a
+    // computed or checked domain only (here T_COMP's computed column, the
+    // domain-check table's column, V_PKG's expression), no system column.
+    let fields = s
+        .query(
+            crate::sql::FIELD_SOURCES,
+            &[o, o, crate::sql::Col::Bool],
+            65_536,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let field_tables: std::collections::BTreeSet<String> =
+        fields.rows.iter().map(|r| txt(&r[0])).collect();
+    eprintln!(
+        "[measure] field sources {} rows, tables {field_tables:?}",
+        fields.rows.len()
+    );
+    assert!(
+        !field_tables
+            .iter()
+            .any(|t| t.starts_with("RDB$") || t.starts_with("MON$") || t.starts_with("SEC$")),
+        "{field_tables:?}"
+    );
+    assert!(field_tables.contains("T_COMP"), "{field_tables:?}");
+    let start = std::time::Instant::now();
+    let deps = crate::views::read(&mut s, deadline).await.unwrap();
+    eprintln!(
+        "[measure] dependent set read in {} ms: complete {}, {} dependent, computed {:?}",
+        start.elapsed().as_millis(),
+        deps.complete,
+        deps.dependent.len(),
+        deps.computed
+    );
+    s.close().await;
+    assert!(deps.complete);
+    // `T` carries the expression index it.sh created over MON$STATEMENTS
+    // (accepted by the server, its dependency not recorded): dependent.
+    for name in [
+        "P_MON", "T_COMP", "P1", "P2", "PKG", "V_PKG", "TR_CONN", "TR_ROW", "T",
+    ] {
+        assert!(
+            deps.dependent.contains(name),
+            "{name}: {:?}",
+            deps.dependent
+        );
+    }
+    for name in ["P", "P_OK"] {
+        assert!(
+            !deps.dependent.contains(name),
+            "{name}: {:?}",
+            deps.dependent
+        );
+    }
+    eprintln!(
+        "[measure] check constraint table dependent {}, domain check table dependent {}",
+        deps.dependent.contains("T_CHK"),
+        deps.dependent.contains("T_DOM")
+    );
+}

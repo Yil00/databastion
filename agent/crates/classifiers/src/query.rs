@@ -73,6 +73,7 @@ use zeroize::Zeroizing;
 
 use crate::names;
 
+pub mod firebird;
 mod pg_code;
 mod pg_scan;
 pub mod tsql;

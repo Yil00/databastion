@@ -51,6 +51,11 @@ echo "[firebird] accounts ready"
 
 if [ ! -f "$DATA/.databastion-seeded" ]; then
   FIREBIRD_SEED_DATABASE="$DATA/crm.fdb" bash /databastion/seed.sh
+  # The seed ran over an embedded connection, whose engine reads the same AuditTraceConfigFile and
+  # wrote the seed's statements (fake values) to the audit log under its own pid (ADR-0060 8e):
+  # emptied once, before the server starts and before any agent reads it (dev only; never on a
+  # monitored server, where a truncated log is a gap).
+  if [ -f /var/lib/firebird/audit/audit.log ]; then : > /var/lib/firebird/audit/audit.log; fi
   touch "$DATA/.databastion-seeded"
 fi
 echo "[firebird] starting the server"

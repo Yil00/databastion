@@ -1378,6 +1378,14 @@ impl AgentConfig {
             if let Some(cas) = &t.cas {
                 files.extend(cas.referenced_paths());
             }
+            if let Some(a) = t.firebird.as_ref().and_then(|f| f.audit.as_ref()) {
+                files.extend([
+                    a.log.clone(),
+                    a.trace_config.clone(),
+                    a.firebird_conf.clone(),
+                ]);
+                files.extend(a.databases_conf.clone());
+            }
         }
         for f in files.into_iter().filter(|f| f.is_absolute()) {
             if let Some(dir) = f.parent().filter(|d| *d != Path::new("/")) {
@@ -2358,9 +2366,20 @@ targets:
         );
         let unknown = FIREBIRD.replace(
             "      peer_uid: 84\n",
-            "      peer_uid: 84\n      audit: {}\n",
+            "      peer_uid: 84\n      audit_log: {}\n",
         );
         assert!(err(&unknown).contains("unknown field"), "{}", err(&unknown));
+        // `firebird.audit` (lot 3) names every file it needs.
+        let incomplete = FIREBIRD.replace(
+            "      peer_uid: 84\n",
+            "      peer_uid: 84\n      audit: {}\n",
+        );
+        assert!(
+            err(&incomplete).contains("missing field")
+                && err(&incomplete).contains("firebird.audit"),
+            "{}",
+            err(&incomplete)
+        );
     }
 
     #[test]

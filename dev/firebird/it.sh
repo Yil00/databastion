@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Firebird connector integration tests (ADR-0060 decision 10: lot 1, the wire client, SRP-256,
 # ChaCha, the loopback, peer-uid and forwarder rules, check(); lot 2, Discovery and the CAS store
-# guard). This script starts throwaway servers from the pinned images, seeds fake accounts and the
-# dev seed (dev/seed/out/firebird.sql, loaded by dev/firebird/seed.sh as the database `crm`, the
-# one of the dev service), and runs agent/crates/connector-firebird's it.rs tests against them:
+# guard; lot 3, the Audit parsers against the server's own trace log). This script starts
+# throwaway servers from the pinned images, seeds fake accounts and the dev seed
+# (dev/seed/out/firebird.sql, loaded by dev/firebird/seed.sh as the database `crm`, the one of the
+# dev service), and runs agent/crates/connector-firebird's it.rs tests against them:
 #
 #   dev/firebird/it.sh [5|4]        # Firebird 5.0.4 (default) or 4.0.7
 #   FIREBIRD_IT_FILTER=it::discovery dev/firebird/it.sh 5   # a subset of the tests
@@ -47,6 +48,7 @@ FWD_PORT="$((PORT + 10))"
 NAME="${COMPOSE_PROJECT_NAME:-databastion}-it-firebird${MAJOR}"
 LOCAL_IMAGE="databastion-it/${NAME}:local"
 VOLUME="${NAME}-data"
+AUDIT_VOLUME="${NAME}-audit"
 NET="$NAME-net"
 VARIANTS="chacha arc4 nocrypt fb3 mapping"
 SUDO=""
@@ -67,7 +69,7 @@ cleanup() {
   for n in $VARIANTS; do c+=("$NAME-$n"); done
   # -v: the anonymous volumes of the image's VOLUME declarations too.
   timeout 60 docker rm -f -v "${c[@]}" "$NET" >/dev/null 2>&1 || true
-  timeout 60 docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+  timeout 60 docker volume rm "$VOLUME" "$AUDIT_VOLUME" >/dev/null 2>&1 || true
   timeout 60 docker rmi "$LOCAL_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -176,12 +178,38 @@ if ! timeout 10 docker logs "$NAME-init" 2>&1 | grep -F "crm.fdb seeded" >/dev/n
   exit 1
 fi
 timeout 60 docker stop "$NAME-init" >/dev/null
+# The system audit trace (lot 3, decision 6): the image's firebird.conf (with its entrypoint's
+# settings) plus AuditTraceConfigFile, and a trace configuration meeting the Partial proofs for
+# app.fdb and crm.fdb (the dev one, with a section for each), the log on its own volume. Mounted
+# read-only over the main server's; copies are kept for the configuration tests.
+timeout 60 docker cp "$NAME-init:/opt/firebird/firebird.conf" "$WORK/firebird.conf"
+timeout 60 docker cp "$NAME-init:/opt/firebird/databases.conf" "$WORK/databases.conf"
+printf '\nAuditTraceConfigFile = /databastion/fbtrace.conf\n' >> "$WORK/firebird.conf"
+# ADR-0060 R42 item 6 (optional): DefaultTimeZone different from the process TZ below.
+if [ -n "${FIREBIRD_IT_DEFAULT_TZ:-}" ]; then
+  printf 'DefaultTimeZone = %s\n' "$FIREBIRD_IT_DEFAULT_TZ" >> "$WORK/firebird.conf"
+fi
+awk -v app=/var/lib/firebird/data/app.fdb '
+  /^database = \/var\/lib\/firebird\/data\/crm.fdb$/ { s = 1 }
+  s { sec = sec $0 "\n" }
+  { print }
+  s && /^}$/ { s = 0; sub(/crm\.fdb/, "app.fdb", sec); printf "\n%s", sec }
+' "$ROOT/dev/firebird/fbtrace.conf" > "$WORK/fbtrace.conf"
+chmod 0644 "$WORK/firebird.conf" "$WORK/fbtrace.conf"
 timeout 120 docker commit --change 'ENV FIREBIRD_ROOT_PASSWORD=' "$NAME-init" "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker rm -v "$NAME-init" >/dev/null
 timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$VOLUME:/d" --entrypoint chown \
   "$LOCAL_IMAGE" -R 84:84 /d
-timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" --user 84:84 \
-  -v "$VOLUME:/var/lib/firebird/data" --entrypoint /opt/firebird/bin/firebird "$LOCAL_IMAGE" >/dev/null
+timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$AUDIT_VOLUME:/a" --entrypoint chown \
+  "$LOCAL_IMAGE" 84:84 /a
+# R42 item 6 (optional): the server process's time zone, POSIX form (no tzdata needed).
+SERVER_TZ=()
+[ -z "${FIREBIRD_IT_TZ:-}" ] || SERVER_TZ=(-e "TZ=$FIREBIRD_IT_TZ")
+timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" "${SERVER_TZ[@]}" --user 84:84 \
+  -v "$VOLUME:/var/lib/firebird/data" -v "$AUDIT_VOLUME:/var/lib/firebird/audit" \
+  -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
+  -v "$WORK/fbtrace.conf:/databastion/fbtrace.conf:ro" \
+  --entrypoint /opt/firebird/bin/firebird "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker run -d --name "$NAME-socat" "${JOIN[@]}" "$SOCAT" \
   "TCP-LISTEN:$FWD_PORT,bind=127.0.0.1,fork,reuseaddr" "TCP:127.0.0.1:$PORT" >/dev/null
 # The variants: ChaCha when ChaCha64 is not offered, Arc4 only and no encryption refused (decision
@@ -242,11 +270,167 @@ printf 'SET HEADING OFF;\nSELECT TRIM(RDB$RELATION_NAME) FROM RDB$RELATIONS ORDE
   | awk 'NF { print $1 }' > "$WORK/secdb.txt"
 [ "$(wc -l < "$WORK/secdb.txt")" -ge 8 ] || { echo "[it] $SECDB: relation list not read" >&2; exit 1; }
 
-# 4. The tests, in the namespace, as the calling user.
-echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
+# The Audit workload (lot 3), over loopback TCP as SYSDBA with the image's own tools, as the
+# server's account: the password on the tool's standard input (its first line, then ISC_PASSWORD),
+# never on a command line. Fake markers only: a literal and a password.
+as_sysdba() { # tool args...: stdin = the password line, then the tool's input
+  timeout 120 docker exec -i --user 84:84 "$NAME" bash -c \
+    'IFS= read -r ISC_PASSWORD; export ISC_PASSWORD; exec "$@"' bash "$@"
+}
+{
+  cat "$WORK/root.pw"
+  cat <<SQL
+SELECT * FROM CUSTOMERS;
+SELECT COUNT(*) FROM CUSTOMERS;
+SELECT * FROM CUSTOMERS WHERE EMAIL = 'it-marker-lit-7';
+CREATE USER IT_MARKER_USER PASSWORD 'it-marker-pw-7' USING PLUGIN Srp;
+COMMIT;
+DROP USER IT_MARKER_USER USING PLUGIN Srp;
+COMMIT;
+ALTER DATABASE BEGIN BACKUP;
+ALTER DATABASE END BACKUP;
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+# ADR-0060 R41 item 9: a CREATE PROCEDURE committed after an intervening check() (the tests
+# place the check between the DDL record and its commit), for the normal and the ambiguous path;
+# dropped afterwards so that app.fdb keeps no dependent object; R42 item 6: a session with
+# SET TIME ZONE, whose header times must follow the process TZ.
+for late in P_LATE_A P_LATE_B; do
+  {
+    cat "$WORK/root.pw"
+    cat <<SQL
+SET AUTODDL OFF;
+SET TERM ^ ;
+CREATE PROCEDURE $late RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM MON\$STATEMENTS INTO :N; SUSPEND; END^
+SET TERM ; ^
+COMMIT;
+SELECT * FROM $late;
+COMMIT;
+DROP PROCEDURE $late;
+COMMIT;
+SQL
+  } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+    >/dev/null
+done
+# The session time zone a default session gets (DefaultTimeZone, or the process TZ).
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET HEADING OFF;
+SELECT RDB$GET_CONTEXT('SYSTEM', 'SESSION_TIMEZONE') FROM RDB$DATABASE;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  | tr -d ' \r' | grep -v '^$' | sed 's/^/[measure] default session time zone: /' >&2
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TIME ZONE '+09:00';
+SELECT 'it-tz-session' FROM RDB$DATABASE;
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+
+# The #82 marker cases the stock tools can write (ADR-0060 item 5): a routine's returned value,
+# `EXECUTE STATEMENT`'s inner text, a client process name, and a database-trigger record's process
+# name (an `ON CONNECT` trigger on crm.fdb while the renamed client attaches). A BLR literal
+# (`print_blr` is off in the proved trace configuration) and a parameter (isql sends none) are
+# parser fixtures (`trace_events_tests::markers_never_reach_an_event`).
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TERM ^ ;
+CREATE FUNCTION F_IT_MARKER RETURNS VARCHAR(20) AS BEGIN RETURN 'it-marker-ret-7'; END^
+EXECUTE BLOCK AS DECLARE X VARCHAR(20); BEGIN EXECUTE STATEMENT 'SELECT ''it-marker-es-7'' FROM RDB$DATABASE' INTO X; END^
+SET TERM ; ^
+COMMIT;
+SELECT F_IT_MARKER() FROM RDB$DATABASE;
+DROP FUNCTION F_IT_MARKER;
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TERM ^ ;
+CREATE TRIGGER T_IT_CONNECT ON CONNECT AS BEGIN END^
+SET TERM ; ^
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" \
+  >/dev/null
+timeout 60 docker exec --user 84:84 "$NAME" sh -c \
+  'mkdir -p /tmp/it-marker-proc-7 && cp /opt/firebird/bin/isql /tmp/it-marker-proc-7/isql'
+{
+  cat "$WORK/root.pw"
+  # shellcheck disable=SC2016 # A Firebird name, not a shell expansion.
+  echo 'SELECT COUNT(*) FROM RDB$DATABASE;'
+} | as_sysdba env LD_LIBRARY_PATH=/opt/firebird/lib FIREBIRD=/opt/firebird \
+  /tmp/it-marker-proc-7/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" >/dev/null
+{
+  cat "$WORK/root.pw"
+  printf 'DROP TRIGGER T_IT_CONNECT;\nCOMMIT;\n'
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" \
+  >/dev/null
+timeout 60 docker exec "$NAME" rm -rf /tmp/it-marker-proc-7
+as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
+  /var/lib/firebird/data/app.fdb /tmp/it-app.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
+timeout 60 docker exec "$NAME" rm -f /tmp/it-app.fbk
+
+# ADR-0060 R41 item 9: a database outside the trace (deps.fdb) with the review's cases, for the
+# dependent-set read on the server: a procedure over MON$STATEMENTS, a computed column (dependent
+# type 3), a call cycle, a standalone P next to a packaged PKG.P, a view calling a packaged
+# function, ON CONNECT and row triggers, a check constraint and a domain check over virtual
+# relations; then whether an expression index can depend on a virtual relation.
+{
+  cat "$WORK/root.pw"
+  printf "CREATE DATABASE '127.0.0.1/%s:/var/lib/firebird/data/deps.fdb' DEFAULT CHARACTER SET UTF8;\n" "$PORT"
+  cat <<'SQL'
+CREATE TABLE T (ID INTEGER, X VARCHAR(10));
+CREATE TABLE T_COMP (ID INTEGER, C COMPUTED BY ((SELECT COUNT(*) FROM MON$STATEMENTS)));
+CREATE DOMAIN D_CHK AS INTEGER CHECK (VALUE > (SELECT COUNT(*) FROM MON$CALL_STACK));
+CREATE TABLE T_DOM (ID D_CHK);
+CREATE TABLE T_CHK (ID INTEGER CHECK (ID > (SELECT COUNT(*) FROM MON$CONTEXT_VARIABLES)));
+SET TERM ^ ;
+CREATE PROCEDURE P_MON RETURNS (S VARCHAR(100)) AS BEGIN FOR SELECT CAST(MON$SQL_TEXT AS VARCHAR(100)) FROM MON$STATEMENTS INTO :S DO SUSPEND; END^
+CREATE PROCEDURE P_OK RETURNS (I INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :I DO SUSPEND; END^
+CREATE PROCEDURE P1 (N INTEGER) RETURNS (I INTEGER) AS BEGIN I = 0; END^
+CREATE PROCEDURE P2 (N INTEGER) RETURNS (I INTEGER) AS BEGIN I = 0; END^
+ALTER PROCEDURE P1 (N INTEGER) RETURNS (I INTEGER) AS BEGIN IF (N > 0) THEN EXECUTE PROCEDURE P2 (N - 1) RETURNING_VALUES :I; SELECT COUNT(*) FROM SEC$USERS INTO :I; END^
+ALTER PROCEDURE P2 (N INTEGER) RETURNS (I INTEGER) AS BEGIN IF (N > 0) THEN EXECUTE PROCEDURE P1 (N - 1) RETURNING_VALUES :I; END^
+CREATE PROCEDURE P RETURNS (I INTEGER) AS BEGIN I = 1; SUSPEND; END^
+CREATE PACKAGE PKG AS BEGIN FUNCTION F RETURNS INTEGER; PROCEDURE P RETURNS (I INTEGER); END^
+CREATE PACKAGE BODY PKG AS BEGIN FUNCTION F RETURNS INTEGER AS BEGIN RETURN (SELECT COUNT(*) FROM MON$STATEMENTS); END PROCEDURE P RETURNS (I INTEGER) AS BEGIN I = 1; SUSPEND; END END^
+CREATE VIEW V_PKG (N) AS SELECT PKG.F() FROM RDB$DATABASE^
+CREATE TRIGGER TR_CONN ON CONNECT AS DECLARE N INTEGER; BEGIN SELECT COUNT(*) FROM MON$STATEMENTS INTO :N; END^
+CREATE TRIGGER TR_ROW FOR T BEFORE INSERT AS DECLARE N INTEGER; BEGIN SELECT COUNT(*) FROM MON$CONTEXT_VARIABLES INTO :N; END^
+SET TERM ; ^
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA >/dev/null
+if {
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+CREATE INDEX IX_EXPR ON T COMPUTED BY ((SELECT COUNT(*) FROM MON$STATEMENTS));
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -b -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/deps.fdb" \
+  >/dev/null 2>&1; then
+  echo "[measure] expression index over a virtual relation: accepted" >&2
+else
+  echo "[measure] expression index over a virtual relation: refused" >&2
+fi
+
+# The tests run in the network namespace, as the calling user.
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
-timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid "$(id -g)" -- \
-  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+run_tests() { # filter, then extra NAME=value settings
+  local filter="$1"
+  shift
+  timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid "$(id -g)" -- \
+  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 "$@" \
   FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 FIREBIRD_IT_MAJOR="$MAJOR" \
   FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
   FIREBIRD_IT_CRM_ATTACH=/var/lib/firebird/data/crm.fdb \
@@ -258,4 +442,94 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" FIREBIRD_IT_FB3_PORT="$((PORT + 4))" \
   FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
   FIREBIRD_IT_SECDB_RELATIONS_FILE="$WORK/secdb.txt" \
-  "$EXE" "${FIREBIRD_IT_FILTER:-it::}" --nocapture
+  FIREBIRD_IT_FIREBIRD_CONF="$WORK/firebird.conf" FIREBIRD_IT_DATABASES_CONF="$WORK/databases.conf" \
+  FIREBIRD_IT_TRACE_CONF="$WORK/fbtrace.conf" \
+  "$EXE" "$filter" --nocapture
+}
+# The own-statement matrix test of R20, phase 1: the agent's own reads while the trace runs, its
+# ledger (attachment ids, ports, statement texts and counts; no value) written for phase 2.
+run_tests it::own_reads_for_the_matrix FIREBIRD_IT_MATRIX_OUT="$WORK/matrix.txt" >&2
+[ -s "$WORK/matrix.txt" ] || { echo "[it] the matrix ledger was not written" >&2; exit 1; }
+sleep 3
+# The log is the server's (0600, uid 84): read through the container, written here by the caller.
+timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log > "$WORK/audit.log"
+[ -s "$WORK/audit.log" ] || { echo "[it] the audit log is empty" >&2; exit 1; }
+
+# Round 4 M-1b (ADR-0060 R41 item 8): DDL records whose text the reader cannot take, each
+# committed after an intervening check (placed by the test), written after the log above was
+# copied (they are defective by design) and handed to the tests as the log's tail: a
+# CREATE PROCEDURE split from its trailer by a header-shaped line in a comment, and two meant to
+# carry a byte that is not UTF-8 (0xE9) in a comment from a WIN1252 and a NONE attachment. isql
+# does not send that byte (under the image's C.UTF-8 it swallows the bytes after it, so the
+# statement never ends; in the C locale, used here, it drops it): the tests measure what reached
+# the log, and the reader's encoding defect is tested with a recorded shape.
+E=$'\xe9'
+for c in "P_SPLIT_A UTF8" "P_ENC_A WIN1252" "P_ENC_B NONE"; do
+  read -r proc cs <<<"$c"
+  if [ "$proc" = P_SPLIT_A ]; then
+    note="/*
+2026-10-30T15:22:38.4210 (1:0x7f0000000001) EXECUTE_STATEMENT_FINISH
+*/"
+  else
+    note="/* caf$E */"
+  fi
+  {
+    cat "$WORK/root.pw"
+    cat <<SQL
+SET AUTODDL OFF;
+SET TERM ^ ;
+CREATE PROCEDURE $proc $note
+RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM MON\$STATEMENTS INTO :N; SUSPEND; END^
+SET TERM ; ^
+COMMIT;
+SELECT * FROM $proc;
+COMMIT;
+DROP PROCEDURE $proc;
+COMMIT;
+SQL
+  } | as_sysdba env LC_ALL=C LANG=C /opt/firebird/bin/isql -q -ch "$cs" -user SYSDBA \
+    "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" >/dev/null
+done
+sleep 3
+timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log \
+  | tail -c +"$(($(wc -c < "$WORK/audit.log") + 1))" > "$WORK/defect.log"
+[ -s "$WORK/defect.log" ] || { echo "[it] the defective DDL records are not in the log" >&2; exit 1; }
+
+# Security review N5 of 2026-10-30: what the server applies for each boolean spelling, from a user
+# trace session (`log_connections = <spelling>`) around one attachment: `true` (traced), `false`
+# (not traced) or `refused` (the session does not start). After the log is copied.
+# shellcheck disable=SC2016 # The script's variables are the inner shell's.
+for spelling in true false TRUE False yes no on off 1 0 Yes ON enabled 2 '"true"' "'true'"; do
+  verdict="$({
+    cat "$WORK/root.pw"
+  } | timeout 60 docker exec -i --user 84:84 "$NAME" bash -c '
+    IFS= read -r ISC_PASSWORD; export ISC_PASSWORD
+    printf "database\n{\n\tenabled = true\n\tlog_connections = %s\n}\n" "$1" > /tmp/it-bool.conf
+    timeout 8 /opt/firebird/bin/fbtracemgr -se "127.0.0.1/$2:service_mgr" -user SYSDBA -start \
+      -name it-bool -config /tmp/it-bool.conf > /tmp/it-bool.out 2>&1 &
+    sleep 2
+    echo "SELECT 1 FROM RDB\$DATABASE;" | /opt/firebird/bin/isql -q -user SYSDBA \
+      "127.0.0.1/$2:/var/lib/firebird/data/crm.fdb" > /dev/null 2>&1
+    sleep 2
+    wait
+    if grep -q ATTACH_DATABASE /tmp/it-bool.out; then echo true
+    elif grep -qiE "error|wrong|invalid|unknown" /tmp/it-bool.out; then echo refused
+    else echo false; fi
+    rm -f /tmp/it-bool.conf /tmp/it-bool.out' bash "$spelling" "$PORT")"
+  echo "$spelling $verdict" >> "$WORK/booleans.txt"
+done
+cat "$WORK/booleans.txt" | sed 's/^/[measure] trace boolean (server) /' >&2
+
+# Security review N4 of 94530b3: the server's command line (argv[0] must be absolute for the
+# layout check, R40 item 6); it holds no secret.
+# shellcheck disable=SC2016 # The inner shell's variables.
+timeout 30 docker exec "$NAME" sh -c \
+  'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = firebird ] && tr "\0" " " < "$p/cmdline" && echo; done; true' \
+  | sed 's/^/[measure] server command line: /' >&2
+
+# 4. The tests.
+echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
+run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
+  FIREBIRD_IT_DEFECT_LOG="$WORK/defect.log" \
+  FIREBIRD_IT_TZ_OFFSET="${FIREBIRD_IT_TZ_OFFSET:-0}" \
+  FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_BOOLEANS_FILE="$WORK/booleans.txt"

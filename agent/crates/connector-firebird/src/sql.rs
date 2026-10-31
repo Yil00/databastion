@@ -40,6 +40,15 @@ pub(crate) const OWN_ATTACHMENT: &str = "SELECT CURRENT_CONNECTION, CAST(MON$REM
 /// an idle attachment is ended by the server after 2 minutes.
 pub(crate) const IDLE_TIMEOUT: &str = "SET SESSION IDLE TIMEOUT 2 MINUTE";
 
+/// The declared database's resolved path and its security database kind,
+/// on the agent's own attachment (ADR-0060 R2 rule 1 (a), R9 rule 1, R19:
+/// `MON$SEC_DATABASE` is `CHAR(7)`). A lot 3 text (R20): its 3d row is
+/// measured with the matrix test.
+pub(crate) const DATABASE_FILE: &str = "SELECT CAST(MON$DATABASE_NAME AS VARCHAR(1020) CHARACTER SET UTF8), CAST(MON$SEC_DATABASE AS VARCHAR(7) CHARACTER SET UTF8) FROM MON$DATABASE";
+
+/// The read-back probe of proof 7: its record must reach the declared log.
+pub(crate) const READ_BACK_PROBE: &str = "SELECT COUNT(*) FROM RDB$DATABASE";
+
 /// The effective identity (decision 4): never `CURRENT_ROLE` to decide
 /// (a `DEFAULT` role is in use while `CURRENT_ROLE` is `NONE`, refinement
 /// R4), the owner of the database, the security-database flag of the
@@ -157,6 +166,36 @@ pub(crate) const RELATIONS: &str = "SELECT CAST(R.RDB$RELATION_NAME AS VARCHAR(2
 pub(crate) const COLUMNS: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(RF.RDB$FIELD_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(RF.RDB$FIELD_POSITION, 0) AS INTEGER), CAST(F.RDB$FIELD_TYPE AS INTEGER), CAST(COALESCE(F.RDB$FIELD_SUB_TYPE, 0) AS INTEGER), CAST(COALESCE(F.RDB$FIELD_SCALE, 0) AS INTEGER), CAST(COALESCE(F.RDB$FIELD_LENGTH, 0) AS INTEGER), CAST(COALESCE(F.RDB$CHARACTER_SET_ID, -1) AS INTEGER), CASE WHEN F.RDB$DIMENSIONS IS NULL THEN FALSE ELSE TRUE END, CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$RELATIONS R ON R.RDB$RELATION_NAME = RF.RDB$RELATION_NAME JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE WHERE COALESCE(R.RDB$SYSTEM_FLAG, 0) = 0 AND COALESCE(R.RDB$RELATION_TYPE, 0) = 0 AND R.RDB$VIEW_BLR IS NULL AND R.RDB$EXTERNAL_FILE IS NULL ORDER BY 1, 3, 2";
 
 /// Every statement the connector may send.
+/// The view-dependency read of R12 item 5 (ADR-0060), first part: every
+/// view's base relations and procedure contexts (`RDB$CONTEXT_TYPE` 2),
+/// names as raw bytes (`OCTETS`, as [`RELATIONS`]).
+pub(crate) const VIEW_RELATIONS: &str = "SELECT CAST(V.RDB$VIEW_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(V.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(V.RDB$CONTEXT_TYPE, 0) AS INTEGER) FROM RDB$VIEW_RELATIONS V";
+
+/// The dependent-set read of R41 (R12 item 5), second part: what views
+/// (1), triggers (2), computed columns (3), domain checks (4), procedures
+/// (5), functions (15) and package headers and bodies (18 and 19) depend
+/// on, with the dependent's package.
+pub(crate) const DEPENDENCIES: &str = "SELECT CAST(D.RDB$DEPENDENT_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDENT_TYPE AS INTEGER), CAST(D.RDB$DEPENDED_ON_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDED_ON_TYPE AS INTEGER), CAST(D.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$DEPENDENCIES D WHERE D.RDB$DEPENDENT_TYPE IN (1, 2, 3, 4, 5, 15, 18, 19)";
+
+/// The dependent-set read of R41 item 1, third part: the field source (its
+/// domain) of every user column (system flag 0) whose domain is computed
+/// or carries a validation, and whether it is computed, mapping computed
+/// columns (3) and domain checks (4) to their tables (re-review L-4: no
+/// other column can depend on anything at read time). The domain is read
+/// as `RDB$FIELDS.RDB$FIELD_NAME`, equal to the column's `RDB$FIELD_SOURCE`
+/// by the join: no `*_SOURCE` column is read (decision 5, the architecture
+/// test).
+pub(crate) const FIELD_SOURCES: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(F.RDB$FIELD_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE WHERE COALESCE(RF.RDB$SYSTEM_FLAG, 0) = 0 AND (F.RDB$COMPUTED_BLR IS NOT NULL OR F.RDB$VALIDATION_BLR IS NOT NULL)";
+
+/// The dependent-set read of R41 items 1 and 3, fourth part: the names of
+/// every procedure (5), function (15), package (18) and trigger (2), with
+/// the package of a packaged routine and a trigger's relation and system
+/// flag (a check constraint's trigger maps to its relation), and every
+/// expression index (6) with its table (measured on 5.0.4: an expression
+/// index over a virtual relation is accepted and its dependency is not
+/// recorded, so its table counts as dependent, R41 item 9).
+pub(crate) const ROUTINES: &str = "SELECT CAST(P.RDB$PROCEDURE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(P.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(5 AS INTEGER), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$PROCEDURES P UNION ALL SELECT CAST(F.RDB$FUNCTION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(F.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(15 AS INTEGER), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$FUNCTIONS F UNION ALL SELECT CAST(K.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(18 AS INTEGER), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$PACKAGES K UNION ALL SELECT CAST(T.RDB$TRIGGER_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(2 AS INTEGER), CAST(T.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(T.RDB$SYSTEM_FLAG, 0) AS INTEGER) FROM RDB$TRIGGERS T UNION ALL SELECT CAST(I.RDB$INDEX_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(6 AS INTEGER), CAST(I.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$INDICES I WHERE I.RDB$EXPRESSION_BLR IS NOT NULL";
+
 pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "version",
@@ -173,6 +212,14 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "idle_timeout",
         text: IDLE_TIMEOUT,
+    },
+    Statement {
+        name: "database_file",
+        text: DATABASE_FILE,
+    },
+    Statement {
+        name: "read_back_probe",
+        text: READ_BACK_PROBE,
     },
     Statement {
         name: "identity",
@@ -225,6 +272,22 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "columns",
         text: COLUMNS,
+    },
+    Statement {
+        name: "view_relations",
+        text: VIEW_RELATIONS,
+    },
+    Statement {
+        name: "dependencies",
+        text: DEPENDENCIES,
+    },
+    Statement {
+        name: "field_sources",
+        text: FIELD_SOURCES,
+    },
+    Statement {
+        name: "routines",
+        text: ROUTINES,
     },
 ];
 
@@ -401,6 +464,9 @@ impl Conv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Built {
     text: String,
+    /// The catalog name of the one table it reads (its execution credit
+    /// names it: R13 items 2 and 4).
+    table: String,
 }
 
 impl Built {
@@ -408,8 +474,16 @@ impl Built {
         &self.text
     }
 
-    fn checked(text: String) -> Option<Self> {
-        (!has_denied_word(&text) && !unquoted(&text).contains('\'')).then_some(Self { text })
+    /// The table the statement reads, as the catalog stores its name.
+    pub(crate) fn table(&self) -> &str {
+        &self.table
+    }
+
+    fn checked(text: String, table: &str) -> Option<Self> {
+        (!has_denied_word(&text) && !unquoted(&text).contains('\'')).then(|| Self {
+            text,
+            table: table.to_owned(),
+        })
     }
 }
 
@@ -437,11 +511,14 @@ pub(crate) fn sample_statement(table: &str, columns: &[(&str, Conv)], n: u32) ->
         .iter()
         .map(|(c, conv)| conv.expr(&quote_identifier(c)))
         .collect();
-    Built::checked(format!(
-        "SELECT FIRST {n} {} FROM {}",
-        exprs.join(", "),
-        quote_identifier(table)
-    ))
+    Built::checked(
+        format!(
+            "SELECT FIRST {n} {} FROM {}",
+            exprs.join(", "),
+            quote_identifier(table)
+        ),
+        table,
+    )
 }
 
 /// The CAS store guard's metadata aggregate of a ticket registry (ADR-0041
@@ -452,12 +529,15 @@ pub(crate) fn ticket_type_counts(table: &str, column: &str) -> Option<Built> {
     if !identifier_ok(table) || !identifier_ok(column) {
         return None;
     }
-    Built::checked(format!(
-        "SELECT CAST(SUBSTRING({} FROM 1 FOR 255) AS VARCHAR(255) CHARACTER SET UTF8), COUNT(*) \
-         FROM {} GROUP BY 1",
-        quote_identifier(column),
-        quote_identifier(table)
-    ))
+    Built::checked(
+        format!(
+            "SELECT CAST(SUBSTRING({} FROM 1 FOR 255) AS VARCHAR(255) CHARACTER SET UTF8), \
+             COUNT(*) FROM {} GROUP BY 1",
+            quote_identifier(column),
+            quote_identifier(table)
+        ),
+        table,
+    )
 }
 
 /// `isc_info_sql_*` items.

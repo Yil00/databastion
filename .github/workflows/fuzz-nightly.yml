@@ -87,6 +87,11 @@ jobs:
           - { target: firebird_proc_net_tcp, seconds: 180 }
           # ADR-0060 decision 5: Discovery's catalog rows, conversions, batches and values.
           - { target: firebird_catalog, seconds: 180 }
+          # ADR-0060 decision 6: the system audit trace log and configuration parsers, and the
+          # Firebird mode of the statement analysis.
+          - { target: firebird_trace_log, seconds: 600 }
+          - { target: firebird_trace_conf, seconds: 300 }
+          - { target: firebird_statement, seconds: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

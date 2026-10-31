@@ -255,6 +255,94 @@ pub fn proc_net_tcp(data: &[u8]) {
     assert!(out.matches == 0 || out.matches as usize <= text.lines().count());
 }
 
+/// A trace log (ADR-0060 decision 6, "Parsing a hostile text log"): lines
+/// assembled into records, each parsed under both name-line grammars and
+/// converted with a fixed catalog, then made an event. Never a panic, and
+/// every record bounded.
+pub fn trace_log(data: &[u8]) {
+    use crate::trace_events::{Catalog, Converted, RelClass, convert, to_event};
+    use crate::trace_log::{Assembled, Assembler, MAX_RECORD, ParseOptions, Series, parse};
+    struct Fixed;
+    impl Catalog for Fixed {
+        fn class(&self, r: &str) -> RelClass {
+            match r.as_bytes().first() {
+                Some(b'R') => RelClass::System,
+                Some(b'M') => RelClass::Virtual,
+                Some(b'V') => RelClass::View,
+                Some(b'E') => RelClass::External,
+                Some(b'G') => RelClass::Gtt,
+                Some(b'T') => RelClass::Table,
+                _ => RelClass::Unknown,
+            }
+        }
+        fn always_view(&self, r: &str) -> bool {
+            r.ends_with("_ALWAYS")
+        }
+    }
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in data.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    for r in &recs {
+        let Assembled::Record(raw) = r else { continue };
+        assert!(raw.len() <= MAX_RECORD);
+        for series in [Series::V4, Series::V5] {
+            let opts = ParseOptions {
+                max_sql_length: Some(4096),
+                series,
+            };
+            let Some(rec) = parse(raw, opts) else {
+                continue;
+            };
+            match convert(&rec, &Fixed) {
+                Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => {
+                    let _ = to_event(&d, &rec, "db", std::time::SystemTime::UNIX_EPOCH);
+                }
+                Converted::Nothing => {}
+            }
+        }
+    }
+}
+
+/// The configuration files (decision 6, R2): the first byte picks the
+/// parser (`firebird.conf`, `databases.conf`, the trace configuration,
+/// then evaluated against one declared database).
+pub fn trace_conf(data: &[u8]) {
+    use crate::trace_conf::{
+        DeclaredDb, Inputs, evaluate, parse_databases_conf, parse_firebird_conf, parse_trace_conf,
+    };
+    let Some((first, rest)) = data.split_first() else {
+        return;
+    };
+    match first % 3 {
+        0 => {
+            let _ = parse_firebird_conf(rest);
+        }
+        1 => {
+            let _ = parse_databases_conf(rest, "/opt/firebird");
+        }
+        _ => {
+            if let Ok(t) = parse_trace_conf(rest) {
+                let dbs = [DeclaredDb {
+                    label: "db",
+                    resolved: Some("/data/db.fdb"),
+                    alias: Some("db"),
+                }];
+                let _ = evaluate(&Inputs {
+                    trace: &t,
+                    aliases: None,
+                    databases: &dbs,
+                    log: "/var/log/fb/audit.log",
+                    root: "/opt/firebird",
+                    longest_own_text: 900,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +358,8 @@ mod tests {
             keys,
             proc_net_tcp,
             catalog,
+            trace_log,
+            trace_conf,
         ] {
             f(&[]);
             f(&[0]);

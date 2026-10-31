@@ -32,6 +32,10 @@ crypto-bigint = { version = "0.7", default-features = false, features = ["zeroiz
 # ChaCha, always through `try_apply_keystream` (decision 1).
 chacha20 = { version = "0.10", default-features = false, features = ["cipher", "legacy", "zeroize"] }
 getrandom = { version = "0.4", default-features = false }
+# The Audit files (decision 6): opened with `O_NOFOLLOW`, checked on the
+# handle (links, owner, mode, `faccessat`, ACLs), the server's `/proc`
+# start time (R5) and the clock ticks; no `unsafe` (as connector-cas).
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "param"] }
 
 [features]
 # Public entry points of the parsers for the fuzz targets (`agent/fuzz`,

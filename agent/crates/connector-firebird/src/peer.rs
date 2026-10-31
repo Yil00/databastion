@@ -207,6 +207,7 @@ where
         let read = read.clone();
         let found = tokio::task::spawn_blocking(move || read(deadline))
             .await
+            .map_err(databastion_core::resume_panic)
             .unwrap_or(Lookup {
                 cut: true,
                 ..Lookup::default()

@@ -318,3 +318,24 @@ path = "fuzz_targets/firebird_proc_net_tcp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "firebird_trace_log"
+path = "fuzz_targets/firebird_trace_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_trace_conf"
+path = "fuzz_targets/firebird_trace_conf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_statement"
+path = "fuzz_targets/firebird_statement.rs"
+test = false
+doc = false
+bench = false

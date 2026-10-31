@@ -64,6 +64,88 @@ pub struct FirebirdDatabase {
     pub attach: String,
 }
 
+/// `firebird.audit`: the system audit trace (ADR-0060 decision 6, M3, and
+/// refinement R2 rule 2). Every path is absolute and on the agent host;
+/// the agent only reads these files, under the file rules of ADR-0043
+/// (`O_NOFOLLOW`, one hard link, nothing the agent could write), and never
+/// sends a path anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirebirdAuditConfig {
+    /// The trace log the server writes (`log_filename` of the applying
+    /// sections).
+    pub log: std::path::PathBuf,
+    /// The trace configuration (`AuditTraceConfigFile`).
+    pub trace_config: std::path::PathBuf,
+    /// The server's `firebird.conf`.
+    pub firebird_conf: std::path::PathBuf,
+    /// The Firebird root directory (`$(root)`), against which relative
+    /// names of the configuration files are resolved.
+    pub root: std::path::PathBuf,
+    /// `<root>/databases.conf` (refinement R2 rule 2): the alias map.
+    /// Without it, aliases other than the declared ones are not evaluated
+    /// (Limited, label `databases_conf`).
+    #[serde(default)]
+    pub databases_conf: Option<std::path::PathBuf>,
+}
+
+/// Longest declared path of `firebird.audit`, in bytes.
+pub const MAX_AUDIT_PATH_BYTES: usize = 4096;
+
+impl FirebirdAuditConfig {
+    /// Local rules: `(key, reason)` on error, never the value.
+    pub(crate) fn validate(&self) -> Result<(), (&'static str, &'static str)> {
+        let canonical = |p: &std::path::Path| {
+            let s = p.as_os_str().as_encoded_bytes();
+            p.is_absolute()
+                && s.len() <= MAX_AUDIT_PATH_BYTES
+                && !s.iter().any(|b| b.is_ascii_control())
+                && s.len() > 1
+                && s[1..]
+                    .split(|b| *b == b'/')
+                    .all(|part| !part.is_empty() && part != b"." && part != b"..")
+        };
+        for (key, p) in [
+            ("audit.log", &self.log),
+            ("audit.trace_config", &self.trace_config),
+            ("audit.firebird_conf", &self.firebird_conf),
+            ("audit.root", &self.root),
+        ] {
+            if !canonical(p) {
+                return Err((
+                    key,
+                    "must be a canonical absolute path (no empty, . or .. component, no \
+                     trailing /, no control character, at most 4096 bytes)",
+                ));
+            }
+        }
+        // The server reads `<root>/firebird.conf` (review of part 1, L2):
+        // another file cannot be the configuration it runs with.
+        if self.firebird_conf != self.root.join("firebird.conf") {
+            return Err((
+                "audit.firebird_conf",
+                "must be <audit.root>/firebird.conf (the file the server reads)",
+            ));
+        }
+        if let Some(d) = &self.databases_conf
+            && *d != self.root.join("databases.conf")
+        {
+            return Err((
+                "audit.databases_conf",
+                "must be <audit.root>/databases.conf (ADR-0060 refinement R2 rule 2)",
+            ));
+        }
+        let files = [&self.log, &self.trace_config, &self.firebird_conf];
+        if files[0] == files[1] || files[0] == files[2] || files[1] == files[2] {
+            return Err((
+                "audit",
+                "log, trace_config and firebird_conf must be distinct files",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Firebird settings of a target.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +171,11 @@ pub struct FirebirdTargetConfig {
     /// `privilege.extended_variant` instead of over-privilege.
     #[serde(default)]
     pub extended_grants: bool,
+    /// Audit from the system audit trace (decision 6); absent: no Audit
+    /// source (`audit.source_not_configured`). Refused with `tunnel: true`
+    /// (decision 3: a tunnel is Discovery only).
+    #[serde(default)]
+    pub audit: Option<FirebirdAuditConfig>,
     /// `peer_uid` resolved when the configuration was loaded.
     #[serde(skip)]
     resolved_peer_uid: Option<u32>,
@@ -143,6 +230,16 @@ impl FirebirdTargetConfig {
             if !attaches.insert(db.attach.as_str()) {
                 return Err(("databases.attach", "the same database is declared twice"));
             }
+        }
+        if let Some(a) = &self.audit {
+            if self.tunnel {
+                return Err((
+                    "audit",
+                    "is not available with tunnel: true (a tunnel is Discovery only, ADR-0060 \
+                     decision 3)",
+                ));
+            }
+            a.validate()?;
         }
         if self.tunnel && self.peer_uid.is_none() {
             return Err((
@@ -405,6 +502,54 @@ mod tests {
         );
         assert!(
             serde_yaml_ng::from_str::<FirebirdTargetConfig>("{databases: [], audit: {}}").is_err()
+        );
+    }
+
+    /// ADR-0060 decision 6 and R2 rule 2: the `audit` block.
+    #[test]
+    fn audit_block_rules() {
+        let base = "databases: [{name: a, attach: a}]";
+        let audit = "log: /var/log/fb/audit.log, trace_config: /opt/firebird/fbtrace.conf, \
+                     firebird_conf: /opt/firebird/firebird.conf, root: /opt/firebird";
+        let ok = block(&format!("{{{base}, audit: {{{audit}}}}}"));
+        assert!(ok.validate().is_ok());
+        assert!(ok.audit.as_ref().unwrap().databases_conf.is_none());
+        let with_map = block(&format!(
+            "{{{base}, audit: {{{audit}, databases_conf: /opt/firebird/databases.conf}}}}"
+        ));
+        assert!(with_map.validate().is_ok());
+        let other_map = block(&format!(
+            "{{{base}, audit: {{{audit}, databases_conf: /etc/databases.conf}}}}"
+        ));
+        assert_eq!(other_map.validate().unwrap_err().0, "audit.databases_conf");
+        let tunnel = block(&format!(
+            "{{{base}, tunnel: true, peer_uid: 1001, audit: {{{audit}}}}}"
+        ));
+        assert_eq!(tunnel.validate().unwrap_err().0, "audit");
+        for (bad, key) in [
+            ("log: audit.log", "audit.log"),
+            ("log: /var/log/../x.log", "audit.log"),
+            ("log: /var/log/fb/", "audit.log"),
+            ("trace_config: fbtrace.conf", "audit.trace_config"),
+            ("root: /opt/./firebird", "audit.root"),
+            ("log: /opt/firebird/fbtrace.conf", "audit"),
+        ] {
+            let field = bad.split(':').next().unwrap();
+            let rest: Vec<&str> = audit
+                .split(", ")
+                .filter(|kv| !kv.starts_with(&format!("{field}:")))
+                .collect();
+            let cfg = block(&format!(
+                "{{{base}, audit: {{{bad}, {}}}}}",
+                rest.join(", ")
+            ));
+            assert_eq!(cfg.validate().unwrap_err().0, key, "{bad}");
+        }
+        assert!(
+            serde_yaml_ng::from_str::<FirebirdTargetConfig>(&format!(
+                "{{{base}, audit: {{{audit}, extra: 1}}}}"
+            ))
+            .is_err()
         );
     }
 
