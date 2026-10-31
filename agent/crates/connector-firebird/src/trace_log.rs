@@ -443,6 +443,22 @@ impl Assembler {
         None
     }
 
+    /// A line of the record in progress was lost (the tailer skipped a
+    /// line longer than its bound): the record is reported as oversized
+    /// (ambiguous, loud), never parsed without that line; lines before
+    /// any header count as orphan lines.
+    pub(crate) fn lose_line(&mut self) {
+        if self.head.is_none() {
+            self.orphan = true;
+            return;
+        }
+        if !self.oversized {
+            self.oversized = true;
+            zeroize::Zeroize::zeroize(self.buf.as_mut_slice());
+            self.buf.clear();
+        }
+    }
+
     fn append(&mut self, bytes: &[u8]) {
         if self.oversized {
             return;

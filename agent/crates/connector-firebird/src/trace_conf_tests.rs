@@ -306,6 +306,27 @@ fn statement_text_limits() {
     assert_eq!(codes(&v.notes), [NoteCode::AuditStatementTextLimitLow]);
     let t = DEV_TRACE.replace("\tmax_sql_length = 65000\n", "");
     assert_eq!(eval(&t, Some(&empty_map()), &crm()).max_sql_length, 300);
+    // Above what the tailer carries in one line: Partial withheld, the
+    // setting reported (as `other`: the label set has no
+    // `max_sql_length` yet), the detail local.
+    let at = MAX_SQL_LENGTH_CARRIED;
+    let t = DEV_TRACE.replace("max_sql_length = 65000", &format!("max_sql_length = {at}"));
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(v.partial, "{:?}", v.notes);
+    let t = DEV_TRACE.replace(
+        "max_sql_length = 65000",
+        &format!("max_sql_length = {}", at + 1),
+    );
+    let v = eval(&t, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert_eq!(codes(&v.notes), [NoteCode::AuditTraceSettingsMissing]);
+    assert_eq!(
+        labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
+        ["other"]
+    );
+    assert!(v.detail.iter().any(|d| d.contains("max_sql_length")));
+    let t = DEV_TRACE.replace("max_sql_length = 65000", "max_sql_length = 10485760");
+    assert!(!eval(&t, Some(&empty_map()), &crm()).partial);
 }
 
 /// R2 rule 4: every alias mapping to the database is evaluated; differing

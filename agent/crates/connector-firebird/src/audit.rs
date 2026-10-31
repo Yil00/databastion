@@ -673,6 +673,7 @@ pub(crate) async fn stream(
         expect: state.with(&id, |t| t.stream.saved),
         reset: false,
         last_end: None,
+        lost_in: None,
     };
     loop {
         // A new check: new names, classes, run.
@@ -868,6 +869,9 @@ struct Runner {
     reset: bool,
     /// The file and end of the last line read.
     last_end: Option<((u64, u64), u64)>,
+    /// A line the tailer skipped for its size at the end of a poll, in a
+    /// file not read yet: the first record of that file lost a line.
+    lost_in: Option<(u64, u64)>,
 }
 
 impl Runner {
@@ -890,9 +894,23 @@ impl Runner {
         if !polled.records.is_empty() {
             self.last_growth = now;
         }
-        for (line, pos) in polled.records.iter().zip(&polled.positions) {
+        // Lines the tailer skipped for their size (longer than 1 MiB): the
+        // record they belong to is made ambiguous, never parsed without
+        // them.
+        let skipped_at = |k: usize| {
+            polled
+                .skipped
+                .iter()
+                .filter(move |(i, _)| *i == k)
+                .map(|(_, f)| *f)
+        };
+        for (k, (line, pos)) in polled.records.iter().zip(&polled.positions).enumerate() {
             let line = line.strip_suffix(b"\n").unwrap_or(line);
             let start = pos.start;
+            let before = self.file;
+            if skipped_at(k).any(|f| Some(f) == before) {
+                self.asm.lose_line();
+            }
             if let Some(e) = self.expect.take()
                 && e != (pos.file, pos.start)
             {
@@ -914,6 +932,12 @@ impl Runner {
                 }
                 self.file = Some(pos.file);
                 m.set_file(pos.file);
+                if self.lost_in.take() == Some(pos.file) {
+                    self.asm.lose_line();
+                }
+            }
+            if skipped_at(k).any(|f| Some(f) != before) {
+                self.asm.lose_line();
             }
             if header(line).is_some() {
                 // The record in progress ends here.
@@ -927,6 +951,13 @@ impl Runner {
                 // nothing for a body line).
                 let done = self.asm.push_line(line);
                 self.hand(m, done, start, now, cats, out);
+            }
+        }
+        for f in skipped_at(polled.records.len()) {
+            if Some(f) == self.file {
+                self.asm.lose_line();
+            } else {
+                self.lost_in = Some(f);
             }
         }
         // A stable end of file: the record in progress is complete.
@@ -1032,6 +1063,7 @@ mod tests {
             expect: None,
             reset: false,
             last_end: None,
+            lost_in: None,
         }
     }
 
@@ -1288,6 +1320,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A statement text line longer than the tailer's line bound (only
+    /// possible with `max_sql_length` above 1 MiB, which `check()` no
+    /// longer proves Partial) is skipped by the tailer; the record it
+    /// belonged to is made ambiguous (`*`, always reported, counted
+    /// oversized), never parsed without it, and the next record is read.
+    #[test]
+    fn a_record_that_lost_a_skipped_line_is_ambiguous() {
+        use crate::stream_tests::{APP, HEAD, attach};
+        let dir = temp("lostline");
+        let log = dir.join("audit.log");
+        let a = "24:0x7f0000000100";
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+        let att = format!(
+            "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+        );
+        let record = |text: &str, rel: &str| {
+            format!(
+                "{HEAD} ({a}) EXECUTE_STATEMENT_FINISH\n{att}\nStatement 1:\n{}\n{text}\n1 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{:>10}{:>70}\n\n",
+                "-".repeat(79),
+                "Table",
+                "*".repeat(115),
+                1,
+                ""
+            )
+        };
+        let long = format!(
+            "SELECT A FROM T1\nUNION ALL SELECT B FROM T1 /* {} */",
+            "x".repeat(1_100_000)
+        );
+        append(
+            &log,
+            &format!(
+                "{}{HEAD} ({a}) START_TRANSACTION\n{att}\n{}{}{}",
+                attach(a, 3, APP),
+                record(&long, "T1"),
+                record("SELECT C FROM T2", "T2"),
+                attach("24:0x7f0000000300", 5, APP)
+            ),
+        );
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert_eq!(r.tailer.oversized, 1);
+        assert_eq!(m.counts.oversized, 1, "{:?}", m.counts);
+        assert!(
+            out.iter().any(|(_, e)| e.always_report()
+                && e.objects().iter().any(|o| o.object().as_str() == "*")),
+            "{:?}",
+            objects(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review L2: a restarted stream's first ambiguous record and first
     /// record are reported although its counters are below the previous
     /// stream's; review M4: a gap is reported.
@@ -1476,6 +1565,7 @@ mod tests {
             expect: None,
             reset: false,
             last_end: None,
+            lost_in: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());

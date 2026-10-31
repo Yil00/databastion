@@ -37,6 +37,14 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_LINE: usize = 8192;
 /// The proof 5 floor of `max_sql_length`.
 pub(crate) const MIN_SQL_LENGTH: u64 = 4096;
+/// The largest `max_sql_length` the Partial level accepts: a statement
+/// text line must fit the core tailer's line bound (1 MiB,
+/// `databastion_core::audit::tail::MAX_RECORD_BYTES`), with a margin of
+/// 64 KiB. A longer line would be skipped by the tailer (its record is
+/// then made ambiguous by the stream, never parsed without it), so a text
+/// could never be read whole.
+pub(crate) const MAX_SQL_LENGTH_CARRIED: u64 =
+    databastion_core::audit::tail::MAX_RECORD_BYTES as u64 - 64 * 1024;
 /// The server's default `max_sql_length` (images' `fbtrace.conf`).
 const DEFAULT_SQL_LENGTH: u64 = 300;
 
@@ -973,7 +981,18 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
             add(&mut missing, "time_threshold");
         }
         log_connections &= eff.flag("log_connections");
-        max_sql = max_sql.min(eff.number("max_sql_length").unwrap_or(DEFAULT_SQL_LENGTH));
+        let sql_length = eff.number("max_sql_length").unwrap_or(DEFAULT_SQL_LENGTH);
+        if sql_length > MAX_SQL_LENGTH_CARRIED {
+            // Sent as `other` until the label set has `max_sql_length`
+            // (a contract revision).
+            add(&mut missing, "max_sql_length");
+            detail.push(format!(
+                "{}: max_sql_length {sql_length} above {MAX_SQL_LENGTH_CARRIED} bytes, the \
+                 longest statement text line the agent reads",
+                db.label
+            ));
+        }
+        max_sql = max_sql.min(sql_length);
     }
     if i.databases.is_empty() {
         max_sql = DEFAULT_SQL_LENGTH;
