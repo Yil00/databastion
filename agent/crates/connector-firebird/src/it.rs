@@ -1060,6 +1060,12 @@ fn every_security_database_relation_is_never_sampled() {
 #[path = "it_audit.rs"]
 mod audit;
 
+/// The host identity files of the readers check on a real kernel
+/// (ADR-0060 refinement of 2026-10-31, R52 items 1 to 3): single-file
+/// read-only bind mounts in a private mount namespace.
+#[path = "it_host_identity.rs"]
+mod host_identity;
+
 /// The lot 3 texts on the agent's own attachment (R2 rule 1, R9, proof
 /// 7): the resolved path, `Default` as the security-database kind of an
 /// ordinary database, and one row for the read-back probe; the session's
