@@ -509,8 +509,8 @@ The agent reads the server's **system audit trace**, a text log the server write
 **Server configuration.** Set `AuditTraceConfigFile` in `firebird.conf` to the trace configuration, then **restart the server**: it reads both files at start only, and a file changed after the server started is not proven. In the trace configuration:
 
 - a `database = <path>` section for each declared database, with the exact path the server prints (no `SIMILAR TO` pattern: a path holding `_`, `%`, `-` or another metacharacter is not evaluated). Disable the default `database` section, or keep it off the declared log: the log must hold only declared databases;
-- in each of these sections: `enabled = true`, `log_filename` the declared log, `connection_id = 0`, `time_threshold = 0`, `max_sql_length` at least 4096, no `include_filter`, `exclude_filter` or GDS-code filter, and `true` (unquoted) for `log_connections`, `log_transactions`, `log_statement_finish`, `log_procedure_finish`, `log_function_finish`, `log_trigger_finish`, `log_blr_requests`, `log_errors`, `log_initfini`, `log_sweep` and `print_perf`;
-- a `services` section with `enabled = true`, `log_services = true` and the same `log_filename`.
+- in each of these sections: `enabled = true`, `log_filename` the declared log, `connection_id = 0`, `time_threshold = 0`, `max_log_size = 0` (no rotation by the server, below), `max_sql_length` at least 4096, no `include_filter`, `exclude_filter` or GDS-code filter, and `true` (unquoted) for `log_connections`, `log_transactions`, `log_statement_finish`, `log_procedure_finish`, `log_function_finish`, `log_trigger_finish`, `log_blr_requests`, `log_errors`, `log_initfini`, `log_sweep` and `print_perf`;
+- a `services` section with `enabled = true`, `log_services = true`, `max_log_size = 0` and the same `log_filename`.
 
 `ServerMode = Classic` in `firebird.conf` gives Limited at best; use `Super` or `SuperClassic`.
 
@@ -520,14 +520,14 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 
 - The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them. Run the agent as a dedicated account, never as root: with root, every file counts as writable by the agent and the readers check always fails (`host_identity_refused (passwd: writable)` in the agent's log).
 - No account other than root, the server's account and the agent may read them. The server's account is taken from the server process, or from `peer_uid`; both must agree.
-- **Use named-user ACLs, not a group.** The server owns the directory and the log, with no group or other access, and the agent reads them through a named-user ACL; a default ACL on the directory gives the next log file after a rotation the same entries. With the server's account owning the files and the agent's account `databastion` (the layout of the dev service, [`dev/firebird/acl-init/layout.sh`](../dev/firebird/acl-init/layout.sh)):
+- **Use named-user ACLs, not a group.** The server owns the directory and the log, with no group or other access, and the agent reads them through a named-user ACL. **Create the log yourself before the server starts**, with the ACL below: the server then opens the existing file and keeps its ACL. With the server's account owning the files and the agent's account `databastion` (the layout of the dev service, [`dev/firebird/acl-init/layout.sh`](../dev/firebird/acl-init/layout.sh)):
   ```sh
   chmod 0700 <dir>; chmod 0600 <log>
   setfacl -m 'u::rwx,g::---,o::---,u:databastion:rx,m::rx' <dir>
   setfacl -d -m 'u::rw,g::---,m::r,o::---,u:databastion:r' <dir>
   setfacl -m 'u::rw,g::---,o::---,u:databastion:r,m::r' <log>
   ```
-  The server creates rotated files `0600`. Whether the default ACL is inherited under that mode is not confirmed yet (P10-D): after the first rotation, check with `getfacl <log>` that the agent's entry `user:databastion:r--` is there and not masked (no `#effective:---` next to it). Otherwise the agent cannot read the new file and the stream stops with a gap (fail closed).
+  A log that the server creates itself (a missing log, or a new one after a server-side rotation) is `0600`: a default ACL's entry for the agent is inherited but masked (`#effective:---` in `getfacl`), so the agent cannot read it and Audit stops with a gap (fail closed). Check the log you created with `getfacl <log>`: the agent's entry `user:databastion:r--` must be there, with no `#effective:---` next to it.
 - **A group that grants read** counts only when every member, named in the group file or by primary group, is root, the server's account or the agent, and when the group file is the only source of groups (below). Prefer the named-user layout.
 - **What the agent reads to decide** (at every check, on the host): `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, and `/etc/subuid` and `/etc/subgid` when present, each owned by root and not writable by group or other (a symbolic link is followed only when every link and directory under `/etc` is root's). It needs Linux 5.6 or later. Consequences:
   - a `passwd:` line in `nsswitch.conf` that names a source other than `files` and `systemd` (LDAP, SSSD, NIS…) fails the check: users from another source cannot be proven;
@@ -560,7 +560,14 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 - **Paths**: mount the Firebird root, the configuration files and the log directory into the agent's container read-only **at the same paths** as the server sees them.
 - Needs Linux 5.8 or later. A refused file is named in the agent's log by its role and the reason, for example `host_identity_refused (passwd: mount)`, never by its path.
 
-**Rotation.** Every rotation of the log (by the server's `max_log_size`, or any other) counts as a gap and caps the target for 24 h. Set `max_log_size` high enough, or to `0`, so that rotations are rare.
+**Rotation** ([ADR-0060 refinement of 2026-10-31 c](adr/0060-firebird-connector.md#refinement-2026-10-31-c-decided-by-the-maintainer-on-2026-10-31-trace-log-rotation)).
+
+- **Partial requires `max_log_size = 0`** in every section that writes the declared log. The server creates each rotated log `0600`, whatever the umask, and that mask hides the agent's ACL entry, so the agent cannot read the new log. The agent does not yet refuse `max_log_size` above 0 at check (a planned change will give Limited at best with `audit.trace_settings_missing`); until then, the first server-side rotation stops Audit with a gap.
+- **Monitor the log's size**: with no rotation, it grows until you rotate it.
+- **Rotate only with the server stopped**: stop the server, move the log away, re-create it with the owner, mode and ACL above (`chmod 0600`, the `setfacl -m` line for the log), check it with `getfacl`, then start the server.
+- **Each rotation, offline or not, counts as a gap** and caps the target for 24 h.
+- **The moved log still holds statement texts**: keep it with the same restrictions as the live log, or delete it.
+- DataBastion provides no tool that restores the ACL after a rotation by the server.
 
 **Backups.** Run backups through the services manager or over loopback TCP. An embedded `gbak` on the server host writes under its own process and makes its records ambiguous (24 h cap).
 
