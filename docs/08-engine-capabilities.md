@@ -1455,7 +1455,8 @@ What the Firebird connector's Audit does, as implemented in lot 3 (P10-B #385; [
   - a gap (`audit.records_dropped`) or an ambiguous record (`audit.log_records_ambiguous`) in the last 24 h.
 
 ### Gaps that cap the level for 24 h
-- **Every live log rotation counts as a gap** (proof 8): each one caps Partial for 24 h.
+- **Every log rotation counts as a gap** (proof 8): each one caps Partial for 24 h, whether the server rotates the log or the operator rotates it with the server stopped.
+- **Partial requires `max_log_size = 0`** ([ADR-0060 refinement of 2026-10-31 c](adr/0060-firebird-connector.md#refinement-2026-10-31-c-decided-by-the-maintainer-on-2026-10-31-trace-log-rotation), decided by the maintainer). The server creates every new log `0600`, whatever the umask, so a default ACL's entry for the agent is inherited but masked: after a server-side rotation the agent cannot read the new log, and the stream stops with a gap and `audit.log_not_readable` (fail closed). The log created by the operator before the server starts keeps its ACL. Rotate only with the server stopped ([user guide](10-user-guide.md#firebird-audit)). Not implemented yet: `check()` withholding Partial (Limited at best, `audit.trace_settings_missing`) for a section with `max_log_size` above 0.
 - **A server restart**, until the next `check()`: the records between the restart and that check are ambiguous (always reported with `*`).
 - **DDL and DCL statements run through `isql`**: they are written without a `Statement <n>:` line, so they are ambiguous until measurement 3o (R37).
 - **A local external data source** (`<internal>` attachment lines with a user) on a declared database.
