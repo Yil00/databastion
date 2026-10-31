@@ -306,7 +306,8 @@ targets:
   # WireCryptPlugin listing ChaCha64 or ChaCha; RemoteBindAddress = 127.0.0.1
   # when no other client needs the network. No other container may share the
   # agent's and the server's network namespace unless it drops NET_RAW and
-  # NET_ADMIN. Discovery and Audit come with the next lots: check() only.
+  # NET_ADMIN. Discovery and Audit (from the system audit trace, below) are
+  # not released yet. Setup: docs/10-user-guide.md, "Firebird Audit".
   # - id: app-fb
   #   engine: firebird
   #   host: 127.0.0.1
@@ -314,8 +315,10 @@ targets:
   #   secret:
   #     file: /etc/databastion/secrets/app-fb
   #   firebird:
-  #     # The account that owns the server's sockets (default firebird; a
-  #     # number when the agent runs in a container).
+  #     # host above: 127.0.0.1 or ::1 only (no name). The account that owns
+  #     # the server's sockets: a user name (default firebird) or a number;
+  #     # a number when the agent runs in a container; 0 refused unless
+  #     # peer_uid_root: true.
   #     peer_uid: firebird
   #     databases:
   #       # name: the label sent to the console; attach: a databases.conf
@@ -331,6 +334,19 @@ targets:
   #     # The role holds SELECT_ANY_OBJECT_IN_DATABASE (it also exposes the
   #     # server configuration, RDB$CONFIG):
   #     # extended_grants: false
+  #     # Audit from the system audit trace (refused with tunnel: true):
+  #     # canonical absolute paths on this host, read only, never sent.
+  #     audit:
+  #       # The Firebird root ($(root)); the server binary is in <root>/bin.
+  #       root: /opt/firebird
+  #       # Must be <root>/firebird.conf.
+  #       firebird_conf: /opt/firebird/firebird.conf
+  #       # The file AuditTraceConfigFile names in firebird.conf.
+  #       trace_config: /opt/firebird/fbtrace.conf
+  #       # The log_filename of the trace configuration's sections.
+  #       log: /var/log/firebird/audit/audit.log
+  #       # Optional, must be <root>/databases.conf: the alias map.
+  #       databases_conf: /opt/firebird/databases.conf
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
