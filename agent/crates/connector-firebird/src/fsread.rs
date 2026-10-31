@@ -351,6 +351,7 @@ pub(crate) fn readers_with(
     identity: &Identity,
 ) -> Result<(), &'static str> {
     let allowed = |uid: u32| uid == 0 || uid == server_uid || uid == agent;
+    let groups = GroupMemo::new(identity, &allowed);
     let check = |p: &Path, need: u32| -> bool {
         let Ok(m) = std::fs::symlink_metadata(p) else {
             return true;
@@ -359,7 +360,7 @@ pub(crate) fn readers_with(
             return true;
         }
         let acl = acl_entries(p, "system.posix_acl_access");
-        others_can(&m, need, acl.as_deref(), identity, &allowed)
+        others_can(&m, need, acl.as_deref(), &groups, &allowed)
     };
     if check(path, 0o4) {
         return Err("log_readable_by_others");
@@ -376,7 +377,7 @@ pub(crate) fn readers_with(
             return Err("log_directory_unreadable");
         };
         let gids: Vec<u32> = server_gid.into_iter().chain([dm.gid()]).collect();
-        if default_acl_open(&def, &gids, identity, &allowed) {
+        if default_acl_open(&def, &gids, &groups, &allowed) {
             return Err("log_directory_default_acl");
         }
     }
@@ -406,6 +407,41 @@ pub(crate) fn readers_with(
     Ok(())
 }
 
+/// Whether each group that grants read is open, computed once per gid
+/// within one readers check (security review L3: the log, its directory,
+/// its default ACL and every rotated file ask for the same gids; ACL
+/// xattrs are read into 4 KiB, at most 511 entries each).
+pub(crate) struct GroupMemo<'a> {
+    identity: &'a Identity,
+    allowed: &'a dyn Fn(u32) -> bool,
+    cache: std::cell::RefCell<std::collections::HashMap<u32, bool>>,
+}
+
+impl<'a> GroupMemo<'a> {
+    pub(crate) fn new(identity: &'a Identity, allowed: &'a dyn Fn(u32) -> bool) -> Self {
+        Self {
+            identity,
+            allowed,
+            cache: std::cell::RefCell::default(),
+        }
+    }
+
+    pub(crate) fn open(&self, gid: u32) -> bool {
+        if let Some(v) = self.cache.borrow().get(&gid) {
+            return *v;
+        }
+        let v = self.identity.group_open(gid, self.allowed);
+        self.cache.borrow_mut().insert(gid, v);
+        v
+    }
+
+    /// How many gids were evaluated.
+    #[cfg(test)]
+    pub(crate) fn evaluated(&self) -> usize {
+        self.cache.borrow().len()
+    }
+}
+
 /// Whether a default ACL gives read to a uid outside `allowed` on the
 /// files created in the directory: named users and groups and other
 /// (under the mask), the owning group (the creating server's group or
@@ -414,10 +450,10 @@ pub(crate) fn readers_with(
 fn default_acl_open(
     entries: &[(u16, u16, u32)],
     gids: &[u32],
-    identity: &Identity,
+    groups: &GroupMemo<'_>,
     allowed: &dyn Fn(u32) -> bool,
 ) -> bool {
-    let group_open = |gid: u32| identity.group_open(gid, allowed);
+    let group_open = |gid: u32| groups.open(gid);
     let mask = entries.iter().find(|e| e.0 == 0x10).map_or(7, |e| e.1);
     entries.iter().any(|&(tag, perm, id)| match tag {
         0x02 => perm & mask & 4 != 0 && !allowed(id),
@@ -469,7 +505,7 @@ fn others_can(
     m: &std::fs::Metadata,
     need: u32,
     acl: Option<&[(u16, u16, u32)]>,
-    identity: &Identity,
+    groups: &GroupMemo<'_>,
     allowed: &dyn Fn(u32) -> bool,
 ) -> bool {
     let mode = m.mode();
@@ -477,7 +513,7 @@ fn others_can(
         // Other.
         return true;
     }
-    let group_open = |gid: u32| identity.group_open(gid, allowed);
+    let group_open = |gid: u32| groups.open(gid);
     let need16 = u16::try_from(need).unwrap_or(4);
     match acl {
         None => {
@@ -623,21 +659,36 @@ mod tests {
             (0x10, 4, u32::MAX),
             (0x20, 0, u32::MAX),
         ];
-        assert!(!default_acl_open(&closed, &[84], &id, &allowed));
+        assert!(!default_acl_open(
+            &closed,
+            &[84],
+            &GroupMemo::new(&id, &allowed),
+            &allowed
+        ));
         // A named user, a named group with another member, other: open.
-        assert!(default_acl_open(&[(2, 4, 1002)], &[84], &id, &allowed));
-        assert!(default_acl_open(&[(8, 4, 50)], &[84], &id, &allowed));
+        assert!(default_acl_open(
+            &[(2, 4, 1002)],
+            &[84],
+            &GroupMemo::new(&id, &allowed),
+            &allowed
+        ));
+        assert!(default_acl_open(
+            &[(8, 4, 50)],
+            &[84],
+            &GroupMemo::new(&id, &allowed),
+            &allowed
+        ));
         assert!(default_acl_open(
             &[(0x20, 4, u32::MAX)],
             &[84],
-            &id,
+            &GroupMemo::new(&id, &allowed),
             &allowed
         ));
         // Under a mask without read: closed.
         assert!(!default_acl_open(
             &[(2, 4, 1002), (0x10, 0, u32::MAX)],
             &[84],
-            &id,
+            &GroupMemo::new(&id, &allowed),
             &allowed
         ));
         // R52 item 1: the dev layout's default ACL (u::rw, g::---, m::r,
@@ -650,7 +701,12 @@ mod tests {
             (0x10, 4, u32::MAX),
             (0x20, 0, u32::MAX),
         ];
-        assert!(!default_acl_open(&dev, &[84], &id, &agent));
+        assert!(!default_acl_open(
+            &dev,
+            &[84],
+            &GroupMemo::new(&id, &agent),
+            &agent
+        ));
         // Groups not provable (R47): an owning group with read is open.
         let open_groups = crate::host_identity::identity_for_tests(
             passwd,
@@ -661,8 +717,35 @@ mod tests {
             crate::host_identity::Place::BareHost,
         )
         .unwrap();
-        assert!(default_acl_open(&closed, &[84], &open_groups, &allowed));
-        assert!(!default_acl_open(&dev, &[84], &open_groups, &agent));
+        assert!(default_acl_open(
+            &closed,
+            &[84],
+            &GroupMemo::new(&open_groups, &allowed),
+            &allowed
+        ));
+        assert!(!default_acl_open(
+            &dev,
+            &[84],
+            &GroupMemo::new(&open_groups, &agent),
+            &agent
+        ));
+    }
+
+    /// Security review L3: a gid is evaluated once per readers check.
+    #[test]
+    fn group_answers_are_memoized() {
+        let id = identity(
+            "root:x:0:0::/:/bin/sh\neve:x:1002:1002::/:/bin/sh\n",
+            "staff:x:50:eve\nfb:x:84:\n",
+        );
+        let allowed = |u: u32| u == 0 || u == 84;
+        let memo = GroupMemo::new(&id, &allowed);
+        let entries: Vec<(u16, u16, u32)> = (0..500)
+            .map(|i| (8, 4, if i % 2 == 0 { 50 } else { 84 }))
+            .collect();
+        assert!(default_acl_open(&entries, &[84], &memo, &allowed));
+        assert!(memo.open(50) && !memo.open(84));
+        assert_eq!(memo.evaluated(), 2);
     }
 
     /// R48 item 3 (and N6): the readers check on real files, with an
