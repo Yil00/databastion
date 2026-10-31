@@ -1,0 +1,211 @@
+# Firebird target end to end (ROADMAP P10-D, ADR-0060 R39 (j) and R52 item 2; the RELEASE.md gate
+# "Firebird Audit end to end"): merged over docker-compose.yml by e2e/firebird.sh only (`-f
+# docker-compose.yml -f docker-compose.firebird.yml -f $E2E_WORK_DIR/hostid.yml`, project
+# databastion-e2e-firebird). The main e2e run (run.sh) never reads this file. Only db, migrate, web,
+# worker, proxy, bootstrap-admin, firebird-audit-init, firebird, agent (or agent-uid), agent-files
+# and the one-shot tools below are started: none of the other targets of docker-compose.yml.
+#
+#   firebird-audit-init  the dev init step (dev/firebird/acl-init, the pinned Firebird image with
+#                        `setfacl`): the firebird-audit volume's directory and log owned by the
+#                        server (84), no group or other access, the agent's uid 10001 reading
+#                        through named-user ACLs, and the directory's default ACL for the next log
+#                        file (ADR-0060 R52 item 1). No network.
+#   firebird             the dev service's image, configuration and entrypoint (dev/firebird: uid 84,
+#                        loopback only, WireCrypt Required, ChaCha, Srp256, the system audit trace
+#                        of fbtrace.conf meeting the Partial proofs, the seed as `crm`), plus the
+#                        e2e test accounts (target-initdb/firebird-20-clients.sh, first start only).
+#                        Its passwords come from Docker secrets, exported by the wrapper below for
+#                        the dev entrypoint only (never in the container's environment, so never in
+#                        `docker inspect`; the entrypoint unsets them before the server starts). On
+#                        agent-net only, which the agent reaches the console through; nothing is
+#                        published and the server listens on the loopback of its own network
+#                        namespace. The Firebird root /opt/firebird is the volume firebird-root
+#                        (filled from the image on its first mount), so that the agent can see it
+#                        read-only at the same path (R50 item 3).
+#   agent                the agent in its container, in the server's network and pid namespaces
+#                        (`network_mode` / `pid: service:firebird`, decision 3 and R50 items 1
+#                        and 5), every capability dropped (x-hardening, so NET_RAW and NET_ADMIN
+#                        too, as for the server), read-only root file system, no supplementary
+#                        group. Mounted read-only at the server's paths: the Firebird root, its
+#                        firebird.conf, the trace configuration and the log directory; not the
+#                        data volume. The host identity files (the runner's own /etc/passwd,
+#                        /etc/group, /etc/nsswitch.conf, and /etc/subuid, /etc/subgid when present,
+#                        single-file binds) come from $E2E_WORK_DIR/hostid.yml, written by
+#                        firebird.sh for each step (read-only, or the negative steps' variants).
+#   agent-uid            the negative step "the agent as the runner's uid" (R52 item 2: uid 1001,
+#                        `uid_collision`): the same image and layout as `agent`, its own state and
+#                        secrets volumes and its own enrollment (`tools` profile).
+#   firebird-acl-inspect one-shot (`tools`): the ACLs of a Firebird log volume (getfacl, as the
+#                        server's uid 84, no capability, no network): whether the volume's file
+#                        system keeps them (R52 item 1).
+#   firebird-rotation    one-shot (`tools`): a throwaway embedded Firebird engine of the same image
+#                        on a volume prepared as firebird-audit (firebird-rotation-init), with a
+#                        1 MB `max_log_size`, so that the trace rotates its log: whether the next
+#                        log file gets the directory's default ACL (R52 item 1). No network.
+
+x-firebird-image: &firebird-image firebirdsql/firebird:5.0.4@sha256:1529560400fc7847f015c57fc9d70729c44d9a9d8f9000df19c5ce1950b4c202
+
+services:
+  firebird-audit-init:
+    build: ../dev/firebird/acl-init
+    image: databastion-dev/firebird-acl-init:5.0.4
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASTION_DEV_AGENT_UID: "10001"
+    volumes:
+      - firebird-audit:/a
+    restart: "no"
+
+  firebird:
+    image: *firebird-image
+    user: "84:84"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        FIREBIRD_SYSDBA_PASSWORD="$$(cat /run/secrets/target_fb_sysdba_password)"
+        FIREBIRD_DATABASTION_PASSWORD="$$(cat /run/secrets/target_agent_password)"
+        export FIREBIRD_SYSDBA_PASSWORD FIREBIRD_DATABASTION_PASSWORD
+        exec /bin/bash /databastion/entrypoint.sh
+    secrets: [target_fb_sysdba_password, target_agent_password, target_client_password]
+    volumes:
+      - firebird-root:/opt/firebird
+      - firebird-data:/var/lib/firebird/data
+      - firebird-audit:/var/lib/firebird/audit
+      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ../dev/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - ../dev/firebird/entrypoint.sh:/databastion/entrypoint.sh:ro
+      - ../dev/firebird/seed.sh:/databastion/seed.sh:ro
+      - ../dev/seed/out/firebird.sql:/databastion/seed/firebird.sql:ro
+      - ./target-initdb/firebird-20-clients.sh:/databastion/initdb.d/20-clients.sh:ro
+    networks: [agent-net]
+    depends_on:
+      firebird-audit-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # As dev's: the seed marker, then a bare TCP connect on the namespace's loopback (no login).
+      test: ["CMD", "bash", "-c", "test -f /var/lib/firebird/data/.databastion-seeded && exec 3<>/dev/tcp/127.0.0.1/3050"]
+      interval: 2s
+      timeout: 5s
+      start_period: 60s
+      retries: 90
+
+  agent:
+    network_mode: "service:firebird"
+    pid: "service:firebird"
+    # Set by the server's namespace: no network, alias or host name of its own.
+    networks: !reset {}
+    hostname: !reset ""
+    group_add: !reset []
+    volumes: !override
+      - agent-state:/var/lib/databastion
+      - agent-secrets:/run/databastion-secrets:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/agent/${E2E_FB_AGENT_CONFIG:-agent.yaml}:/etc/databastion/agent.yaml:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      # The Firebird root, its firebird.conf, the trace configuration and the log directory,
+      # read-only at the server's paths (R50 item 3); never the data volume.
+      - firebird-root:/opt/firebird:ro
+      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ../dev/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - firebird-audit:/var/lib/firebird/audit:ro
+    depends_on: !override
+      proxy:
+        condition: service_started
+      firebird:
+        condition: service_healthy
+
+  agent-uid:
+    profiles: [tools]
+    image: ${E2E_AGENT_IMAGE:-databastion-agent:e2e}
+    user: "${E2E_FB_COLLISION_UID:-1001}:${E2E_FB_COLLISION_UID:-1001}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    network_mode: "service:firebird"
+    pid: "service:firebird"
+    command: ["run", "--config", "/etc/databastion/agent.yaml"]
+    restart: "no"
+    environment:
+      DATABASTION_LOG: debug
+    volumes:
+      # nocopy: the image's /var/lib/databastion (10001, 0700) is not copied into the volume, which
+      # firebird.sh hands to that uid first (0700).
+      - type: volume
+        source: agent-state-uid
+        target: /var/lib/databastion
+        volume:
+          nocopy: true
+      - agent-secrets-uid:/run/databastion-secrets:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/agent/agent-uid.yaml:/etc/databastion/agent.yaml:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      # The Firebird root, its firebird.conf, the trace configuration and the log directory,
+      # read-only at the server's paths (R50 item 3); never the data volume.
+      - firebird-root:/opt/firebird:ro
+      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ../dev/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - firebird-audit:/var/lib/firebird/audit:ro
+
+  agent-files:
+    volumes: !override
+      - agent-state:/state
+      - agent-secrets:/secrets
+      - agent-state-uid:/state-uid
+      - agent-secrets-uid:/secrets-uid
+
+  firebird-acl-inspect:
+    profiles: [tools]
+    image: databastion-dev/firebird-acl-init:5.0.4
+    user: "84:84"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-euc"]
+    volumes:
+      - firebird-audit:/a:ro
+      - firebird-rotation:/r:ro
+
+  firebird-rotation-init:
+    profiles: [tools]
+    image: databastion-dev/firebird-acl-init:5.0.4
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASTION_DEV_AGENT_UID: "10001"
+    volumes:
+      - firebird-rotation:/a
+
+  firebird-rotation:
+    profiles: [tools]
+    image: *firebird-image
+    user: "84:84"
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/bash", "-euc"]
+    # /var/lib/firebird/data: the image's VOLUME, a tmpfs here (no anonymous volume left behind).
+    tmpfs: [/tmp, /var/lib/firebird/data]
+    volumes:
+      - firebird-rotation:/var/lib/firebird/audit
+      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/rotation-fbtrace.conf:/databastion/fbtrace.conf:ro
+
+volumes:
+  firebird-root: {}
+  firebird-data: {}
+  firebird-audit: {}
+  firebird-rotation: {}
+  agent-state-uid: {}
+  agent-secrets-uid: {}
+
+secrets:
+  target_fb_sysdba_password:
+    file: ${E2E_WORK_DIR:?set by firebird.sh}/secrets/target_fb_sysdba_password

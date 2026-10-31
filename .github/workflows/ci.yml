@@ -33,6 +33,7 @@ jobs:
       e2e_sqlserver: ${{ steps.e2e.outputs.e2e_sqlserver }}
       e2e_redis: ${{ steps.e2e.outputs.e2e_redis }}
       e2e_sqlite: ${{ steps.e2e.outputs.e2e_sqlite }}
+      e2e_firebird: ${{ steps.e2e.outputs.e2e_firebird }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -134,6 +135,14 @@ jobs:
             e2e_sqlite=false
           fi
           echo "e2e_sqlite=$e2e_sqlite" | tee -a "$GITHUB_OUTPUT"
+          # Firebird target end to end (e2e/firebird.sh): the same, with the Firebird dev service (its
+          # image pin, configuration, trace configuration, entrypoint and ACL init step) and its seed.
+          if [ -z "$changed" ] || grep -qE '^(agent/|console/|shared/|e2e/|deploy/initdb/|dev/firebird/|dev/seed/out/firebird\.sql$|dev/ground-truth\.json$|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e_firebird=true
+          else
+            e2e_firebird=false
+          fi
+          echo "e2e_firebird=$e2e_firebird" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
               || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
@@ -1219,6 +1228,75 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Firebird target end to end (ROADMAP P10-D; ADR-0060 R39 (j) and the host-identity refinement's
+  # R52 item 2; e2e/README.md "Firebird target"): the RELEASE.md gate "Firebird Audit end to end".
+  # The console and agent images with the dev Firebird 5.0.4 service (uid 84, loopback only, the
+  # system audit trace, the seed as `crm`), the agent in its container in the server's network and
+  # pid namespaces (every container of it without NET_RAW / NET_ADMIN), the Firebird root,
+  # configuration and log directory read-only at the server's paths, and this runner's own
+  # /etc/passwd, /etc/group, /etc/nsswitch.conf (and /etc/subuid, /etc/subgid) as single-file
+  # read-only bind mounts, never edited. Preconditions first (e2e/firebird_hostid.py: uids 84 and
+  # 10001 absent from the runner's passwd and outside its subordinate and systemd ranges, its
+  # nsswitch.conf accepted, uid 1001 present): the job fails rather than picking other uids. Then
+  # the log volume's ACLs (kept by its file system; the next log file after a rotation, measured
+  # and written to the job summary), Discovery against dev/ground-truth.json, `firebird.audit`
+  # reaching Partial through `firebird.audit.host_identity`, a full read of seeded tables raising a
+  # critical incident, the #82 marker cases, I2, and the four real-kernel negative steps (no
+  # host_identity, a file of the agent image, the passwd file mounted read-write, the agent as uid
+  # 1001), each not Partial with its local reason. Fake random passwords in files of a private
+  # 0700 directory, never on a command line nor in a container's configuration; logs redacted.
+  # Needs the console to list `engine.firebird` (ROADMAP P10-E, Firebird part): the script fails at
+  # once without it. Required through ci-result, like the other e2e jobs.
+  e2e-firebird:
+    name: E2E Firebird target
+    needs: detect
+    if: needs.detect.outputs.e2e_firebird == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-firebird-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          uname -r
+          docker info --format '{{.Driver}} {{.DockerRootDir}}'
+          shellcheck --version | head -n 2
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/firebird.sh e2e/lib.sh e2e/target-initdb/firebird-20-clients.sh dev/firebird/entrypoint.sh dev/firebird/acl-init/layout.sh
+      - name: Unit tests of the preconditions and the I2 leak scanner
+        run: |
+          timeout 120 python3 -m unittest discover -s e2e -p 'test_firebird*.py' -v
+          timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
+      - name: Run e2e/firebird.sh
+        # Within the job budget (50 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 2700 e2e/firebird.sh
+      # firebird.sh redacts every generated secret and the #82 markers from the logs on exit, whatever
+      # the result (and masks them in the job log). The ACL measurement and the event census are in
+      # the job summary too.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-firebird-census
+          path: e2e-firebird-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-firebird-logs
+          path: e2e-firebird-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
   # RELEASE.md section 7 "Compatibility": e2e/run.sh with the console from this PR and the agent of
   # the previous release (its signed image, verified with the exact tag identity and pulled by
   # digest; .github/workflows/e2e-compat.yml, e2e/README.md "Compatibility with the previous agent").
@@ -1249,7 +1327,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-firebird, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-sqlite, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-firebird, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-sqlite, e2e-firebird, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

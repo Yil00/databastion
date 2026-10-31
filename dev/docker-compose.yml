@@ -591,9 +591,9 @@ services:
   # (DATABASTION_DEV_AGENT_UID, 10001 by default) reading the log through a named-user ACL and the
   # next log file through the directory's default ACL (firebird/acl-init/layout.sh), so the agent
   # can read it and not write it, and no group grants read (R4, R47 item 4). Mount the volume
-  # read-only into the agent's container. Whether the volume's file system keeps ACLs is checked in
-  # P10-D. The earlier group layout (0640, directory 2750 with the agent's gid) is a negative case
-  # of dev/firebird/it.sh.
+  # read-only into the agent's container. The e2e-firebird job checks that the volume's file system
+  # keeps the ACLs and measures a rotation (e2e/README.md "Firebird target"). The earlier group
+  # layout (0640, directory 2750 with the agent's gid) is a negative case of dev/firebird/it.sh.
   firebird-audit-init:
     build: ./firebird/acl-init
     image: databastion-dev/firebird-acl-init:5.0.4
