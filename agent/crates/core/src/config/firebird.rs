@@ -540,17 +540,48 @@ fn lookup_user(passwd: &str, name: &str) -> Option<u32> {
 /// Firebird readers check, at every check (R44 item 3).
 #[must_use]
 pub fn agent_in_container() -> bool {
-    let read = |p: &str| std::fs::read_to_string(p).ok();
+    // Security review N1 (refinement of 2026-10-31): run at every check,
+    // so every `/proc` file is read through one handle checked to be on
+    // procfs, with a bound; a file that is not read gives no signal.
+    let read = |p: &str, bytes: usize, lines: usize| {
+        read_proc_bounded(p, bytes, lines).and_then(|b| String::from_utf8(b).ok())
+    };
     std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists()
         || std::path::Path::new("/run/systemd/container").exists()
         || std::path::Path::new("/run/host/container-manager").exists()
         || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
-        || read("/proc/1/cgroup").is_some_and(|t| cgroup_names_container(&t))
-        || read("/proc/self/uid_map").is_some_and(|t| uid_map_is_namespaced(&t))
-        || read("/proc/self/gid_map").is_some_and(|t| uid_map_is_namespaced(&t))
-        || read("/proc/self/mountinfo").is_some_and(|t| root_is_overlay(&t))
-        || read("/proc/1/sched").is_some_and(|t| sched_pid_is_not_1(&t))
+        || read("/proc/1/cgroup", 1 << 20, 65_536).is_some_and(|t| cgroup_names_container(&t))
+        || read("/proc/self/uid_map", 64 << 10, 512).is_some_and(|t| uid_map_is_namespaced(&t))
+        || read("/proc/self/gid_map", 64 << 10, 512).is_some_and(|t| uid_map_is_namespaced(&t))
+        || read("/proc/self/mountinfo", 16 << 20, 65_536).is_some_and(|t| root_is_overlay(&t))
+        || read("/proc/1/sched", 64 << 10, 4096).is_some_and(|t| sched_pid_is_not_1(&t))
+}
+
+/// Reads a `/proc` file through one handle (`O_NOFOLLOW` on the last
+/// component) checked to be on procfs (`fstatfs`), `None` when it is not
+/// there, not on procfs, or reaches either bound (`max_bytes` bytes or
+/// `max_lines` newlines): a bounded text is never read as if complete.
+#[must_use]
+pub fn read_proc_bounded(path: &str, max_bytes: usize, max_lines: usize) -> Option<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read;
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    if rustix::fs::fstatfs(&fd).ok()?.f_type != rustix::fs::PROC_SUPER_MAGIC {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::from(fd)
+        .take(max_bytes as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+    (bytes.len() < max_bytes && newlines < max_lines).then_some(bytes)
 }
 
 /// Whether a `/proc/self/uid_map` (or `gid_map`) text is anything but the
@@ -942,6 +973,20 @@ mod tests {
         let yaml: FirebirdTargetConfig =
             serde_yaml_ng::from_str("{peer_uid: 84, databases: [{name: a, attach: a}]}").unwrap();
         assert_eq!(yaml.peer_uid, Some(PeerUid::Number(84)));
+    }
+
+    /// Security review N1: bounded reads on procfs only.
+    #[test]
+    fn proc_reads_are_bounded_and_on_procfs() {
+        let m = read_proc_bounded("/proc/self/mountinfo", 16 << 20, 65_536).unwrap();
+        assert!(!m.is_empty());
+        assert!(read_proc_bounded("/proc/self/mountinfo", 8, 65_536).is_none());
+        assert!(read_proc_bounded("/proc/self/mountinfo", 16 << 20, 1).is_none());
+        assert!(read_proc_bounded("/proc/no-such-file", 1 << 20, 10).is_none());
+        let off = std::env::temp_dir().join(format!("fb-proc-{}", std::process::id()));
+        std::fs::write(&off, "0 0 4294967295\n").unwrap();
+        assert!(read_proc_bounded(off.to_str().unwrap(), 1 << 20, 10).is_none());
+        let _ = std::fs::remove_file(&off);
     }
 
     #[test]

@@ -992,23 +992,8 @@ fn read_bounded(file: &File, bounds: Bounds) -> Result<Zeroizing<Vec<u8>>, Kind>
 /// Reads a `/proc` file through one handle checked to be on procfs
 /// (`fstatfs`, security review N3); reaching either bound refuses.
 pub(crate) fn read_proc(path: &str, bounds: Bounds) -> Option<Zeroizing<Vec<u8>>> {
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()?;
-    if rustix::fs::fstatfs(&fd).ok()?.f_type != rustix::fs::PROC_SUPER_MAGIC {
-        return None;
-    }
-    let file = File::from(fd);
-    let mut bytes = Zeroizing::new(Vec::new());
-    (&file)
-        .take(bounds.bytes as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let newlines = bytes.iter().filter(|b| **b == b'\n').count();
-    (bytes.len() < bounds.bytes && newlines < bounds.lines).then_some(bytes)
+    databastion_core::config::firebird::read_proc_bounded(path, bounds.bytes, bounds.lines)
+        .map(Zeroizing::new)
 }
 
 /// R46: both maps the identity map of the initial user namespace.
