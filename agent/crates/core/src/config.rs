@@ -2561,6 +2561,46 @@ targets:
         assert_eq!(fb.peer_uid(), Some(84));
         assert_eq!(fb.databases[0].attach, "appdb");
         assert!(!fb.tunnel && !fb.extended_grants);
+        assert!(fb.audit.as_ref().unwrap().host_identity.is_none());
+        // ADR-0060 R44: the `host_identity` example uncommented, accepted
+        // only for an agent in a container.
+        let hi: String = text[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.strip_prefix("  # ").map(|r| format!("  {r}"))?;
+                let t = l.trim_start();
+                let key = t.strip_prefix("#   ").is_some_and(|k| !k.starts_with('#'));
+                if t.starts_with("# tunnel:")
+                    || t.starts_with("# extended_grants:")
+                    || t.starts_with("# host_identity:")
+                    || key
+                {
+                    Some(l.replacen("# ", "", 1))
+                } else if t.starts_with('#') {
+                    None
+                } else {
+                    Some(l)
+                }
+            })
+            .map(|l| l.replace("peer_uid: firebird", "peer_uid: 84") + "\n")
+            .collect();
+        assert!(hi.contains("host_identity:") && hi.contains("agent_account: databastion"));
+        let parsed = parse(&format!("{base}targets:\n{hi}"));
+        if firebird::agent_in_container() {
+            let cfg = parsed.unwrap_or_else(|e| panic!("{e}\n{hi}"));
+            let h = cfg.targets[0]
+                .firebird_settings()
+                .unwrap()
+                .audit
+                .as_ref()
+                .unwrap();
+            let h = h.host_identity.as_ref().unwrap();
+            assert_eq!(h.files().len(), 5);
+            assert_eq!(h.server_account.as_deref(), Some("firebird"));
+        } else {
+            let e = parsed.unwrap_err().to_string();
+            assert!(e.contains("targets[0].firebird.audit.host_identity"), "{e}");
+        }
     }
 
     /// The commented SQL Server target of the example file is valid once

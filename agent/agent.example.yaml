@@ -347,6 +347,29 @@ targets:
   #       log: /var/log/firebird/audit/audit.log
   #       # Optional, must be <root>/databases.conf: the alias map.
   #       databases_conf: /opt/firebird/databases.conf
+  #       # Only for an agent in a container (refused on the host, where the
+  #       # agent reads /etc/passwd, /etc/group and /etc/nsswitch.conf
+  #       # itself): the host's identity files, each bind-mounted read-only,
+  #       # file by file, from the host (host bind mounts or hostPath only,
+  #       # never a ConfigMap, Secret or emptyDir), checked at every check.
+  #       # The agent's container must share the server's pid namespace
+  #       # (pid: service:<firebird>, or pid: host), see the Firebird root,
+  #       # configuration and log directory read-only at the server's paths,
+  #       # run with identity uid and gid maps (no user namespace) and not
+  #       # as root. Restart the agent's container after a change of host
+  #       # accounts or groups (a stale mount is refused).
+  #       # host_identity:
+  #       #   passwd: /run/databastion/host/passwd
+  #       #   group: /run/databastion/host/group
+  #       #   nsswitch: /run/databastion/host/nsswitch.conf
+  #       #   # Optional: the host's subordinate ids; without them every uid
+  #       #   # or gid of 100000 or more is treated as subordinate.
+  #       #   subuid: /run/databastion/host/subuid
+  #       #   subgid: /run/databastion/host/subgid
+  #       #   # Optional: the only names the server's and the agent's uids
+  #       #   # may carry in the host's passwd file (absent otherwise).
+  #       #   server_account: firebird
+  #       #   agent_account: databastion
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
