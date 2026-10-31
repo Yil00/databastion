@@ -585,17 +585,16 @@ timeout 600 $SUDO unshare --mount --propagation private -- /bin/sh -eu -c '
 # named-user ACLs, a default ACL for the next file; the ACL xattrs written directly, the host may
 # have no setfacl), the agent's stream tailing it as uid 10001 (it::rotation, in the background),
 # then more than 2 MiB of trace. Printed: each file's mode, owner and ACL after the rotations, what
-# uid 10001 can open, and what the stream saw.
+# uid 10001 can open, and what the stream saw. Cases: the image's umask, umask 027 and 000 (the
+# server started by a shell that sets it), and umask 027 without the default ACL. The server
+# creates the log with open(O_CREAT, 0600) (PluginLogWriter::reopen, 4.0.7 and 5.0.4).
 echo "[it] rotation: max_log_size = 1" >&2
 timeout 60 docker stop "$NAME" >/dev/null
 # Not under /tmp: the stream's open check refuses a log below a directory the agent can write.
 ROT="$(mktemp -d -p /var/lib databastion-it-rotation.XXXXXX)"
 chmod 0711 "$ROT"
-install -d -o 84 -g 84 -m 0700 "$ROT/audit"
-install -o 84 -g 84 -m 0600 /dev/null "$ROT/audit/audit.log"
-install -d -o 10001 -g 10001 -m 0700 "$ROT/agent"
 install -m 0755 "$EXE" "$ROT/it"
-acl() { # set DIR AGENT_UID | show FILE...
+acl() { # set DIR AGENT_UID DEFAULT(yes|no) | show FILE...
   python3 -I - "$@" <<'PY'
 import os, struct, sys
 U, TAGS = 0xFFFFFFFF, {1: "u", 2: "u", 4: "g", 8: "g", 0x10: "m", 0x20: "o"}
@@ -611,7 +610,8 @@ def dec(raw):
 if sys.argv[1] == "set":
     d, a = sys.argv[2], int(sys.argv[3])
     os.setxattr(d, "system.posix_acl_access", enc([(1, 7, U), (2, 5, a), (4, 0, U), (0x10, 5, U), (0x20, 0, U)]))
-    os.setxattr(d, "system.posix_acl_default", enc([(1, 6, U), (2, 4, a), (4, 0, U), (0x10, 4, U), (0x20, 0, U)]))
+    if sys.argv[4] == "yes":
+        os.setxattr(d, "system.posix_acl_default", enc([(1, 6, U), (2, 4, a), (4, 0, U), (0x10, 4, U), (0x20, 0, U)]))
     os.setxattr(d + "/audit.log", "system.posix_acl_access", enc([(1, 6, U), (2, 4, a), (4, 0, U), (0x10, 4, U), (0x20, 0, U)]))
 else:
     for f in sys.argv[2:]:
@@ -625,44 +625,69 @@ else:
         print(line)
 PY
 }
-acl set "$ROT/audit" 10001
-acl show "$ROT/audit" "$ROT/audit/audit.log" | sed 's/^/[measure] rotation: before: /' >&2
 sed 's/^\tmax_log_size = 0$/\tmax_log_size = 1/' "$WORK/fbtrace.conf" > "$WORK/fbtrace-rot.conf"
 grep -F 'max_log_size = 1' "$WORK/fbtrace-rot.conf" >/dev/null || { echo "[it] rotation: no max_log_size" >&2; exit 1; }
 chmod 0644 "$WORK/fbtrace-rot.conf"
-timeout 60 docker run -d --name "$NAME-rot" "${JOIN[@]}" --user 84:84 \
-  -v "$VOLUME:/var/lib/firebird/data" -v "$ROT/audit:/var/lib/firebird/audit" \
-  -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
-  -v "$WORK/fbtrace-rot.conf:/databastion/fbtrace.conf:ro" \
-  --entrypoint /opt/firebird/bin/firebird "$LOCAL_IMAGE" >/dev/null
-listening "$PORT"
-setpriv --reuid 10001 --regid 10001 --clear-groups -- \
-  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
-  FIREBIRD_IT_ROTATION_LOG="$ROT/audit/audit.log" FIREBIRD_IT_ROTATION_READY="$ROT/agent/ready" \
-  timeout 300 "$ROT/it" it::rotation::the_stream_across_a_server_rotation --exact --nocapture \
-  > "$ROT/test.out" 2>&1 &
-TEST_PID=$!
-for _ in $(seq 1 60); do [ -e "$ROT/agent/ready" ] && break; sleep 1; done
-[ -e "$ROT/agent/ready" ] || { cat "$ROT/test.out" >&2; echo "[it] rotation: the stream did not start" >&2; exit 1; }
-# 40 statements of about 60 KB each (a multi-line comment of 600 lines; max_sql_length 65000):
-# about 2.4 MiB of trace, so at least two rotations.
-{
-  cat "$WORK/root.pw"
-  pad="$(head -c 100 /dev/zero | tr '\0' 'x')"
-  for i in $(seq 1 40); do
-    # shellcheck disable=SC2016 # A Firebird name, not a shell expansion.
-    printf 'SELECT %d FROM RDB$DATABASE /*\n' "$i"
-    for _ in $(seq 1 600); do printf '%s\n' "$pad"; done
-    printf '*/;\n'
-  done
-} | SERVER="$NAME-rot" as_sysdba /opt/firebird/bin/isql -q -user SYSDBA \
-  "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" >/dev/null
-sleep 3
-wait "$TEST_PID" || echo "[it] rotation: the measurement test failed" >&2
-grep -F '[measure]' "$ROT/test.out" >&2 || cat "$ROT/test.out" >&2
-mapfile -t files < <(find "$ROT/audit" -mindepth 1 -maxdepth 1 | sort)
-acl show "$ROT/audit" "${files[@]}" | sed 's/^/[measure] rotation: after: /' >&2
-for f in "${files[@]}"; do
-  echo "[measure] rotation: $(basename "$f"): $(wc -l < "$f") lines"
-done >&2
-timeout 60 docker rm -f -v "$NAME-rot" >/dev/null
+rotation_case() { # label umask(image|NNN) default-acl(yes|no)
+  local label="$1" mask="$2" def="$3" C="$ROT/$1" start=(--entrypoint /opt/firebird/bin/firebird)
+  install -d -m 0711 "$C"
+  install -d -o 84 -g 84 -m 0700 "$C/audit"
+  install -o 84 -g 84 -m 0600 /dev/null "$C/audit/audit.log"
+  install -d -o 10001 -g 10001 -m 0700 "$C/agent"
+  acl set "$C/audit" 10001 "$def"
+  # shellcheck disable=SC2016 # The inner shell's variable.
+  [ "$mask" = image ] || start=(--entrypoint /bin/sh "$LOCAL_IMAGE" -c 'umask "$1"; umask; exec /opt/firebird/bin/firebird' sh "$mask")
+  acl show "$C/audit" "$C/audit/audit.log" | sed "s/^/[measure] rotation $label: before: /" >&2
+  if [ "$mask" = image ]; then
+    timeout 60 docker run -d --name "$NAME-rot" "${JOIN[@]}" --user 84:84 \
+      -v "$VOLUME:/var/lib/firebird/data" -v "$C/audit:/var/lib/firebird/audit" \
+      -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
+      -v "$WORK/fbtrace-rot.conf:/databastion/fbtrace.conf:ro" "${start[@]}" "$LOCAL_IMAGE" >/dev/null
+  else
+    timeout 60 docker run -d --name "$NAME-rot" "${JOIN[@]}" --user 84:84 \
+      -v "$VOLUME:/var/lib/firebird/data" -v "$C/audit:/var/lib/firebird/audit" \
+      -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
+      -v "$WORK/fbtrace-rot.conf:/databastion/fbtrace.conf:ro" "${start[@]}" >/dev/null
+  fi
+  listening "$PORT"
+  # shellcheck disable=SC2016 # The inner shell's variables.
+  echo "[measure] rotation $label: server umask $(timeout 30 docker exec "$NAME-rot" sh -c \
+    'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = firebird ] && \
+     awk "/^Umask/ {print \$2}" "$p/status"; done; true' | head -n 1)" >&2
+  setpriv --reuid 10001 --regid 10001 --clear-groups -- \
+    env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+    FIREBIRD_IT_ROTATION_LOG="$C/audit/audit.log" FIREBIRD_IT_ROTATION_READY="$C/agent/ready" \
+    timeout 300 "$ROT/it" it::rotation::the_stream_across_a_server_rotation --exact --nocapture \
+    > "$C/test.out" 2>&1 &
+  local test_pid=$!
+  for _ in $(seq 1 60); do [ -e "$C/agent/ready" ] && break; sleep 1; done
+  [ -e "$C/agent/ready" ] || { cat "$C/test.out" >&2; echo "[it] rotation: the stream did not start" >&2; exit 1; }
+  # 40 statements of about 60 KB each (a multi-line comment of 600 lines; max_sql_length 65000):
+  # about 2.4 MiB of trace, so at least two rotations.
+  {
+    cat "$WORK/root.pw"
+    pad="$(head -c 100 /dev/zero | tr '\0' 'x')"
+    for i in $(seq 1 40); do
+      # shellcheck disable=SC2016 # A Firebird name, not a shell expansion.
+      printf 'SELECT %d FROM RDB$DATABASE /*\n' "$i"
+      for _ in $(seq 1 600); do printf '%s\n' "$pad"; done
+      printf '*/;\n'
+    done
+  } | SERVER="$NAME-rot" as_sysdba /opt/firebird/bin/isql -q -user SYSDBA \
+    "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" >/dev/null
+  sleep 3
+  wait "$test_pid" || echo "[it] rotation $label: the measurement test failed" >&2
+  grep -F '[measure]' "$C/test.out" | sed "s/\[measure\] rotation:/[measure] rotation $label:/" >&2 \
+    || cat "$C/test.out" >&2
+  local files
+  mapfile -t files < <(find "$C/audit" -mindepth 1 -maxdepth 1 | sort)
+  acl show "$C/audit" "${files[@]}" | sed "s/^/[measure] rotation $label: after: /" >&2
+  for f in "${files[@]}"; do
+    echo "[measure] rotation $label: $(basename "$f"): $(wc -l < "$f") lines"
+  done >&2
+  timeout 60 docker rm -f -v "$NAME-rot" >/dev/null
+}
+rotation_case image image yes
+rotation_case umask027 027 yes
+rotation_case umask000 000 yes
+rotation_case umask027-no-default-acl 027 no

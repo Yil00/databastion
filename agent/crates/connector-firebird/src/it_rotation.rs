@@ -48,12 +48,19 @@ fn the_stream_across_a_server_rotation() {
     let (mut lines, mut errors, mut first_error) = (0usize, 0u64, None);
     let mut lines_at_rotation = None;
     let mut polls_after_error = 0;
+    let mut idle = 0;
     while Instant::now() < deadline {
         match t.poll() {
             Ok(p) => {
                 lines += p.records.len();
                 if t.rotations > 0 && lines_at_rotation.is_none() {
                     lines_at_rotation = Some(lines);
+                }
+                // Every file read: stop 5 s after the trace stops growing
+                // past the second rotation.
+                idle = if p.records.is_empty() { idle + 1 } else { 0 };
+                if t.rotations >= 2 && idle >= 10 {
+                    break;
                 }
             }
             Err(e) => {
