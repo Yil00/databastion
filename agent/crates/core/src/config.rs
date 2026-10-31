@@ -1317,15 +1317,30 @@ impl AgentConfig {
                     && !matches!(&f.peer_uid, Some(firebird::PeerUid::Name(n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
             })
         });
-        let (passwd, in_container) = if names_a_user {
-            (
-                std::fs::read_to_string("/etc/passwd").ok(),
-                firebird::agent_in_container(),
-            )
-        } else {
-            (None, false)
-        };
+        // ADR-0060 R44 item 3: `host_identity` only in a container,
+        // detected at load (and at every check by the connector).
+        let host_identity = self.targets.iter().any(|t| {
+            t.firebird
+                .as_ref()
+                .and_then(|f| f.audit.as_ref())
+                .is_some_and(|a| a.host_identity.is_some())
+        });
+        let passwd = names_a_user
+            .then(|| std::fs::read_to_string("/etc/passwd").ok())
+            .flatten();
+        let in_container = (names_a_user || host_identity) && firebird::agent_in_container();
+        let state_dir = self.state_dir.clone();
         for (i, t) in self.targets.iter_mut().enumerate() {
+            if let Some(h) = t
+                .firebird
+                .as_ref()
+                .and_then(|f| f.audit.as_ref())
+                .and_then(|a| a.host_identity.as_ref())
+            {
+                h.validate_state_dir(&state_dir).map_err(|(key, reason)| {
+                    invalid(format!("targets[{i}].firebird.{key}"), reason)
+                })?;
+            }
             if let Some(f) = t.firebird.as_mut() {
                 f.resolve(passwd.as_deref(), in_container)
                     .map_err(|(key, reason)| {
@@ -1385,6 +1400,9 @@ impl AgentConfig {
                     a.firebird_conf.clone(),
                 ]);
                 files.extend(a.databases_conf.clone());
+                if let Some(h) = &a.host_identity {
+                    files.extend(h.files().into_iter().map(|(_, p)| p.to_owned()));
+                }
             }
         }
         for f in files.into_iter().filter(|f| f.is_absolute()) {
