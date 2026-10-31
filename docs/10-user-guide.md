@@ -512,12 +512,14 @@ The agent reads the server's **system audit trace**, a text log the server write
 - in each of these sections: `enabled = true`, `log_filename` the declared log, `connection_id = 0`, `time_threshold = 0`, `max_sql_length` at least 4096, no `include_filter`, `exclude_filter` or GDS-code filter, and `true` (unquoted) for `log_connections`, `log_transactions`, `log_statement_finish`, `log_procedure_finish`, `log_function_finish`, `log_trigger_finish`, `log_blr_requests`, `log_errors`, `log_initfini`, `log_sweep` and `print_perf`;
 - a `services` section with `enabled = true`, `log_services = true` and the same `log_filename`.
 
+`ServerMode = Classic` in `firebird.conf` gives Limited at best; use `Super` or `SuperClassic`.
+
 A missing setting is shown as `audit.trace_settings_missing` with the setting's name. The dev service's [`dev/firebird/fbtrace.conf`](../dev/firebird/fbtrace.conf) is a complete example.
 
 **Log file permissions.**
 
 - The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them.
-- No account other than root, the server's account and the agent may read them. Give the agent a named-user ACL, and a default ACL on the directory so that the next log file after a rotation gets it too (an example to adapt, not tested on a real host: `setfacl -m u:databastion:rx <dir>`, `setfacl -m u:databastion:r <log>` and `setfacl -d -m u:databastion:r <dir>`, with the agent's account `databastion`); the server creates rotated files `0600`. With a group grant instead, every member of that group must be root, the server's account or the agent.
+- No account other than root, the server's account and the agent may read them. Give the agent a named-user ACL, and a default ACL on the directory so that the next log file after a rotation gets it too (an example to adapt, not tested on a real host: `setfacl -m u:databastion:rx <dir>`, `setfacl -m u:databastion:r <log>` and `setfacl -d -m u:databastion:r <dir>`, with the agent's account `databastion`); the server creates rotated files `0600`. Whether the default ACL is inherited under that mode is not confirmed yet (P10-D): after the first rotation, check with `getfacl <log>` that the agent's entry is effective (not masked). Otherwise the agent cannot read the new file and the stream stops with a gap (fail closed). With a group grant instead, every member of that group must be root, the server's account or the agent.
 - The server's account is taken from the server process, or from `peer_uid`; both must agree.
 - **An agent in a container cannot prove the readers check** (it does not see the host's identity files), so Partial needs the agent on the host for now. A refinement that lets you declare the host's identity files, mounted read-only, is planned.
 

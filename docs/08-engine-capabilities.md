@@ -1443,8 +1443,12 @@ What the Firebird connector's Audit does, as implemented in lot 3 (P10-B #385; [
 - **Level: not stated yet.** The ceiling is Partial; Full is never reported. `check()` computes Partial or Limited from proofs 1 to 11 of decision 6, and None when no record of a declared database was parsed in the last 24 h. **No Firebird Audit level is stated until the `e2e-firebird` run and the 10 000-object schema measurement are done** ([release gates](../RELEASE.md#open-release-gates)).
 - **Partial is not proven when the agent runs in a container**: the readers check (who other than root, the server's account and the agent can read the log, its rotated files and its directory) needs the host's own identity files. A refinement that lets the operator declare them, mounted read-only into the agent's container, is planned (maintainer decision of 2026-10-31).
 - **What lowers the level**, each shown as a target note:
-  - a missing trace setting or a missing services section (`audit.trace_settings_missing`, with the setting's label);
-  - a trace configuration the agent cannot evaluate (`audit.trace_config_not_evaluated`);
+  - a missing trace setting (`audit.trace_settings_missing`, with the setting's label);
+  - a missing or incomplete services section (`audit.services_not_audited`, with the label `log_services` of `audit.trace_settings_missing`);
+  - a trace configuration the agent cannot evaluate, or a configuration not bound to the running server (`audit.trace_config_not_evaluated`, with labels such as `trace_config_file_mismatch`, `config_changed_since_start`, `server_process_not_visible` or `server_layout_not_the_root`);
+  - a log the agent cannot read under the file rules (`audit.log_not_readable`), or one that others can read (`audit.log_readable_by_others`);
+  - a `max_sql_length` below the agent's longest own statement (`audit.statement_text_limit_low`, also reported, without lowering the level, below 4096);
+  - `ServerMode = Classic`: Limited at best (R1 rule 10);
   - a gap (`audit.records_dropped`) or an ambiguous record (`audit.log_records_ambiguous`) in the last 24 h.
 
 ### Gaps that cap the level for 24 h
@@ -1471,6 +1475,9 @@ What the Firebird connector's Audit does, as implemented in lot 3 (P10-B #385; [
   - **R-4**: one unreadable record invalidates every declared database until the other clients' attachments open at that record end (over-reporting).
 - **Misattribution**: a client that forges records in its own statement text can, if it guesses the right header token, attach its real read to another principal. The read stays reported with its objects and row count ([05-security.md](05-security.md#firebird-audit-trace-log)).
 - **Volume**: `records fetched` counts rows, not blob bytes, so a few rows of large blobs do not raise `volume.large_result`.
+- **Unknown names**: names the catalog does not know count as dependent only where an object is named (relations, routines, block and routine-name lines); elsewhere in a text they do not mark the read.
+- **Tested by unit tests only** (R41 item 9): block-less `ON CONNECT` and `ON TRANSACTION START` triggers, a failed call of a dependent routine, an early-ended group, and the `NONE` and `WIN1252` attachment character sets.
+- **Database impact under load is not measured yet** (P10-D: measurements 3l, 3m and 8g).
 
 ## Known export signatures
 | Tool | Observable signature | Engine |
