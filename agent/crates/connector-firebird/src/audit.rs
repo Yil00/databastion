@@ -695,26 +695,8 @@ pub(crate) async fn stream(
         {
             machine.start_time_changed();
         }
-        let (r, m, out, polled) = tokio::task::spawn_blocking(move || {
-            let mut m = machine;
-            let mut r = runner;
-            let mut out = Vec::new();
-            let cats_ref: Vec<&dyn Catalog> = cats.iter().map(|c| c as &dyn Catalog).collect();
-            let polled = r.poll(&mut m, &cats_ref, &mut out);
-            (r, (m, cats), out, polled)
-        })
-        .await
-        .map_err(|e| {
-            // A panic of the blocking task is resumed (re-review L-D).
-            let _ = databastion_core::resume_panic(e);
-            ConnectorError::Target {
-                engine: databastion_core::Engine::Firebird,
-                code: FailureCode::Internal,
-                engine_code: None,
-            }
-        })?;
-        runner = r;
-        (machine, cats) = m;
+        let polled;
+        (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, sink).await?;
         let now = SystemTime::now();
         // Proofs 8 and 9 from this stream's deltas (review L2: a restarted
         // stream's counters start again at 0), and the gaps of proof 8
@@ -740,9 +722,6 @@ pub(crate) async fn stream(
                 continue;
             }
         };
-        for (_db, ev) in out {
-            sink.submit(ev).await?;
-        }
         let held = runner.held(&machine);
         // Where the next stream must resume (review M4).
         let resume = held
@@ -770,6 +749,43 @@ pub(crate) async fn stream(
             tokio::time::sleep(cfg.poll_interval()).await;
         }
     }
+}
+
+/// One read cycle of the stream: the runner's poll on a blocking thread,
+/// then every event it produced handed to the sink, and only then the
+/// poll's result. The events go first also when the poll failed: a
+/// rotation whose new file cannot be opened ends what the old file held
+/// (its last record, pending fold groups) into the events, then fails
+/// (security review H1 of #392); a caller that met the error first would
+/// drop them.
+async fn poll_and_deliver(
+    runner: Runner,
+    machine: Machine,
+    cats: Vec<Classes>,
+    sink: &EventSink,
+) -> Result<(Runner, Machine, Vec<Classes>, Result<bool, TailError>), ConnectorError> {
+    let (r, m, cats, out, polled) = tokio::task::spawn_blocking(move || {
+        let mut m = machine;
+        let mut r = runner;
+        let mut out = Vec::new();
+        let cats_ref: Vec<&dyn Catalog> = cats.iter().map(|c| c as &dyn Catalog).collect();
+        let polled = r.poll(&mut m, &cats_ref, &mut out);
+        (r, m, cats, out, polled)
+    })
+    .await
+    .map_err(|e| {
+        // A panic of the blocking task is resumed (re-review L-D).
+        let _ = databastion_core::resume_panic(e);
+        ConnectorError::Target {
+            engine: databastion_core::Engine::Firebird,
+            code: FailureCode::Internal,
+            engine_code: None,
+        }
+    })?;
+    for (_db, ev) in out {
+        sink.submit(ev).await?;
+    }
+    Ok((r, m, cats, polled))
 }
 
 /// The merged early-check requests of one stream (R11 8d): a request is
@@ -1412,6 +1428,57 @@ mod tests {
             assert!(r.held(&m).is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Security review H1 of #392, the live case: the last record is
+    /// held, the server rotates into a file the agent cannot open, and
+    /// the poll that meets the rotation reads nothing and fails. The held
+    /// record, ended into the poll's events, reaches the sink before the
+    /// stream handles the error.
+    #[tokio::test]
+    async fn the_held_record_reaches_the_sink_when_the_rotating_poll_fails() {
+        use crate::stream_tests::{APP, attach, select};
+        let dir = temp("deliver");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let store = databastion_core::audit::CursorStore::new(&dir, "t", "fb");
+        let runner = runner(&log, store);
+        let machine = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let cats = vec![Classes::default()];
+        let (sink, mut rx) = EventSink::channel(64);
+        let (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, &sink)
+            .await
+            .unwrap();
+        assert!(!polled.unwrap());
+        let a = "24:0x7f0000000100";
+        append(
+            &log,
+            &format!(
+                "{}{}",
+                attach(a, 3, APP),
+                select(a, 3, 5, APP, "PAYROLL", 2)
+            ),
+        );
+        let (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, &sink)
+            .await
+            .unwrap();
+        polled.unwrap();
+        assert!(runner.record_start.is_some(), "the select is held");
+        assert!(rx.try_recv().is_err());
+        std::fs::rename(&log, dir.join("audit.1.log")).unwrap();
+        let elsewhere = dir.join("other");
+        std::fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        let (_, _, _, polled) = poll_and_deliver(runner, machine, cats, &sink)
+            .await
+            .unwrap();
+        assert!(polled.is_err(), "the rotating poll fails");
+        let mut objects = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            objects.extend(ev.objects().iter().map(|o| o.object().as_str().to_owned()));
+        }
+        assert!(objects.contains(&"PAYROLL".to_owned()), "{objects:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Security review L2 of #392: a line skipped in a file of which no
