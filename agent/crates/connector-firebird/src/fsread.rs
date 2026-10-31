@@ -296,8 +296,9 @@ pub(crate) struct Place<'a> {
 
 /// Who can read `path` (R4, proof 1): `Ok` when no uid other than root,
 /// the server's and the agent's can read the log, the files rotated from
-/// it (`<name>.*` and `<name>-*` next to it: the files the server may
-/// still write and the ones the agent may still be reading), or its
+/// it (next to it, named as the server or an external rotation names
+/// them, [`rotated_name`]: the files the server may still write and the
+/// ones the agent may still be reading), or its
 /// directory, nor will the next log file through the directory's
 /// default ACL; otherwise the reason (local detail only). `server`: the
 /// server's uid and gid as `/proc` shows them, `peer`: the declared
@@ -401,10 +402,7 @@ pub(crate) fn readers_with(
             return Err("log_directory_unreadable");
         };
         let f = e.file_name();
-        let rotated = f
-            .as_encoded_bytes()
-            .strip_prefix(name.as_bytes())
-            .is_some_and(|rest| rest.starts_with(b".") || rest.starts_with(b"-"));
+        let rotated = rotated_name(name, f.as_encoded_bytes());
         // Security review N5: a rotated name that is not UTF-8 counts as
         // open rather than being skipped.
         if rotated && (f.to_str().is_none() || check(&dir.join(&f), 0o4)) {
@@ -412,6 +410,40 @@ pub(crate) fn readers_with(
         }
     }
     Ok(())
+}
+
+/// Whether `f`, a name in the log's directory, is a file rotated from the
+/// log `name` (R4): the server's own rotated names, and the names an
+/// external rotation gives.
+///
+/// - The server (`PluginLogWriter::write`, `max_log_size`, the same in
+///   4.0.7 and 5.0.4) renames the log at the last `.` of its path:
+///   `<stem>.<YYYY-MM-DD>T<hh-mm-ss>.<ffff>.<ext>` for `<stem>.<ext>`
+///   (`audit.log` gives `audit.2026-10-31T10-00-00.1234.log`). Matched as
+///   any name `<stem>.*.<ext>` other than the log (wider than the
+///   server's, so that nothing it writes is missed). For a file name
+///   without a `.`, the target is a path under a directory that does not
+///   exist (cut at a `.` of a directory of its path, or, with no `.` at
+///   all, `<path>.<timestamp>.<path>`, read from the sources): the
+///   server's `rename` fails with `ENOENT`, which it ignores, and the log
+///   is never rotated; nothing to match here.
+/// - An external rotation (`logrotate` and the like): `<name>.*` and
+///   `<name>-*`.
+fn rotated_name(name: &str, f: &[u8]) -> bool {
+    let name = name.as_bytes();
+    if f == name {
+        return false;
+    }
+    if f.strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with(b".") || rest.starts_with(b"-"))
+    {
+        return true;
+    }
+    let Some(dot) = name.iter().rposition(|b| *b == b'.') else {
+        return false;
+    };
+    let (stem, ext) = (&name[..=dot], &name[dot..]);
+    f.len() > stem.len() + ext.len() && f.starts_with(stem) && f.ends_with(ext)
 }
 
 /// Whether each group that grants read is open, computed once per gid
@@ -800,6 +832,76 @@ mod tests {
             Err("log_directory_is_a_symlink")
         );
         let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4: the server's rotated names (`audit.<timestamp>.log` for
+    /// `audit.log`, measured on 4.0.7 and 5.0.4) and an external
+    /// rotation's are rotated files; other names are not.
+    #[test]
+    fn rotated_names_are_the_servers_and_external_ones() {
+        for (name, f, rotated) in [
+            ("audit.log", "audit.2026-10-31T10-00-00.1234.log", true),
+            ("audit.log", "audit.2026-10-31T10-00-00.0001.log", true),
+            ("audit.log", "audit.log.1", true),
+            ("audit.log", "audit.log-20261031", true),
+            ("audit.log", "audit.log.2026-10-31T10-00-00.1234.gz", true),
+            ("audit.log", "audit.x.log", true),
+            ("audit.log", "audit.log", false),
+            ("audit.log", "audit.log2", false),
+            ("audit.log", "other.2026-10-31T10-00-00.1234.log", false),
+            ("audit.log", "audit.2026-10-31T10-00-00.1234.txt", false),
+            ("audit.log", "audit..log", false),
+            (
+                "fb.trace.log",
+                "fb.trace.2026-10-31T10-00-00.1234.log",
+                true,
+            ),
+            (
+                "fb.trace.log",
+                "fb.2026-10-31T10-00-00.1234.trace.log",
+                false,
+            ),
+            ("trace", "trace.2026-10-31T10-00-00.1234", true),
+            ("trace", "trace-1", true),
+            ("trace", "tracex", false),
+            (".log", ".2026-10-31T10-00-00.1234.log", true),
+        ] {
+            assert_eq!(rotated_name(name, f.as_bytes()), rotated, "{name} {f}");
+        }
+        // A name that is not UTF-8 with the server's shape is rotated.
+        assert!(rotated_name("audit.log", b"audit.\xff.log"));
+    }
+
+    /// R4 on real files: a file rotated by the server (its name) and
+    /// readable by others withholds Partial; 0600, it does not.
+    #[test]
+    fn a_server_rotated_file_readable_by_others_is_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fb-srvrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"x").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let id = identity("root:x:0:0::/:/bin/sh\n", "root:x:0:\n");
+        let rotated = dir.join("audit.2026-10-31T10-00-00.1234.log");
+        std::fs::write(&rotated, b"y").unwrap();
+        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(readers_with(&log, me, None, me, &id), Ok(()));
+        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            readers_with(&log, me, None, me, &id),
+            Err("rotated_log_readable_by_others")
+        );
+        // An unrelated file next to the log is not examined.
+        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, b"z").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(readers_with(&log, me, None, me, &id), Ok(()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
