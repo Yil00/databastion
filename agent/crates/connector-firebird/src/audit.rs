@@ -674,6 +674,7 @@ pub(crate) async fn stream(
         reset: false,
         last_end: None,
         lost_in: None,
+        ended: None,
     };
     loop {
         // A new check: new names, classes, run.
@@ -872,6 +873,8 @@ struct Runner {
     /// A line the tailer skipped for its size at the end of a poll, in a
     /// file not read yet: the first record of that file lost a line.
     lost_in: Option<(u64, u64)>,
+    /// The last file whose held records were ended ([`Self::end_file`]).
+    ended: Option<(u64, u64)>,
 }
 
 impl Runner {
@@ -884,7 +887,18 @@ impl Runner {
         if cats.is_empty() {
             return Ok(false);
         }
-        let polled = self.tailer.poll()?;
+        let polled = match self.tailer.poll() {
+            Ok(p) => p,
+            Err(e) => {
+                // A rotation whose new file cannot be opened still ended
+                // the old one (security review M1 of #392).
+                let now = Instant::now();
+                if let Some(f) = self.tailer.take_ended() {
+                    self.end_file(f, m, now, cats, out);
+                }
+                return Err(e);
+            }
+        };
         // R39 (a): the re-read region (known once the file is open) is
         // emitted again, not suppressed; its end is kept for the count.
         if let Some(r) = self.tailer.take_replay() {
@@ -918,22 +932,18 @@ impl Runner {
             }
             self.last_end = Some((pos.file, pos.end));
             if self.file != Some(pos.file) {
-                if self.file.is_some() {
-                    // A rotation (review M3): the old file ended. Its last
-                    // record is complete; what it still holds (pending fold
-                    // groups, held records) ends now, as R25 item 3 says,
-                    // since a held position in a rotated file cannot be
-                    // re-read after a restart.
-                    let done = self.asm.flush();
-                    let rs = self.record_start.unwrap_or(0);
-                    self.hand(m, done, rs, now, cats, out);
-                    self.record_start = None;
-                    m.end_all(now, cats, out);
+                if let Some(old) = self.file {
+                    // A rotation (review M3): the old file ended.
+                    self.end_file(old, m, now, cats, out);
                 }
                 self.file = Some(pos.file);
                 m.set_file(pos.file);
-                if self.lost_in.take() == Some(pos.file) {
-                    self.asm.lose_line();
+                match self.lost_in.take() {
+                    Some(f) if f == pos.file => self.asm.lose_line(),
+                    // A line skipped in a file of which no line was read
+                    // (security review L2 of #392): a record lost whole.
+                    Some(_) => m.unreadable(now, cats, out),
+                    None => {}
                 }
             }
             if skipped_at(k).any(|f| Some(f) != before) {
@@ -960,6 +970,12 @@ impl Runner {
                 self.lost_in = Some(f);
             }
         }
+        // The file being read was ended by a rotation whose new file has
+        // given no line yet (or cannot be opened): what it holds ends now
+        // (security review M1 of #392).
+        if let Some(f) = self.tailer.take_ended() {
+            self.end_file(f, m, now, cats, out);
+        }
         // A stable end of file: the record in progress is complete.
         if !polled.more && now.duration_since(self.last_growth) >= STABLE_EOF {
             let done = self.asm.flush();
@@ -969,6 +985,31 @@ impl Runner {
         }
         m.expire(now, cats, out);
         Ok(polled.more)
+    }
+
+    /// The file `f` ended (rotated away, read to its end): if it is the
+    /// file being read, its last record is complete and what it still
+    /// holds (pending fold groups, held records) ends now, as R25 item 3
+    /// says, since a held position in a rotated file cannot be re-read
+    /// after a restart. Once per file: the next file's first line finds
+    /// nothing left.
+    fn end_file(
+        &mut self,
+        f: (u64, u64),
+        m: &mut Machine,
+        now: Instant,
+        cats: &[&dyn Catalog],
+        out: &mut Vec<crate::stream::Emitted>,
+    ) {
+        if self.file != Some(f) || self.ended == Some(f) {
+            return;
+        }
+        let done = self.asm.flush();
+        let rs = self.record_start.unwrap_or(0);
+        self.hand(m, done, rs, now, cats, out);
+        self.record_start = None;
+        m.end_all(now, cats, out);
+        self.ended = Some(f);
     }
 
     /// The position the cursor may be saved at: the first record of the
@@ -1064,6 +1105,7 @@ mod tests {
             reset: false,
             last_end: None,
             lost_in: None,
+            ended: None,
         }
     }
 
@@ -1320,6 +1362,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Security review M1 of #392: a rotation whose new file cannot be
+    /// opened ends the old file all the same: the record held at its end
+    /// is handed on and nothing of it stays held (lost at a restart
+    /// otherwise), whether the poll that met the rotation read lines of
+    /// the old file (handed on) or nothing (the poll fails).
+    #[test]
+    fn a_rotation_to_an_unopenable_file_ends_what_the_old_file_holds() {
+        use crate::stream_tests::{APP, attach, select};
+        for read_in_the_rotating_poll in [true, false] {
+            let dir = temp(&format!("rotfail-{read_in_the_rotating_poll}"));
+            let log = dir.join("audit.log");
+            std::fs::write(&log, b"").unwrap();
+            let store = databastion_core::audit::CursorStore::new(&dir, "t", "fb");
+            let mut r = runner(&log, store);
+            let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+            let classes = Classes::default();
+            let cats: Vec<&dyn Catalog> = vec![&classes];
+            let mut out = Vec::new();
+            assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+            let a = "24:0x7f0000000100";
+            append(
+                &log,
+                &format!(
+                    "{}{}",
+                    attach(a, 3, APP),
+                    select(a, 3, 5, APP, "CUSTOMERS", 2)
+                ),
+            );
+            if !read_in_the_rotating_poll {
+                while r.poll(&mut m, &cats, &mut out).unwrap() {}
+                // The select is the record in progress: held.
+                assert!(r.record_start.is_some());
+                assert!(!objects(&out).contains(&"CUSTOMERS".to_owned()));
+            }
+            std::fs::rename(&log, dir.join("audit.1.log")).unwrap();
+            let elsewhere = dir.join("other");
+            std::fs::write(&elsewhere, b"").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+            for _ in 0..3 {
+                let _ = r.poll(&mut m, &cats, &mut out);
+            }
+            assert!(
+                objects(&out).contains(&"CUSTOMERS".to_owned()),
+                "{read_in_the_rotating_poll}: {:?}",
+                objects(&out)
+            );
+            assert!(r.record_start.is_none());
+            assert!(r.held(&m).is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Security review L2 of #392: a line skipped in a file of which no
+    /// line was read (it rotated away first) is a record lost whole:
+    /// ambiguous, counted oversized.
+    #[test]
+    fn a_line_skipped_in_a_file_never_read_is_ambiguous() {
+        use crate::stream_tests::{APP, attach};
+        let dir = temp("lostfile");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+        append(&log, &attach("24:0x7f0000000100", 3, APP));
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        // B: one line past the bound only, read in the poll that opens it.
+        std::fs::rename(&log, dir.join("audit.1.log")).unwrap();
+        std::fs::write(&log, format!("{}\n", "x".repeat(1_100_000))).unwrap();
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert_eq!(r.tailer.oversized, 1);
+        // C before any line of B.
+        std::fs::rename(&log, dir.join("audit.2.log")).unwrap();
+        std::fs::write(&log, attach("24:0x7f0000000300", 5, APP)).unwrap();
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert_eq!(m.counts.oversized, 1, "{:?}", m.counts);
+        assert!(out.iter().any(|(_, e)| e.always_report()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A statement text line longer than the tailer's line bound (only
     /// possible with `max_sql_length` above 1 MiB, which `check()` no
     /// longer proves Partial) is skipped by the tailer; the record it
@@ -1566,6 +1691,7 @@ mod tests {
             reset: false,
             last_end: None,
             lost_in: None,
+            ended: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());
