@@ -938,7 +938,15 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   uid, a host user's (`agent-uid`: its own enrollment, its own state and secrets volumes owned by
   that uid, never given Audit), runs after the I2 checks, its notes being its own: exactly
   `audit.log_not_readable`, `audit.log_readable_by_others` and `audit.partial_pending_first_record`
-  (that uid cannot read the log), with `uid_collision`. Last, the console side again (a second
+  (that uid cannot read the log), with `uid_collision`. Then an unquiesced restart, the case
+  the steps avoid: the main agent is killed (`stop -t 0`) right after a check, before its stream
+  reads that check's records, and started again. It records the ADR-0060 R39 (a) residual (until
+  the parser-checkpoint follow-up lot: a restart can withhold Partial for up to 24 h and report the
+  agent's own reads) and requires its fail-closed outcome whatever the timing: either clean
+  (Partial, nothing withholding it) or not Partial with `audit.log_records_ambiguous` as the only
+  withholding note; the readers check holding; and every event received since the kill naming
+  `DATABASTION_AGENT`, never another principal or a fingerprint. Which outcome happened, the
+  ambiguous-record count and the own-account events are logged. Last, the console side again (a second
   database dump, the pages, the main agent's state), the uid step's agent state and every log: no
   ground-truth value, marker or secret.
 

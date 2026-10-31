@@ -939,6 +939,69 @@ step uid-collision agent-uid "$AGENT2_ID" agent-uid.yaml ro uid_collision \
 dump_agent
 phase_done uid-step
 
+# --------------------------------------------------------------------------- unquiesced restart
+# The restart the negative steps avoid (quiesce_agent), tested for its fail-closed outcome, after
+# the gate's checks (re-review of #394): the main agent is killed (`stop -t 0`) right after a check,
+# before its stream can read that check's records, then started again. The new process reads them
+# with no state (ADR-0060 R39 (a), an accepted residual until the parser-checkpoint follow-up lot):
+# a record of an attachment it never saw open is ambiguous, others come out as reads by the agent's
+# account. Whatever the timing, one of two outcomes is required, and which one is logged: clean
+# (Partial, nothing withholding it), or not Partial with audit.log_records_ambiguous as the only
+# withholding note. Either way the
+# readers check holds, and every event received since the kill names DATABASTION_AGENT, never
+# another principal nor a fingerprint (nobody else uses the server meanwhile). The scans below
+# cover its logs.
+log "unquiesced restart: the main agent killed right after a check, then started again"
+timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
+STEP=restart-killed AGENT_SVC=agent
+hostid_yml agent ro
+export E2E_FB_AGENT_CONFIG=agent.yaml
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps agent >/dev/null
+deadline=$(( $(date +%s) + 120 ))
+until [ -n "$(last_checked agent)" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "unquiesced restart: no check within 120 s of the start"
+  sleep 1
+done
+T_KILL="$(console_sql "SELECT now()")"
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" stop -t 0 agent >/dev/null 2>&1 || true
+dump_agent
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" rm -f agent >/dev/null 2>&1 || true
+STEP=restart-after
+STEP_T="$(console_sql "SELECT now()")"
+T_RESTART="$(date +%s)"
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps agent >/dev/null
+layout "$(compose ps -q agent)" "$AGENT_UID"
+while :; do
+  st="$(status_after "$AGENT_ID" "$STEP_T")"
+  [ "${st%%|*}" = partial ] && break
+  [ "$(date +%s)" -lt $(( T_RESTART + PARTIAL_WINDOW_S )) ] || break
+  sleep 3
+done
+[ -n "$st" ] || fail "unquiesced restart: no heartbeat within ${PARTIAL_WINDOW_S} s"
+why="$(readers_detail "$(last_checked agent)")"
+[ "$why" = holds ] || fail "unquiesced restart: the readers check fails ('${why}')"
+amb="$(console_sql "SELECT coalesce((SELECT n->>'count' FROM agent_targets t, jsonb_array_elements(coalesce(t.notes, '[]'::jsonb)) n
+    WHERE t.agent_id = '${AGENT_ID}' AND t.target_id = '${TARGET}' AND n->>'code' = 'audit.log_records_ambiguous'), '0')")"
+got="$(withholding "${st##*|}")"
+case "$got" in
+  audit.log_records_ambiguous)
+    [ "${st%%|*}" != partial ] || fail "unquiesced restart: Partial with audit.log_records_ambiguous"
+    outcome="fail-closed: level ${st%%|*} with audit.log_records_ambiguous (${amb} record(s))" ;;
+  "")
+    [ "${st%%|*}" = partial ] || fail "unquiesced restart: nothing withholds Partial, yet the level is ${st%%|*} after ${PARTIAL_WINDOW_S} s"
+    outcome="clean: Partial, no ambiguous record" ;;
+  *) fail "unquiesced restart: '${got}' withholds Partial; only audit.log_records_ambiguous may (R39 (a))" ;;
+esac
+sleep 15  # the events of the reads after the restart, sent and evaluated
+own="$(console_sql "SELECT concat_ws(',', count(*) FILTER (WHERE db_user = 'DATABASTION_AGENT'),
+    count(*) FILTER (WHERE db_user IS DISTINCT FROM 'DATABASTION_AGENT' OR db_user_fingerprint IS NOT NULL))
+  FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${TARGET}' AND received_at > '${T_KILL}'::timestamptz")"
+IFS=, read -r n_own n_other <<<"$own"
+[ "$n_other" = 0 ] || fail "unquiesced restart: ${n_other} event(s) since the kill name another principal or a fingerprint"
+log "unquiesced restart: ${outcome}; ${n_own} event(s) of the agent's own account since the kill, none of another principal (R39 (a) residual recorded)"
+dump_agent
+phase_done unquiesced-restart
+
 # After the steps (review L2): the console side again (a second database dump, the pages, the main
 # agent's state), the uid step's agent state and every log: no ground-truth value, marker or secret.
 for f in "$E2E_LOG_DIR"/agent-*.log; do [ -s "$f" ] || fail "$(basename "$f") is empty"; done
