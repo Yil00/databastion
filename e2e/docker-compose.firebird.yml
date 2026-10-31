@@ -14,6 +14,9 @@
 #                        loopback only, WireCrypt Required, ChaCha, Srp256, the system audit trace
 #                        of fbtrace.conf meeting the Partial proofs, the seed as `crm`), plus the
 #                        e2e test accounts (target-initdb/firebird-20-clients.sh, first start only).
+#                        Its firebird.conf and fbtrace.conf are root-owned copies of the dev files
+#                        ($E2E_WORK_DIR/firebird, made by firebird.sh before the start), mounted
+#                        read-only into the server and every agent alike.
 #                        Its passwords come from Docker secrets, exported by the wrapper below for
 #                        the dev entrypoint only (never in the container's environment, so never in
 #                        `docker inspect`; the entrypoint unsets them before the server starts). On
@@ -76,8 +79,8 @@ services:
       - firebird-root:/opt/firebird
       - firebird-data:/var/lib/firebird/data
       - firebird-audit:/var/lib/firebird/audit
-      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
-      - ../dev/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
       - ../dev/firebird/entrypoint.sh:/databastion/entrypoint.sh:ro
       - ../dev/firebird/seed.sh:/databastion/seed.sh:ro
       - ../dev/seed/out/firebird.sql:/databastion/seed/firebird.sql:ro
@@ -109,8 +112,8 @@ services:
       # The Firebird root, its firebird.conf, the trace configuration and the log directory,
       # read-only at the server's paths (R50 item 3); never the data volume.
       - firebird-root:/opt/firebird:ro
-      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
-      - ../dev/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
       - firebird-audit:/var/lib/firebird/audit:ro
     depends_on: !override
       proxy:
@@ -145,8 +148,8 @@ services:
       # The Firebird root, its firebird.conf, the trace configuration and the log directory,
       # read-only at the server's paths (R50 item 3); never the data volume.
       - firebird-root:/opt/firebird:ro
-      - ../dev/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
-      - ../dev/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
       - firebird-audit:/var/lib/firebird/audit:ro
 
   agent-files:

@@ -868,6 +868,11 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   127.0.0.11 in every user network) and owned by uid 84 or 0, never the agent's or a host user's;
   and, as uid 10001 with the root mounted as the agent sees it (`firebird-root-probe`), that the
   security database and the image's `SYSDBA.password` are not readable.
+- **The configuration files**: `firebird.conf` and `fbtrace.conf` are root-owned copies of the dev
+  files (`$E2E_WORK_DIR/firebird`, made before the server starts), mounted read-only into the
+  server and every agent. The checkout's own files belong to the user running the job (uid 1001 on
+  the runner), and an agent running as that uid refuses a file it owns (ADR-0043), which would add
+  `audit.trace_config_not_evaluated` to the collision step only.
 - **The agent's container** (R52 item 2, R50): `network_mode` and `pid: service:firebird`, every
   capability dropped (as the server's: no container of that namespace keeps `NET_RAW` or
   `NET_ADMIN`; checked with `docker inspect` at every start), read-only root file system, no
@@ -906,29 +911,36 @@ for each step (`$E2E_WORK_DIR/hostid.yml`) over this stack (Compose project
   value (the e-mail-named table included), literal or marker in the console database, the pages,
   the agent's state or any log (whole, windows, encoded forms), no path of the target's files in the
   agent's log, and the secret hygiene of the other runs.
-- **Negative steps** (R52 item 2, security review L7), after the gate's checks, on the real kernel:
-  a control first (the main agent's readers check holds, its status has no
-  `audit.log_readable_by_others`), then each step replaces the agent's container and watches it for
-  the main agent's measured time to Partial plus 60 s: the level is never `partial` in that window,
-  the local reason stays the expected one, and at its end the notes that withhold Partial are
-  `audit.log_readable_by_others` plus at most the baseline: what withholds Partial for the main
-  agent just before the steps (after the traffic, `audit.log_records_ambiguous`; a restarted agent
-  may or may not report it again, R39 (a)). The steps: without `host_identity`
-  (`agent_in_container`); `host_identity.passwd` naming the agent image's own `/etc/passwd`, not a
-  mount (`host_identity_refused (passwd: mount)`); a passwd file mounted read-write (the same
-  reason); the agent run as the collision uid, a host user's (`agent-uid`: its own enrollment, its
-  own state and secrets volumes owned by that uid, `uid_collision`; that uid cannot read the log,
-  so `audit.log_not_readable` and `audit.partial_pending_first_record` are expected too). The
-  read-write step binds a root-owned copy of the host's passwd file (`install -o 0 -g 0 -m 0644`,
-  with `sudo -n` in CI) rather than the host's own file read-write, which R52 item 2's text names:
-  the refused rule (`mount`) is the same (for docs-keeper: an ADR-0060 note). Then a positive
-  control: the main agent with its own configuration and the read-only host files again; within
-  the same window the readers check holds again, `audit.log_readable_by_others` is gone, and
-  either the target is Partial or only notes of the baseline withhold it (Partial is required
-  whenever nothing does). Last, the console side again (a second database dump, the pages, the main
-  agent's state), the uid step's agent state and every log: no ground-truth value, marker or
-  secret.
-
+- **Negative steps** (R52 item 2, security review L7), on the real kernel, right after the main
+  agent first reaches Partial and the "no event before the first client statement" check, before
+  any client traffic: the gate's Partial is proven there. The traffic that follows (its DCL, PSQL,
+  `EXECUTE STATEMENT` and cut records are ambiguous) leaves the target Limited for 24 h, as ADR-0060
+  expects (`audit.log_records_ambiguous`), which would make a "never Partial" check after it prove
+  nothing. A control first: the main agent's readers check holds, it is Partial and nothing
+  withholds it (the run fails otherwise). Then each step replaces the agent's container (the same
+  identity, uid 10001), restarting it between two checks (after a "Firebird checked" line, 25 s,
+  two Audit poll intervals plus a margin, then a graceful stop): an agent stopped before its stream
+  read its last check's records leaves them to the next process, which reads them with no state
+  (ADR-0060 R39 (a), an accepted residual: a `TRACE_FINI` of an attachment it never saw open is
+  ambiguous, and other records come out as reads by the agent's account), and that would decide
+  the notes, not the readers check. It watches the new container for the main agent's measured time to Partial plus 60 s: the
+  level is never `partial` in that window, the local reason stays the expected one, and at its end
+  the notes that withhold Partial are exactly `audit.log_readable_by_others`. The steps: without
+  `host_identity` (`agent_in_container`); `host_identity.passwd` naming the agent image's own
+  `/etc/passwd`, not a mount (`host_identity_refused (passwd: mount)`); a passwd file mounted
+  read-write (the same reason). The read-write step binds a root-owned copy of the host's passwd
+  file (`install -o 0 -g 0 -m 0644`, with `sudo -n` in CI) rather than the host's own file
+  read-write, which R52 item 2's text names: the refused rule (`mount`) is the same (for
+  docs-keeper: an ADR-0060 note). Then a positive control: the main agent with its own
+  configuration and the read-only host files again must be Partial, with nothing withholding it,
+  within the same window, and still no event (the restarts surface none of the agents' own
+  statements); that agent runs the traffic phase. The fourth step, the agent run as the collision
+  uid, a host user's (`agent-uid`: its own enrollment, its own state and secrets volumes owned by
+  that uid, never given Audit), runs after the I2 checks, its notes being its own: exactly
+  `audit.log_not_readable`, `audit.log_readable_by_others` and `audit.partial_pending_first_record`
+  (that uid cannot read the log), with `uid_collision`. Last, the console side again (a second
+  database dump, the pages, the main agent's state), the uid step's agent state and every log: no
+  ground-truth value, marker or secret.
 
 The CI job is `e2e-firebird` in [`ci.yml`](../.github/workflows/ci.yml) (50 min budget,
 `firebird.sh` at most 2700 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`,

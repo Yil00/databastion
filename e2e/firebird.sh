@@ -159,12 +159,26 @@ host_fingerprints >"$HOSTID_FP"
 PASSWD_COPY="$E2E_WORK_DIR/hostcopy/passwd"
 mkdir -p "$(dirname "$PASSWD_COPY")"
 chmod 0755 "$(dirname "$PASSWD_COPY")"
-if [ "$(id -u)" = 0 ]; then
-  install -o 0 -g 0 -m 0644 /etc/passwd "$PASSWD_COPY"
-else
-  timeout 30 sudo -n install -o 0 -g 0 -m 0644 /etc/passwd "$PASSWD_COPY" \
-    || fail "cannot make the root-owned passwd copy of the read-write step (sudo -n)"
-fi
+# root_copy SOURCE DEST: a root-owned 0644 copy (sudo -n when not root, as in CI).
+root_copy() {
+  if [ "$(id -u)" = 0 ]; then
+    install -o 0 -g 0 -m 0644 "$1" "$2"
+  else
+    timeout 30 sudo -n install -o 0 -g 0 -m 0644 "$1" "$2"
+  fi
+}
+root_copy /etc/passwd "$PASSWD_COPY" || fail "cannot make the root-owned passwd copy of the read-write step"
+# The server's firebird.conf and trace configuration, mounted read-only into the server and every
+# agent at the same paths: root-owned copies of the dev files, made before the server starts (their
+# change time must precede its start, proof 2). Not the checkout's files: those are owned by the
+# user running the job (uid 1001 on the runner), and an agent running as that uid (the collision
+# step) refuses a file it owns (ADR-0043: writable by the agent), which would add
+# audit.trace_config_not_evaluated to that step only.
+mkdir -p "$E2E_WORK_DIR/firebird"
+chmod 0755 "$E2E_WORK_DIR/firebird"
+for f in firebird.conf fbtrace.conf; do
+  root_copy "$HERE/../dev/firebird/$f" "$E2E_WORK_DIR/firebird/$f" || fail "cannot make the root-owned copy of $f"
+done
 log "identity files mounted: ${HOST_FILES[*]}"
 kernel="$(uname -r)"
 IFS=. read -r kmaj kmin _ <<<"$kernel"
@@ -326,17 +340,25 @@ readers_detail() {
   d="$(jq -r '.fields.detail' <<<"$1" | tr ';' '\n' | sed -n 's/^ *readers check: //p' | head -n 1)"
   printf '%s' "${d:-holds}"
 }
-# ambiguous_count AGENT_ID TIME: the count of audit.log_records_ambiguous in the target's status
-# received after TIME (0 without the note).
-ambiguous_count() {
-  console_sql "SELECT coalesce((SELECT (n->>'count') FROM agent_targets t, jsonb_array_elements(coalesce(t.notes, '[]'::jsonb)) n
-      WHERE t.agent_id = '$1' AND t.target_id = '${TARGET}' AND t.last_reported_at > '$2'::timestamptz
-        AND n->>'code' = 'audit.log_records_ambiguous'), '0')"
-}
-# within SET ALLOWED: every note of SET is in ALLOWED (space-separated lists).
-within() {
-  local c
-  for c in $1; do [[ " $2 " == *" $c "* ]] || return 1; done
+# quiesce_agent SERVICE: stops the agent of SERVICE between two checks, the way an operator restarts
+# one: after a new "Firebird checked" line, two Audit poll intervals and a margin (25 s; the
+# contract's default poll_interval_s is 10) for its stream to read that check's records, its last
+# TRACE_FINI included, then a graceful stop. An agent stopped in the middle of a check leaves records of its own attachments
+# that the next process reads with no state (ADR-0060 R39 (a), an accepted residual: reported as the
+# agent account's reads, or ambiguous); the negative steps test the readers check, not that.
+quiesce_agent() {
+  local n0 deadline
+  [ -n "$(compose --profile tools ps -q "$1")" ] || return 0
+  n0="$(timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color --no-log-prefix "$1" 2>/dev/null \
+    | grep -F '"Firebird checked"' | grep -cF "\"target_id\":\"${TARGET}\"" || true)"
+  deadline=$(( $(date +%s) + 120 ))
+  until [ "$(timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color --no-log-prefix "$1" 2>/dev/null \
+      | grep -F '"Firebird checked"' | grep -cF "\"target_id\":\"${TARGET}\"" || true)" -gt "$n0" ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "no new check of ${TARGET} by ${1} within 120 s before its restart"
+    sleep 2
+  done
+  sleep 25
+  timeout 60 docker compose "${COMPOSE_ARGS[@]}" --profile tools stop -t 30 "$1" >/dev/null 2>&1 || true
 }
 # withholding NOTES: the notes of NOTES that withhold Partial (FORBIDDEN_NOTES), sorted.
 withholding() {
@@ -541,6 +563,108 @@ if [ "$n" != 0 ]; then
 fi
 log "Audit: no event before the first client statement"
 phase_done partial
+
+# --------------------------------------------------------------------------- negative steps
+# R52 item 2 (security review L7), on the real kernel, with uid 10001, right after the main agent
+# first reached Partial and before any client traffic (re-review of #394): the traffic's DCL, PSQL
+# and EXECUTE STATEMENT records are ambiguous and leave the target Limited for 24 h, as ADR-0060
+# accepts, which would make "never Partial" prove nothing. Here nothing but the readers check can
+# withhold Partial: each step replaces the agent's container (the same identity), waits for a check
+# with the expected reason and a heartbeat after its start, watches the window, and requires the
+# withholding notes to be exactly audit.log_readable_by_others. Control first: the main agent's
+# readers check holds and nothing withholds Partial (an empty baseline, or the run fails).
+why="$(readers_detail "$(last_checked agent)")"
+[ "$why" = holds ] || fail "control: the main agent's readers check fails (${why}) before the negative steps"
+ctl="$(status_after "$AGENT_ID" "$STEP_T")"
+[ "${ctl%%|*}" = partial ] || fail "control: the main agent is not Partial before the negative steps (${ctl})"
+BASELINE="$(withholding "${ctl##*|}")"
+[ -z "$BASELINE" ] || fail "control: '${BASELINE}' withholds Partial before the negative steps: the steps would prove nothing"
+log "negative steps: control holds (readers check holds; Partial; nothing withholds it)"
+
+# step NAME SERVICE AGENT_ID CONFIG PASSWD_MODE REASON EXPECTED_WITHHOLDING: one negative step. It
+# watches at least the main agent's time to Partial plus a minute (PARTIAL_WINDOW_S, review M1): the
+# level is never partial in that window, and at its end the notes that withhold Partial are exactly
+# EXPECTED_WITHHOLDING.
+step() {
+  local name="$1" svc="$2" id="$3" config="$4" mode="$5" reason="$6" expected="$7" deadline line why st cid end t_start
+  quiesce_agent "$AGENT_SVC"
+  dump_agent
+  timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
+  STEP="$name" AGENT_SVC="$svc"
+  hostid_yml "$svc" "$mode"
+  export E2E_FB_AGENT_CONFIG="$config"
+  STEP_T="$(console_sql "SELECT now()")"
+  t_start="$(date +%s)"
+  timeout 60 docker compose "${COMPOSE_ARGS[@]}" --profile tools up -d --no-deps "$svc" >/dev/null
+  cid="$(compose --profile tools ps -q "$svc")"
+  [ -n "$cid" ] || fail "step ${name}: the agent's container did not start"
+  if [ "$svc" = agent-uid ]; then
+    layout "$cid" "$COLLISION_UID" "$([ "$mode" = rw ] && echo true || echo false)"
+  else
+    layout "$cid" "$AGENT_UID" "$([ "$mode" = rw ] && echo true || echo false)"
+  fi
+  deadline=$(( $(date +%s) + STEP_TIMEOUT_S ))
+  while :; do
+    line="$(last_checked "$svc")"
+    why="$(readers_detail "$line")"
+    st="$(status_after "$id" "$STEP_T")"
+    if [ -n "$line" ] && [ -n "$st" ] && [ "$why" != holds ]; then break; fi
+    [ "$(date +%s)" -lt "$deadline" ] \
+      || fail "step ${name}: no check with a failed readers check and a heartbeat within ${STEP_TIMEOUT_S} s (readers check '${why}', status '${st}')"
+    sleep 3
+  done
+  [ "$why" = "$reason" ] || fail "step ${name}: the readers check fails with '${why}', expected '${reason}'"
+  end=$(( t_start + PARTIAL_WINDOW_S ))
+  while :; do
+    st="$(status_after "$id" "$STEP_T")"
+    [ "${st%%|*}" != partial ] || fail "step ${name}: the target became Partial"
+    why="$(readers_detail "$(last_checked "$svc")")"
+    [ "$why" = "$reason" ] || fail "step ${name}: the readers check now gives '${why}', expected '${reason}'"
+    [ "$(date +%s)" -lt "$end" ] || break
+    sleep 3
+  done
+  [[ " ${st##*|} " == *" ${READERS_NOTE} "* ]] || fail "step ${name}: no ${READERS_NOTE} note (${st##*|})"
+  local got
+  got="$(withholding "${st##*|}")"
+  [ "$got" = "$expected" ] \
+    || fail "step ${name}: the notes withholding Partial are '${got}', expected exactly '${expected}'"
+  log "step ${name}: never partial over ${PARTIAL_WINDOW_S} s; level ${st%%|*}; withholding notes '${got}'; local reason '${why}'"
+  inspect_scan "step ${name}"
+}
+STEP=initial  # the main agent's log until now: agent-initial.log
+step no-host-identity agent "$AGENT_ID" agent-noid.yaml ro agent_in_container "$READERS_NOTE"
+step image-file agent "$AGENT_ID" agent-image.yaml ro "host_identity_refused (passwd: mount)" "$READERS_NOTE"
+step passwd-rw agent "$AGENT_ID" agent.yaml rw "host_identity_refused (passwd: mount)" "$READERS_NOTE"
+quiesce_agent agent
+dump_agent
+# Positive control of the steps (review M1): the main agent again, its own configuration and the
+# read-only host files: Partial again, with nothing withholding it, within the same window. It is the
+# agent of the traffic phase that follows.
+log "positive control: the main agent with host_identity again, Partial within ${PARTIAL_WINDOW_S} s"
+timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
+STEP=main AGENT_SVC=agent
+hostid_yml agent ro
+export E2E_FB_AGENT_CONFIG=agent.yaml
+STEP_T="$(console_sql "SELECT now()")"
+T_FINAL="$(date +%s)"
+timeout 60 docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps agent >/dev/null
+AGENT_CID="$(compose ps -q agent)"
+layout "$AGENT_CID" "$AGENT_UID"
+while :; do
+  st="$(status_after "$AGENT_ID" "$STEP_T")"
+  if [ "${st%%|*}" = partial ] && [ -z "$(withholding "${st##*|}")" ]; then break; fi
+  [ "$(date +%s)" -lt $(( T_FINAL + PARTIAL_WINDOW_S )) ] \
+    || fail "positive control: not Partial within ${PARTIAL_WINDOW_S} s of the restart (status '${st}', readers check '$(readers_detail "$(last_checked agent)")')"
+  sleep 3
+done
+why="$(readers_detail "$(last_checked agent)")"
+[ "$why" = holds ] || fail "positive control: Partial while the readers check reports '${why}'"
+log "positive control: Partial again $(( $(date +%s) - T_FINAL )) s after the restart"
+# The restarts surfaced none of the agent's own statements (they would be reported under its account).
+n="$(console_sql "SELECT count(*) FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${TARGET}'")"
+[ "$n" = 0 ] || fail "${TARGET}: $n event(s) after the negative steps and before any client statement: the agents' own activity surfaced"
+log "negative steps: still no event before the first client statement"
+phase_done negative-steps
 
 # --------------------------------------------------------------------------- client traffic
 # The exporter: a whole-table SELECT of each granted table (shape.full_table_read).
@@ -751,7 +875,9 @@ for f in agent.log web.log worker.log; do
 done
 # Decision 6 and R44 item 4: no path of the target's files reaches the agent's log.
 for needle in "$FB_DB" "$FB_LOG" "$HOST_DIR"; do
-  ! grep -qF "$needle" "$E2E_LOG_DIR/agent.log" || fail "the agent logged a path of the target's files"
+  for f in "$E2E_LOG_DIR"/agent.log "$E2E_LOG_DIR"/agent-*.log; do
+    ! grep -qF "$needle" "$f" || fail "the agent logged a path of the target's files ($(basename "$f"))"
+  done
 done
 D="$E2E_WORK_DIR/dump"
 collect_console_side "$D" "$TARGET"
@@ -780,81 +906,9 @@ rm -rf -- "$D"
 [ "$leaks" = 0 ] || fail "a secret or a marker reached the console, a log or the agent's state (names above)"
 phase_done i2
 
-# --------------------------------------------------------------------------- negative steps
-# R52 item 2 (security review L7), on the real kernel, after the gate's checks: each step replaces
-# the agent's container (the same identity, or for the uid step its own), waits for a "Firebird
-# checked" line with the expected reason and for a heartbeat after the step's start, and asserts:
-# not Partial, the note audit.log_readable_by_others. Control first: the main agent's last check
-# holds the readers check and its stored status has no such note.
-why="$(readers_detail "$(last_checked agent)")"
-[ "$why" = holds ] || fail "control: the main agent's readers check fails (${why}) before the negative steps"
-ctl="$(status_after "$AGENT_ID" "$STEP_T")"
-[[ " ${ctl##*|} " != *" ${READERS_NOTE} "* ]] || fail "control: the main agent's status already has ${READERS_NOTE}"
-# The baseline: what withholds Partial for the main agent now, after the traffic. Measured: no
-# ambiguous record when Partial was reached, then audit.log_records_ambiguous after the traffic
-# (6 records in a local run), which caps the level for 24 h, as ADR-0060 accepts. A step's
-# withholding notes must be the readers note plus a part of this baseline, nothing else. Whether a
-# restarted agent process reports audit.log_records_ambiguous again varies: none in the local runs,
-# some in CI on #394. Possible causes, both accepted residuals of R39 (a): the restarted process
-# re-reads from a held-back position with no state, or it reads records of the previous process's
-# attachments as another client's. Not confirmed from the CI log, which could not be fetched here.
-BASELINE="$(withholding "${ctl##*|}")"
-log "negative steps: control holds (readers check holds; level ${ctl%%|*}; no ${READERS_NOTE}; baseline withholding notes '${BASELINE:-none}'; ambiguous records $(ambiguous_count "$AGENT_ID" "$STEP_T"))"
-
-# step NAME SERVICE AGENT_ID CONFIG PASSWD_MODE REASON EXPECTED_WITHHOLDING: one negative step. It
-# watches at least the main agent's time to Partial plus a minute (PARTIAL_WINDOW_S, review M1): the
-# level is never partial in that window, and at its end the notes that withhold Partial hold every
-# note of EXPECTED_WITHHOLDING and nothing beyond it and the baseline (BASELINE, see the control).
-step() {
-  local name="$1" svc="$2" id="$3" config="$4" mode="$5" reason="$6" expected="$7" deadline line why st cid end t_start
-  dump_agent
-  timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
-  STEP="$name" AGENT_SVC="$svc"
-  hostid_yml "$svc" "$mode"
-  export E2E_FB_AGENT_CONFIG="$config"
-  STEP_T="$(console_sql "SELECT now()")"
-  t_start="$(date +%s)"
-  timeout 60 docker compose "${COMPOSE_ARGS[@]}" --profile tools up -d --no-deps "$svc" >/dev/null
-  cid="$(compose --profile tools ps -q "$svc")"
-  [ -n "$cid" ] || fail "step ${name}: the agent's container did not start"
-  if [ "$svc" = agent-uid ]; then
-    layout "$cid" "$COLLISION_UID" "$([ "$mode" = rw ] && echo true || echo false)"
-  else
-    layout "$cid" "$AGENT_UID" "$([ "$mode" = rw ] && echo true || echo false)"
-  fi
-  deadline=$(( $(date +%s) + STEP_TIMEOUT_S ))
-  while :; do
-    line="$(last_checked "$svc")"
-    why="$(readers_detail "$line")"
-    st="$(status_after "$id" "$STEP_T")"
-    if [ -n "$line" ] && [ -n "$st" ] && [ "$why" != holds ]; then break; fi
-    [ "$(date +%s)" -lt "$deadline" ] \
-      || fail "step ${name}: no check with a failed readers check and a heartbeat within ${STEP_TIMEOUT_S} s (readers check '${why}', status '${st}')"
-    sleep 3
-  done
-  [ "$why" = "$reason" ] || fail "step ${name}: the readers check fails with '${why}', expected '${reason}'"
-  end=$(( t_start + PARTIAL_WINDOW_S ))
-  while :; do
-    st="$(status_after "$id" "$STEP_T")"
-    [ "${st%%|*}" != partial ] || fail "step ${name}: the target became Partial"
-    why="$(readers_detail "$(last_checked "$svc")")"
-    [ "$why" = "$reason" ] || fail "step ${name}: the readers check now gives '${why}', expected '${reason}'"
-    [ "$(date +%s)" -lt "$end" ] || break
-    sleep 3
-  done
-  [[ " ${st##*|} " == *" ${READERS_NOTE} "* ]] || fail "step ${name}: no ${READERS_NOTE} note (${st##*|})"
-  local got
-  got="$(withholding "${st##*|}")"
-  if ! { within "$expected" "$got" && within "$got" "$expected $BASELINE"; }; then
-    fail "step ${name}: the notes withholding Partial are '${got}', expected '${expected}' plus at most the baseline '${BASELINE:-none}'"
-  fi
-  log "step ${name}: never partial over ${PARTIAL_WINDOW_S} s; level ${st%%|*}; withholding notes '${got}' (required '${expected}', baseline '${BASELINE:-none}', ambiguous records $(ambiguous_count "$id" "$STEP_T")); local reason '${why}'"
-  inspect_scan "step ${name}"
-}
-step no-host-identity agent "$AGENT_ID" agent-noid.yaml ro agent_in_container "$READERS_NOTE"
-step image-file agent "$AGENT_ID" agent-image.yaml ro "host_identity_refused (passwd: mount)" "$READERS_NOTE"
-step passwd-rw agent "$AGENT_ID" agent.yaml rw "host_identity_refused (passwd: mount)" "$READERS_NOTE"
-
+# --------------------------------------------------------------------------- uid step
+# R52 item 2: the agent run as a host user's uid, after the traffic (its own identity, never given
+# Audit: its notes do not depend on the main agent's). See "negative steps" for step().
 # The uid step: its own enrollment, state and secrets volumes owned by that uid (0700, files 0600).
 log "step uid-collision: enrolling a second agent identity running as uid ${COLLISION_UID}"
 r="$(api_json POST /api/enrollment-tokens '{"label":"e2e-firebird-uid"}')"
@@ -883,40 +937,7 @@ unset identity
 step uid-collision agent-uid "$AGENT2_ID" agent-uid.yaml ro uid_collision \
   "audit.log_not_readable ${READERS_NOTE} audit.partial_pending_first_record"
 dump_agent
-# Positive control of the steps (review M1): the main agent again, its own configuration and the
-# read-only host files. Within the same window: the readers check holds again, the readers note is
-# gone, and whatever still withholds Partial is part of the baseline; when nothing does, the target
-# must be Partial (so a restart with the declared files gives Partial whenever only the readers check
-# stood in its way). Partial ends the wait at once.
-log "positive control: the main agent with host_identity again, within ${PARTIAL_WINDOW_S} s"
-timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools rm -sf agent agent-uid >/dev/null 2>&1 || true
-STEP=final AGENT_SVC=agent
-hostid_yml agent ro
-export E2E_FB_AGENT_CONFIG=agent.yaml
-STEP_T="$(console_sql "SELECT now()")"
-T_FINAL="$(date +%s)"
-timeout 60 docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps agent >/dev/null
-layout "$(compose ps -q agent)" "$AGENT_UID"
-while :; do
-  st="$(status_after "$AGENT_ID" "$STEP_T")"
-  if [ "${st%%|*}" = partial ] && [ -z "$(withholding "${st##*|}")" ]; then break; fi
-  [ "$(date +%s)" -lt $(( T_FINAL + PARTIAL_WINDOW_S )) ] || break
-  sleep 3
-done
-why="$(readers_detail "$(last_checked agent)")"
-got="$(withholding "${st##*|}")"
-[ -n "$st" ] || fail "positive control: no heartbeat within ${PARTIAL_WINDOW_S} s of the restart"
-[ "$why" = holds ] || fail "positive control: the readers check fails again ('${why}')"
-[[ " ${st##*|} " != *" ${READERS_NOTE} "* ]] || fail "positive control: ${READERS_NOTE} is still reported"
-if [ "${st%%|*}" = partial ]; then
-  log "positive control: Partial again $(( $(date +%s) - T_FINAL )) s after the restart"
-else
-  [ -n "$got" ] || fail "positive control: nothing withholds Partial, yet the level is ${st%%|*} after ${PARTIAL_WINDOW_S} s"
-  within "$got" "$BASELINE" || fail "positive control: '${got}' withholds Partial, beyond the baseline '${BASELINE:-none}'"
-  log "positive control: the readers check holds, no ${READERS_NOTE}; level ${st%%|*}, withheld only by the baseline's '${got}' (ambiguous records $(ambiguous_count "$AGENT_ID" "$STEP_T"))"
-fi
-dump_agent
-phase_done negative-steps
+phase_done uid-step
 
 # After the steps (review L2): the console side again (a second database dump, the pages, the main
 # agent's state), the uid step's agent state and every log: no ground-truth value, marker or secret.
