@@ -401,6 +401,14 @@ fn mountinfo_grammar_and_bound() {
             String::from_utf8_lossy(bad)
         );
     }
+    // Review N4: an empty source field.
+    let t =
+        parse_mountinfo(b"812 500 0:60 / /run/databastion/host/passwd ro - fuse.x  ro\n").unwrap();
+    assert_eq!(t[0].mount_point, DECLARED);
+    assert_eq!(
+        parse_mountinfo(b"812 500 0:60 / /run/x ro - fuse.x src \n"),
+        Err(Kind::Mount)
+    );
     // Optional fields before the separator.
     let t = parse_mountinfo(b"7 1 0:1 / /p ro shared:3 master:2 - tmpfs t ro\n").unwrap();
     assert_eq!(t.len(), 1);

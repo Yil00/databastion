@@ -463,7 +463,14 @@ pub(crate) fn parse_mountinfo(b: &[u8]) -> Result<Vec<MountEntry>, Kind> {
         let Some(sep) = f.iter().position(|x| *x == b"-") else {
             return Err(Kind::Mount);
         };
-        if sep < 6 || f.len() != sep + 4 || f.iter().any(|x| x.is_empty()) {
+        // The source (field 4 after `-`) may be empty (security review
+        // N4: some file systems show none); every other field may not.
+        if sep < 6
+            || f.len() != sep + 4
+            || f.iter()
+                .enumerate()
+                .any(|(i, x)| x.is_empty() && i != sep + 2)
+        {
             return Err(Kind::Mount);
         }
         let (Some(id), Some(_parent)) = (dec(f[0], u64::MAX), dec(f[1], u64::MAX)) else {
