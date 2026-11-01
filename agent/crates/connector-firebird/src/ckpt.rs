@@ -16,8 +16,10 @@
 //!
 //! What the bodies hold is in [`crate::stream`] (the parser state) and
 //! [`crate::own`] (the ledger): ids, tokens, positions, counters, times,
-//! relation and routine names, keyed tags of names and texts; never a
-//! statement text, a parameter or a value (I2).
+//! relation and routine names in clear, keyed tags of the other names and
+//! of texts; never a statement text or a parameter (I2). Relation and
+//! routine names are kept as the ADR keeps them in events; a name can
+//! embed a value its owner put in it.
 
 use databastion_classifiers::masking::LocalTagKey;
 
@@ -57,7 +59,7 @@ impl Refused {
     }
 }
 
-/// A keyed tag of `parts` under `purpose` (never a value in clear).
+/// A keyed tag of `parts` under `purpose` (the parts are never kept).
 pub(crate) fn tag(key: &LocalTagKey, purpose: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut all: Vec<&[u8]> = Vec::with_capacity(parts.len() * 2 + 2);
     let plen = u32::try_from(purpose.len())

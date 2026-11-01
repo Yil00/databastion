@@ -117,6 +117,48 @@ impl Classes {
     }
 }
 
+impl Classes {
+    /// The keyed digest of what this check gives the stream for its
+    /// database (the decision of 2026-11-01 on L10: a restored checkpoint
+    /// re-reads a database whose digest changed with every relation
+    /// dependent): whether the catalog read was complete; the user
+    /// relations classed as external-file tables (the block-blind set of
+    /// R28) and as views; the dependent set of R41 (dependent objects,
+    /// tables with a computed column and whether the columns were read,
+    /// routine names, whether those reads were complete). Names are sorted;
+    /// only the tag is kept.
+    pub(crate) fn digest(&self, key: &databastion_classifiers::masking::LocalTagKey) -> [u8; 32] {
+        let mut w = crate::ckpt::Writer::default();
+        let set = |w: &mut crate::ckpt::Writer, names: &mut dyn Iterator<Item = &String>| {
+            let mut v: Vec<&String> = names.collect();
+            v.sort();
+            w.len(v.len());
+            for n in v {
+                w.str(n);
+            }
+        };
+        w.bool(self.complete);
+        let of = |c: RelClass| {
+            self.user
+                .iter()
+                .filter(move |(_, k)| **k == c)
+                .map(|(n, _)| n)
+        };
+        set(&mut w, &mut of(RelClass::External));
+        set(&mut w, &mut of(RelClass::View));
+        set(&mut w, &mut self.deps.dependent.iter());
+        set(&mut w, &mut self.deps.computed.iter());
+        w.bool(self.deps.computed_known);
+        set(&mut w, &mut self.deps.routines.iter());
+        w.bool(self.deps.complete);
+        crate::ckpt::tag(
+            key,
+            b"databastion.firebird.checkpoint.check_digest.v1",
+            &[&w.buf],
+        )
+    }
+}
+
 impl Catalog for Classes {
     fn class(&self, r: &str) -> RelClass {
         if let Some(c) = self.user.get(r) {
@@ -678,6 +720,10 @@ pub(crate) async fn stream(
         machine.confirm_run(r);
     }
     let mut runner = Runner {
+        digests: ckpt
+            .as_ref()
+            .map(|c| cats.iter().map(|x| x.digest(&c.key())).collect())
+            .unwrap_or_default(),
         ckpt,
         shed: 0,
         tailer: Tailer::new(audit.log.clone(), FRAMING, cfg.cursor(CURSOR))
@@ -700,6 +746,10 @@ pub(crate) async fn stream(
             generation = g;
             machine.reconfigure(s);
             cats = c;
+            if let Some(ck) = &runner.ckpt {
+                let key = ck.key();
+                runner.digests = cats.iter().map(|x| x.digest(&key)).collect();
+            }
             if let Some(r) = run {
                 machine.confirm_run(r);
             }
@@ -910,6 +960,9 @@ struct Seen {
 struct Runner {
     /// The parser checkpoint (`None` without a state directory or key).
     ckpt: Option<Checkpointer>,
+    /// Per declared database, the digest of the current check's results
+    /// ([`Classes::digest`]).
+    digests: Vec<[u8; 32]>,
     /// Pending groups ended for the checkpoint's cap in this poll.
     shed: usize,
     tailer: Tailer,
@@ -946,6 +999,7 @@ impl Runner {
         if cats.is_empty() {
             return Ok(false);
         }
+        let rotations = self.tailer.rotations;
         let polled = match self.tailer.poll() {
             Ok(p) => p,
             Err(e) => {
@@ -967,8 +1021,18 @@ impl Runner {
         // The checkpoint, restored only when bound to exactly the position
         // the tailer resumed from (before any record is handed).
         if let Some(c) = self.ckpt.as_mut() {
-            c.on_open(self.tailer.take_resumed(), m, now);
+            c.on_open(self.tailer.take_resumed(), m, &self.digests, now);
         }
+        // A log reset in this poll (a truncation, a rotation; review M1): no
+        // position read before it is trusted any more, and this poll's
+        // events carry none (an inode can be reused, an offset can name new
+        // content).
+        let reset = self.tailer.rotations != rotations;
+        if reset && let Some(c) = self.ckpt.as_mut() {
+            m.reset_positions();
+            c.reset();
+        }
+        m.unkeyed = reset;
         if !polled.records.is_empty() {
             self.last_growth = now;
         }
@@ -1053,6 +1117,21 @@ impl Runner {
             self.shed += m.shed_groups(budget, now, cats, out);
         }
         m.expire(now, cats, out);
+        m.unkeyed = false;
+        // The suppressed positions the read has passed (review M1).
+        if let Some(f) = self.file {
+            let at = self
+                .record_start
+                .or(self.last_end.filter(|(lf, _)| *lf == f).map(|(_, e)| e));
+            if let Some(at) = at {
+                m.prune_suppress(f, at);
+            }
+        }
+        if std::mem::take(&mut m.suppress_cleared)
+            && let Some(c) = self.ckpt.as_mut()
+        {
+            c.forget_restored();
+        }
         Ok(polled.more)
     }
 
@@ -1077,7 +1156,8 @@ impl Runner {
         let Some(c) = self.ckpt.as_mut() else {
             return self.held(m);
         };
-        match c.commit(m, live, open, sink, Instant::now()) {
+        let read = self.last_end;
+        match c.commit(m, live, open, sink, (&self.digests, read), Instant::now()) {
             Commit::At(file, start) => vec![(
                 0,
                 databastion_core::audit::tail::RecordPos {
@@ -1215,6 +1295,7 @@ mod tests {
     ) -> Runner {
         Runner {
             ckpt: None,
+            digests: Vec::new(),
             shed: 0,
             tailer: Tailer::new(log.to_path_buf(), FRAMING, store)
                 .with_open_check(open_check(log.to_path_buf())),
@@ -1854,6 +1935,7 @@ mod tests {
         let cats: Vec<&dyn Catalog> = vec![&classes];
         let mut r = Runner {
             ckpt: None,
+            digests: Vec::new(),
             shed: 0,
             tailer: Tailer::new(log.clone(), FRAMING, None)
                 .with_open_check(open_check(log.clone())),

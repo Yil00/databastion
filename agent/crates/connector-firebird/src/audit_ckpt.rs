@@ -11,7 +11,7 @@
 //!   positions;
 //! - `<target>.firebird_ledger.counters` (at most 2 MiB): the agent's own
 //!   attachments and execution credits ([`crate::own`]), written at every
-//!   checkpoint and at the end of every own session.
+//!   checkpoint and, on a blocking thread, soon after an own session ends.
 //!
 //! Together they stay within R25 item 9's one 16 MiB cap. Both are sealed
 //! with a keyed tag under the agent key's audit sub-key; a file that does
@@ -62,18 +62,38 @@ pub(crate) const MAGIC: &[u8; 4] = b"FBCK";
 /// Deduplication positions kept at most.
 const MAX_DEDUP: usize = 262_144;
 /// One position, encoded.
-const DKEY_BYTES: usize = 8 + 8 + 8 + 1;
+const DKEY_BYTES: usize = 8 + 8 + 8 + 1 + 8 + 8;
 /// Checkpoints written at most this often (between two writes, the cursor
 /// stays at the last one's offset).
 const WRITE_EVERY: Duration = Duration::from_secs(1);
 /// The envelope's own bytes.
 const ENVELOPE: usize = 4 + 2 + 4 + 32;
+/// Declared databases of one target at most, in a checkpoint.
+const MAX_DATABASES: usize = 4096;
+/// Commits in a row whose checkpoint does not fit the cap before the last
+/// one is dropped and the position held back as without one (review L3).
+const MAX_TOO_LARGE: u32 = 3;
+/// The host's boot id (`/proc/sys/kernel/random/boot_id`).
+const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
 /// A checkpoint body, decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Body {
+    /// A keyed tag of the host's boot id (security review L1): a
+    /// checkpoint of another boot is not used.
+    pub(crate) boot: [u8; 32],
     pub(crate) file: (u64, u64),
     pub(crate) pos: u64,
+    /// The end of what the writing process had read in `file` (the re-read
+    /// region's end; `u64::MAX` when it read past `file`).
+    pub(crate) read_end: u64,
+    /// Per declared database, a keyed digest of what its last check gave
+    /// the stream ([`crate::audit::Classes::digest`]: the decision of
+    /// 2026-11-01 on L10).
+    pub(crate) digests: Vec<[u8; 32]>,
+    /// Re-read invalidations still running when it was written:
+    /// `(database, end in file)`.
+    pub(crate) invalid: Vec<(u32, u64)>,
     pub(crate) machine: Vec<u8>,
     pub(crate) dedup: Vec<DKey>,
 }
@@ -81,9 +101,20 @@ pub(crate) struct Body {
 impl Body {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut w = Writer::default();
+        w.bytes32(&self.boot);
         w.u64(self.file.0);
         w.u64(self.file.1);
         w.u64(self.pos);
+        w.u64(self.read_end);
+        w.len(self.digests.len());
+        for d in &self.digests {
+            w.bytes32(d);
+        }
+        w.len(self.invalid.len());
+        for (db, end) in &self.invalid {
+            w.u32(*db);
+            w.u64(*end);
+        }
         w.len(self.machine.len());
         w.buf.extend_from_slice(&self.machine);
         w.len(self.dedup.len());
@@ -92,6 +123,8 @@ impl Body {
             w.u64(k.file.1);
             w.u64(k.off);
             w.bool(k.group);
+            w.u64(k.members);
+            w.u64(k.last);
         }
         w.buf
     }
@@ -99,8 +132,28 @@ impl Body {
     /// Strict, bounded (the fuzz target `firebird_checkpoint`).
     pub(crate) fn decode(body: &[u8]) -> Result<Self, Bad> {
         let mut r = Reader::new(body);
+        let boot = r.bytes32()?;
         let file = (r.u64()?, r.u64()?);
         let pos = r.u64()?;
+        let read_end = r.u64()?;
+        if read_end < pos {
+            return Err(Bad);
+        }
+        let n = r.len(MAX_DATABASES, 32)?;
+        let mut digests = Vec::with_capacity(n);
+        for _ in 0..n {
+            digests.push(r.bytes32()?);
+        }
+        let n = r.len(MAX_DATABASES, 12)?;
+        let mut invalid = Vec::with_capacity(n);
+        for _ in 0..n {
+            let db = r.u32()?;
+            let end = r.u64()?;
+            if usize::try_from(db).map_or(true, |d| d >= digests.len()) || end <= pos {
+                return Err(Bad);
+            }
+            invalid.push((db, end));
+        }
         let n = r.len(databastion_core::audit::MAX_CHECKPOINT_BYTES, 1)?;
         let machine = r.bytes(n)?.to_vec();
         let n = r.len(MAX_DEDUP, DKEY_BYTES)?;
@@ -111,7 +164,12 @@ impl Body {
                 file: (r.u64()?, r.u64()?),
                 off: r.u64()?,
                 group: r.bool()?,
+                members: r.u64()?,
+                last: r.u64()?,
             };
+            if !k.group && (k.members != 0 || k.last != 0) {
+                return Err(Bad);
+            }
             if !seen.insert(k) {
                 return Err(Bad);
             }
@@ -119,15 +177,19 @@ impl Body {
         }
         r.done()?;
         Ok(Self {
+            boot,
             file,
             pos,
+            read_end,
+            digests,
+            invalid,
             machine,
             dedup,
         })
     }
 
-    fn size(machine: usize, dedup: usize) -> usize {
-        ENVELOPE + 24 + 4 + machine + 4 + dedup * DKEY_BYTES
+    pub(crate) fn size(machine: usize, dedup: usize, dbs: usize) -> usize {
+        ENVELOPE + 32 + 32 + 4 + dbs * (32 + 12) + 4 + 4 + machine + 4 + dedup * DKEY_BYTES
     }
 }
 
@@ -145,6 +207,10 @@ struct Written {
     step: u64,
     at: Instant,
 }
+
+/// What a checkpoint is written with: the digests of the current check
+/// per declared database, and the read end (file and offset).
+pub(crate) type Facts<'a> = (&'a [[u8; 32]], Option<((u64, u64), u64)>);
 
 /// A checkpoint taken, written once the core has every event emitted
 /// before it durably.
@@ -178,6 +244,13 @@ pub(crate) struct CkptCounts {
     pub(crate) dedup_dropped: u64,
     /// Pending groups ended for the cap (R25 item 9).
     pub(crate) shed: u64,
+    /// Checkpoints that did not fit the cap (review L3).
+    pub(crate) too_large: u64,
+    /// Log resets (truncation, rotation) that dropped every position.
+    pub(crate) resets: u64,
+    /// Declared databases invalidated for a re-read after a restore (their
+    /// check results changed while the agent was stopped).
+    pub(crate) invalidated: u64,
 }
 
 /// Where the cursor is committed after a commit.
@@ -218,6 +291,10 @@ pub(crate) struct Checkpointer {
     every: Duration,
     /// The core's checkpoint file bound (tests: smaller).
     cap: usize,
+    /// The tag of this boot's id.
+    boot: [u8; 32],
+    /// Commits in a row whose checkpoint did not fit.
+    too_large: u32,
 }
 
 impl Checkpointer {
@@ -231,6 +308,7 @@ impl Checkpointer {
     ) -> Option<Self> {
         let store = store?;
         let key = store.local_tag_key()?;
+        let boot = boot_tag(&key, std::fs::read(BOOT_ID).ok()?.as_slice())?;
         let mut counts = CkptCounts::default();
         let loaded = match store.load() {
             Ok(Some(bytes)) => match crate::ckpt::open(&key, MAGIC, &bytes)
@@ -284,7 +362,42 @@ impl Checkpointer {
             counts,
             every: WRITE_EVERY,
             cap: databastion_core::audit::MAX_CHECKPOINT_BYTES,
+            boot,
+            too_large: 0,
         })
+    }
+
+    /// Test support: another boot id.
+    #[cfg(test)]
+    pub(crate) fn set_boot_for_tests(&mut self, id: &[u8]) {
+        if let Some(b) = boot_tag(&self.key, id) {
+            self.boot = b;
+        }
+    }
+
+    /// A log reset (truncation, rotation): positions read before it may
+    /// name other content. Every position recorded, waiting or restored is
+    /// dropped, the checkpoint taken or written for this file is dropped
+    /// and its file removed: the position is held back as without one
+    /// until a checkpoint of the new content is written.
+    pub(crate) fn reset(&mut self) {
+        self.counts.resets += 1;
+        self.restored.clear();
+        self.durable.clear();
+        self.waiting.clear();
+        self.pending = None;
+        self.dirty = false;
+        if self.last.take().is_some()
+            && let Err(e) = self.store.remove()
+        {
+            tracing::warn!(error = %e, "Firebird parser checkpoint not removed");
+        }
+    }
+
+    /// The machine dropped its suppressed positions (a run change): the
+    /// restored ones are dropped too.
+    pub(crate) fn forget_restored(&mut self) {
+        self.restored.clear();
     }
 
     /// Test support: the write interval and the size cap.
@@ -303,13 +416,22 @@ impl Checkpointer {
     /// from, `Tailer::take_resumed`): the loaded checkpoint is restored into
     /// `m` when it is bound to exactly that position, verified; otherwise it
     /// is not used. Once, before the first record is handed.
-    pub(crate) fn on_open(&mut self, resumed: Option<Resumed>, m: &mut Machine, now: Instant) {
+    pub(crate) fn on_open(
+        &mut self,
+        resumed: Option<Resumed>,
+        m: &mut Machine,
+        digests: &[[u8; 32]],
+        now: Instant,
+    ) {
         let Some(l) = self.loaded.take() else {
             return;
         };
         let bound =
             resumed.is_some_and(|r| r.verified && r.file == l.body.file && r.offset == l.body.pos);
-        let result = if bound {
+        let result = if l.body.boot != self.boot {
+            // Another boot: another server run whatever its pid and start.
+            Err(Refused::State)
+        } else if bound {
             m.import(&l.body.machine, now)
         } else {
             Err(Refused::Position)
@@ -317,6 +439,26 @@ impl Checkpointer {
         match result {
             Ok(()) => {
                 m.clear_invalidations();
+                // L10 (decision of 2026-11-01): a database whose check
+                // results differ from the writing process's last check is
+                // invalidated for the records re-read up to that process's
+                // read end; the invalidations still running then go on.
+                let mut inv: Vec<(usize, u64)> = l
+                    .body
+                    .invalid
+                    .iter()
+                    .filter_map(|(d, e)| usize::try_from(*d).ok().map(|d| (d, *e)))
+                    .collect();
+                for (i, d) in digests.iter().enumerate() {
+                    if l.body.digests.get(i) != Some(d) && l.body.read_end > l.body.pos {
+                        inv.push((i, l.body.read_end));
+                        self.counts.invalidated += 1;
+                    }
+                }
+                m.set_reread_invalid(l.body.file, &inv);
+                // The next checkpoint carries the invalidation and the new
+                // digests, even with no other change.
+                self.dirty |= !inv.is_empty();
                 let attaches = m.attaches();
                 let credits = l.ledger.map_or(0, |s| {
                     self.ledger.restore(s, &attaches, (l.body.file, l.body.pos))
@@ -433,6 +575,7 @@ impl Checkpointer {
         live: Option<((u64, u64), u64)>,
         open: Option<(u64, u64)>,
         sink: (u64, Option<u64>),
+        facts: Facts<'_>,
         now: Instant,
     ) -> Commit {
         if self.loaded.is_some() {
@@ -461,7 +604,7 @@ impl Checkpointer {
                 .as_ref()
                 .is_some_and(|l| l.file == p.file && l.pos == p.pos && l.step == p.step);
             if !(unchanged && !self.dirty) {
-                self.write(p, now);
+                self.write(p, m, facts, now);
             }
         }
         match self.last.as_ref().filter(|l| Some(l.file) == open) {
@@ -492,13 +635,24 @@ impl Checkpointer {
             return None;
         };
         let cap = self.cap;
-        let size = Body::size(machine.len(), 0);
+        let size = Body::size(machine.len(), 0, m.attaches().len());
         if size > cap {
             // R25 item 9: the oldest pending groups end first (at the next
-            // poll); never a truncated checkpoint.
+            // poll); never a truncated checkpoint. Review L3: counted and
+            // logged; after a few in a row, the last checkpoint is dropped.
+            self.counts.too_large += 1;
+            self.too_large += 1;
+            tracing::warn!(
+                bytes = size,
+                "Firebird parser checkpoint larger than its cap; not written"
+            );
+            if self.too_large >= MAX_TOO_LARGE {
+                self.drop_last();
+            }
             self.shed_target = Some(m.group_bytes().saturating_sub(size - cap + (64 << 10)));
             return None;
         }
+        self.too_large = 0;
         Some(Pending {
             file,
             pos,
@@ -512,7 +666,14 @@ impl Checkpointer {
     /// Writes `p` with the positions recorded as sent that can come again
     /// from its state: emitted after it (by step), and restored ones it has
     /// not passed.
-    fn write(&mut self, p: Pending, now: Instant) {
+    fn write(
+        &mut self,
+        p: Pending,
+        m: &Machine,
+        facts: Facts<'_>,
+        now: Instant,
+    ) {
+        let (digests, read) = facts;
         self.durable.retain(|_, s| *s >= p.step);
         self.restored.retain(|k| {
             k.file == p.file && (k.off >= p.pos || (k.group && p.firsts.contains(&k.off)))
@@ -526,7 +687,8 @@ impl Checkpointer {
         dedup.sort();
         dedup.dedup_by_key(|(_, k)| *k);
         let cap = self.cap;
-        let room = (cap.saturating_sub(Body::size(p.machine.len(), 0)) / DKEY_BYTES).min(MAX_DEDUP);
+        let room = (cap.saturating_sub(Body::size(p.machine.len(), 0, digests.len())) / DKEY_BYTES)
+            .min(MAX_DEDUP);
         if dedup.len() > room {
             // The oldest first (their events are sent again after a restart).
             let drop = dedup.len() - room;
@@ -536,9 +698,22 @@ impl Checkpointer {
                 self.restored.remove(&k);
             }
         }
+        let read_end = match read {
+            Some((f, e)) if f == p.file => e.max(p.pos),
+            _ => u64::MAX,
+        };
         let body = Body {
+            boot: self.boot,
             file: p.file,
             pos: p.pos,
+            read_end,
+            digests: digests.to_vec(),
+            invalid: m
+                .reread_invalid(p.file)
+                .into_iter()
+                .filter(|(_, e)| *e > p.pos)
+                .filter_map(|(d, e)| u32::try_from(d).ok().map(|d| (d, e)))
+                .collect(),
             machine: p.machine,
             dedup: dedup.into_iter().map(|(_, k)| k).collect(),
         };
@@ -563,6 +738,18 @@ impl Checkpointer {
         });
     }
 
+    /// Review L3: no checkpoint fits: the last one is dropped (its file
+    /// removed), so the position is held back as without one rather than
+    /// staying at an ever older checkpoint.
+    fn drop_last(&mut self) {
+        self.too_large = 0;
+        if self.last.take().is_some()
+            && let Err(e) = self.store.remove()
+        {
+            tracing::warn!(error = %e, "Firebird parser checkpoint not removed");
+        }
+    }
+
     /// No checkpoint for the open file: the file is removed (a restart must
     /// not restore a state the cursor no longer goes with) and the position
     /// is held back as without a checkpoint.
@@ -583,4 +770,12 @@ impl Checkpointer {
         });
         Commit::Fallback(hold)
     }
+}
+
+/// The keyed tag of a boot id (`None` when it is not one: empty or too
+/// long).
+fn boot_tag(key: &LocalTagKey, id: &[u8]) -> Option<[u8; 32]> {
+    let id = id.trim_ascii();
+    (!id.is_empty() && id.len() <= 64)
+        .then(|| crate::ckpt::tag(key, b"databastion.firebird.checkpoint.boot.v1", &[id]))
 }

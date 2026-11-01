@@ -243,6 +243,8 @@ struct Group {
     first: u64,
     /// The position of its first block-less record (R25 item 1).
     first_bare: Option<u64>,
+    /// The position of its last record (its events' key).
+    last: u64,
 }
 
 impl Group {
@@ -356,14 +358,22 @@ struct Held {
 
 /// The position an event is attributed to (R25 item 7's deduplication by
 /// position): its record's, or for the events of a group that ended
-/// without folding, the group's first record's (`group`).
+/// without folding, the group's members: its first record's position, its
+/// number of records and its last record's position (`group`). A re-read
+/// that groups the records otherwise (a group ended by reading time, a cap
+/// or shedding on the first reading, not on the re-read) gives another
+/// key, so its events are sent, never suppressed for another group's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct DKey {
     /// The log file's `(st_dev, st_ino)`.
     pub(crate) file: (u64, u64),
-    /// The record's first byte.
+    /// The record's first byte (a group: its first record's).
     pub(crate) off: u64,
     pub(crate) group: bool,
+    /// A group's records (0 for a record).
+    pub(crate) members: u64,
+    /// A group's last record's first byte (0 for a record).
+    pub(crate) last: u64,
 }
 
 /// The state as it was before the record that started a block-less hold
@@ -556,6 +566,17 @@ pub(crate) struct Machine {
     /// Snapshots are taken (the stream checkpoints).
     snapshots: bool,
     snapshot: Option<Snapshot>,
+    /// Events are pushed with no position (a poll across a log reset: a
+    /// position there may name other content).
+    pub(crate) unkeyed: bool,
+    /// The suppressed positions were dropped (a run change, a log reset):
+    /// the checkpoint drops its restored ones too.
+    pub(crate) suppress_cleared: bool,
+    /// After a restore, the declared databases whose check results differ
+    /// from the previous process's (the decision of 2026-11-01 on L10):
+    /// every relation counts as dependent for the records re-read before
+    /// that process's read end, `(database, file, end)`.
+    reread_invalid: Vec<(usize, (u64, u64), u64)>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -618,7 +639,60 @@ impl Machine {
             step: 0,
             snapshots: false,
             snapshot: None,
+            unkeyed: false,
+            suppress_cleared: false,
+            reread_invalid: Vec::new(),
         }
+    }
+
+    /// The suppressed positions the read has passed are dropped: those
+    /// before `pos` in `file` (a group's while a pending group starts
+    /// there), and every one of another file.
+    pub(crate) fn prune_suppress(&mut self, file: (u64, u64), pos: u64) {
+        if self.suppress.is_empty() {
+            return;
+        }
+        let firsts = self.group_firsts();
+        self.suppress
+            .retain(|k| k.file == file && (k.off >= pos || (k.group && firsts.contains(&k.off))));
+        self.reread_invalid
+            .retain(|(_, f, end)| *f == file && *end > pos);
+    }
+
+    /// A log reset (a truncation, a rotation): positions read before it may
+    /// name other content now. Nothing is suppressed any more, the snapshot
+    /// is dropped, and the re-read invalidation ends.
+    pub(crate) fn reset_positions(&mut self) {
+        self.suppress.clear();
+        self.suppress_cleared = true;
+        self.snapshot = None;
+        self.reread_invalid.clear();
+    }
+
+    /// After a restore: the databases invalidated for the records re-read
+    /// before `end` of `file` (the decision of 2026-11-01 on L10).
+    pub(crate) fn set_reread_invalid(&mut self, file: (u64, u64), dbs: &[(usize, u64)]) {
+        self.reread_invalid = dbs
+            .iter()
+            .filter(|(d, _)| *d < self.s.databases.len())
+            .map(|(d, e)| (*d, file, *e))
+            .collect();
+    }
+
+    /// The re-read invalidations still to apply, `(database, end)` in
+    /// `file` (written with the next checkpoint).
+    pub(crate) fn reread_invalid(&self, file: (u64, u64)) -> Vec<(usize, u64)> {
+        self.reread_invalid
+            .iter()
+            .filter(|(_, f, _)| *f == file)
+            .map(|(d, _, e)| (*d, *e))
+            .collect()
+    }
+
+    fn reread_dirty(&self, db: usize, pos: u64) -> bool {
+        self.reread_invalid
+            .iter()
+            .any(|(d, f, e)| *d == db && *f == self.file && pos < *e)
     }
 
     /// Enables the checkpoint: the agent key's sub-key (stable hashes of
@@ -713,6 +787,7 @@ impl Machine {
     /// restart.
     fn put(&mut self, out: &mut Vec<Emitted>, db: usize, ev: MaskedEvent, key: Option<DKey>) {
         self.step += 1;
+        let key = key.filter(|_| !self.unkeyed);
         if let Some(k) = key
             && self.suppress.contains(&k)
         {
@@ -730,6 +805,8 @@ impl Machine {
             file: self.file,
             off: g.first,
             group: true,
+            members: g.full.count + g.bare.count,
+            last: g.last,
         }
     }
 
@@ -856,6 +933,12 @@ impl Machine {
             self.invalidate(db, wall);
         }
         self.probe_records.clear();
+        // The positions restored for the old run are not suppressed in the
+        // new one (fail closed: sent again).
+        if !self.suppress.is_empty() {
+            self.suppress.clear();
+            self.suppress_cleared = true;
+        }
         // Review L-B: the run's pending groups end as R25 item 3 says (at the
         // next record or reading-time bound), never dropped silently.
         let groups: Vec<Group> = self.groups.drain(..).collect();
@@ -1443,6 +1526,8 @@ impl Machine {
             file: self.file,
             off: pos,
             group: false,
+            members: 0,
+            last: 0,
         });
         // Review L3: the whole record (parse, judgement, view sets, event)
         // under the panic isolation; a record that panics, or whose header
@@ -1478,8 +1563,16 @@ impl Machine {
         // dependent.
         let named = std::mem::take(&mut self.ddl_named);
         self.ddl_named_lent = named.keys().copied().collect();
-        let all = self.all_relations.clone();
-        let invalid = self.views_invalid.clone();
+        let mut all = self.all_relations.clone();
+        let mut invalid = self.views_invalid.clone();
+        // L10 (decision of 2026-11-01): a database whose check results
+        // changed while the agent was stopped, in the re-read region.
+        for db in 0..self.s.databases.len() {
+            if self.reread_dirty(db, pos) {
+                all.insert(db);
+                invalid.insert(db);
+            }
+        }
         let wrapped: Vec<Invalidated<'_>> = cat
             .iter()
             .enumerate()
@@ -1580,6 +1673,8 @@ impl Machine {
             file: self.file,
             off: pos,
             group: false,
+            members: 0,
+            last: 0,
         });
         self.unreadable(now, cat, out);
         self.cur = None;
@@ -2572,6 +2667,7 @@ impl Machine {
             } else {
                 g.full.add(m);
             }
+            g.last = g.last.max(pos);
             return true;
         }
         let per = self.groups.iter().filter(|g| g.key == key).count();
@@ -2594,6 +2690,7 @@ impl Machine {
             started: now,
             first: pos,
             first_bare: None,
+            last: pos,
         };
         if m.block_less {
             g.first_bare = Some(pos);

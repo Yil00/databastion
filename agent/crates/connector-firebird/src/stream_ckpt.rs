@@ -24,7 +24,9 @@
 //!   databases, open DDL transactions, waits, the run-long marks, times).
 //!
 //! Undeclared databases are their keyed hash (R1 rule 11), never a name.
-//! **Not written**: any statement text, parameter or value; the names a
+//! Relation and routine names are in clear (as in events: a name can embed
+//! a value its owner put in it).
+//! **Not written**: any statement text or parameter; the names a
 //! DDL text named in the interval (R41 item 8): a database that had such
 //! names is restored with every relation dependent instead (fail closed);
 //! held records (the checkpoint is only taken where none is held: they lie
@@ -394,13 +396,21 @@ impl Machine {
                 .unwrap_or(u64::MAX)
         });
         w.opt_u64(window);
-        w.len(self.groups.len());
-        for g in &self.groups {
+        // N1: only the groups of live bindings of declared databases (the
+        // others end with nothing to send).
+        let groups: Vec<&Group> = self
+            .groups
+            .iter()
+            .filter(|g| matches!(g.key.0, DbId::Declared(_)) && self.bindings.contains_key(&g.key))
+            .collect();
+        w.len(groups.len());
+        for g in groups {
             w_key(&mut w, g.key);
             w.u64(g.tra);
             w_part(&mut w, &g.full);
             w.u64(age(now, g.started));
             w.u64(g.first);
+            w.u64(g.last);
         }
         match self.last_declared {
             Some(i) => {
@@ -758,6 +768,10 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
         let full = d.part()?;
         let started = back(now, d.r.u64()?);
         let first = d.r.u64()?;
+        let last = d.r.u64()?;
+        if last < first {
+            return Err(Bad);
+        }
         st.groups.push(Group {
             key,
             tra,
@@ -766,6 +780,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
             started,
             first,
             first_bare: None,
+            last,
         });
     }
     st.last_declared = match d.r.u8()? {
@@ -961,6 +976,8 @@ impl Restored {
             if *n > MAX_GROUPS_PER_BINDING
                 || !seen_groups.insert((g.key, g.tra))
                 || g.full.count == 0
+                || !matches!(g.key.0, DbId::Declared(_))
+                || !self.bindings.contains_key(&g.key)
             {
                 return Err(());
             }
