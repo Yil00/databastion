@@ -239,6 +239,10 @@ impl Machine {
             && self.hold_since.is_none()
             && self.pending_end.is_empty()
             && !self.groups.iter().any(Group::blockless)
+            // R29 item 2: an external-source binding's held events are not
+            // persisted; the position is held back at its attach.
+            && self.ext.is_empty()
+            && self.ext_fail.is_empty()
     }
 
     /// The parser state as a checkpoint body, `None` when it cannot be
@@ -272,6 +276,7 @@ impl Machine {
                 Kind::User => 0,
                 Kind::Internal => 1,
                 Kind::Sweep => 2,
+                Kind::External => 3,
             });
             w.opt_u64(b.first_tra);
             w.len(b.open_tras.len());
@@ -658,6 +663,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
             0 => Kind::User,
             1 => Kind::Internal,
             2 => Kind::Sweep,
+            3 => Kind::External,
             _ => return Err(Bad),
         };
         let first_tra = d.r.opt_u64()?;

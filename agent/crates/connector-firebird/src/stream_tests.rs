@@ -2686,3 +2686,147 @@ fn own_error_follow_ups_are_consumed_once_and_a_second_copy_is_loud() {
     assert!(step(&mut m, &other).is_empty());
     assert_eq!(m.counts.ambiguous, 1);
 }
+
+/// R29: a local external data source's records on `token`, attachment
+/// `id`, transaction `tra`, for the user `SYSDBA` (`<internal>` lines with
+/// a user and a role, no client line): its attach, a read of `rel`, its
+/// transaction's end and detach.
+pub(crate) fn ext_source(token: &str, id: u64, tra: u64, rel: &str) -> (String, String, String) {
+    let line = format!("\t{APP} (ATT_{id}, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx =
+        format!("{line}\t\t(TRA_{tra}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n");
+    let start = format!(
+        "{HEAD} ({token}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({token}) ATTACH_DATABASE\n{line}\n{HEAD} ({token}) START_TRANSACTION\n{ctx}\n"
+    );
+    let read = format!(
+        "{HEAD} ({token}) EXECUTE_STATEMENT_FINISH\n{ctx}\nStatement 1:\n{}\nSELECT * FROM {rel}\n2 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{:>10}{:>70}\n\n",
+        "-".repeat(79),
+        "Table",
+        "*".repeat(115),
+        2,
+        ""
+    );
+    let end = format!(
+        "{HEAD} ({token}) COMMIT_TRANSACTION\n{ctx}      0 ms, 1 fetch(es)\n\n{HEAD} ({token}) DETACH_DATABASE\n{line}\n{HEAD} ({token}) TRACE_FINI\n\tSESSION_1 Firebird Audit\n\t\n\n"
+    );
+    (start + &read, String::new(), end)
+}
+
+/// A caller attachment (`APP`, attachment 3) with transaction 5 open.
+pub(crate) fn caller_open(token: &str) -> String {
+    format!(
+        "{}{HEAD} ({token}) START_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n",
+        attach(token, 3, APP)
+    )
+}
+
+/// The caller's commit of transaction 5.
+pub(crate) fn caller_commit(token: &str) -> String {
+    format!(
+        "{HEAD} ({token}) COMMIT_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms, 1 fetch(es)\n\n"
+    )
+}
+
+/// R29 items 1 and 2: a local external data source's attachment is an
+/// external-source binding under its line's principal; its events are
+/// held until its transaction's end and emitted as judged when a caller
+/// exists (another binding with a transaction open at the attach that
+/// wrote a finish record of code meanwhile). Before R29 every such record
+/// was ambiguous (R18 item 3).
+#[test]
+fn an_external_source_with_a_caller_is_reported_under_its_user() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    let call = stmt(
+        c,
+        3,
+        5,
+        "APP",
+        "EXECUTE BLOCK AS DECLARE N INTEGER; BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM CUSTOMERS' ON EXTERNAL '/var/lib/firebird/data/app.fdb' INTO :N; END",
+        0,
+        &[],
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut out = feed(&mut m, &cats, &format!("{}{start}", caller_open(c)), 0);
+    assert!(!names(&out).contains(&"CUSTOMERS".to_owned()), "held");
+    assert_eq!(m.ext_holds_for_tests(), 1);
+    assert!(
+        m.held_from().is_some(),
+        "the position is held back at the attach"
+    );
+    out.extend(feed(
+        &mut m,
+        &cats,
+        &format!("{call}{}{end}", caller_commit(c)),
+        100_000,
+    ));
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    let cust: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert_eq!(cust.len(), 1, "{:?}", names(&out));
+    assert!(!cust[0].1.always_report());
+    assert_eq!(cust[0].1.principal().account_name(), "SYSDBA");
+    assert_eq!(m.ext_holds_for_tests(), 0);
+    assert!(m.held_from().is_none());
+}
+
+/// R29 item 2 (security review M2): without a caller (no binding with a
+/// transaction open at the attach, or no finish record of code before the
+/// external transaction's end, or the binding gone first) every record of
+/// the external-source binding is ambiguous: always reported, `*`.
+#[test]
+fn an_external_source_without_a_caller_is_ambiguous() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    let plain = select(c, 3, 5, APP, "ORDERS", 1);
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let cases = [
+        // The caller's records are no code.
+        format!("{}{start}{plain}{}{end}", caller_open(c), caller_commit(c)),
+        // No transaction open anywhere at the attach.
+        format!("{}{start}{end}", attach(c, 3, APP)),
+        // Detached before its transaction's end.
+        format!(
+            "{}{start}{HEAD} ({e}) DETACH_DATABASE\n\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n\n",
+            caller_open(c)
+        ),
+    ];
+    for (i, log) in cases.iter().enumerate() {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        let out = feed(&mut m, &cats, log, 0);
+        let cust: Vec<_> = out
+            .iter()
+            .filter(|(_, ev)| {
+                ev.objects()
+                    .iter()
+                    .any(|o| o.object().as_str() == "CUSTOMERS")
+            })
+            .collect();
+        assert!(!cust.is_empty(), "case {i}: {:?}", names(&out));
+        assert!(cust.iter().all(|(_, ev)| ev.always_report()), "case {i}");
+        assert!(names(&out).contains(&"*".to_owned()), "case {i}");
+        assert!(m.counts.ambiguous >= 3, "case {i}: {:?}", m.counts);
+        assert_eq!(m.ext_holds_for_tests(), 0, "case {i}");
+    }
+    // An `<internal>` line with a client line is not the shape: ambiguous
+    // at once (R6 item 5).
+    let forged = start.replace(
+        "NONE, <internal>)\n\n",
+        "NONE, <internal>)\n\t/usr/bin/app:28\n\n",
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let _ = feed(&mut m, &cats, &format!("{}{forged}", caller_open(c)), 0);
+    assert!(m.counts.ambiguous >= 1);
+    assert_eq!(m.ext_holds_for_tests(), 0);
+}

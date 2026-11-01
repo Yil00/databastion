@@ -68,9 +68,18 @@
 //!   events were durably spooled before the restart (deduplication by
 //!   position).
 //!
-//! Not implemented here (each fail closed, listed in the lot 3 report):
-//! R1 rule 9, local external data sources (R29: their `<internal>`
-//! attachments are ambiguous, as R18 item 3 accepted).
+//! - **Local external data sources** (R29): an `<internal>` attach with
+//!   a user and a role, no client line, on the run's pid, anchors an
+//!   external-source binding (never own, never internal) whose events are
+//!   held until its transaction's end (10 minutes of reading time, 16 384
+//!   events and 4 MiB per stream, not persisted: the position is held back
+//!   at its attach) and emitted as judged only when a caller exists
+//!   (another binding with a transaction open at the attach that wrote a
+//!   finish record of code meanwhile); otherwise every record of it is
+//!   ambiguous.
+//!
+//! Not implemented here (fail closed, listed in the lot 3 report): R1
+//! rule 9.
 
 #[path = "stream_ckpt.rs"]
 mod stream_ckpt;
@@ -200,7 +209,44 @@ enum Kind {
     Internal,
     /// The automatic sweep (R17).
     Sweep,
+    /// A local external data source's attachment (R29): an `<internal>`
+    /// line with a user and a role.
+    External,
 }
+
+/// R29 item 2: the events of an external-source binding, held until its
+/// transaction's end, and the callers that can vouch for it.
+#[derive(Debug)]
+struct ExtHold {
+    /// Reading time of its `ATTACH_DATABASE` (the 10-minute bound).
+    started: Instant,
+    /// The position of its `ATTACH_DATABASE` (the persisted position is
+    /// held back to it).
+    attach_pos: u64,
+    events: Vec<ExtHeld>,
+    bytes: usize,
+    /// Other live bindings of the run with a transaction open at the
+    /// attach (started before it).
+    callers: std::collections::HashSet<Key>,
+    /// One of them wrote a finish record of code since the attach.
+    caller: bool,
+}
+
+/// One record of an external-source binding: its event as judged, if
+/// any, and its ambiguous form (`*`, always reported).
+#[derive(Debug)]
+struct ExtHeld {
+    db: usize,
+    normal: Option<MaskedEvent>,
+    loud: MaskedEvent,
+    key: Option<DKey>,
+}
+
+/// R29 item 2: a binding's events are held at most this long.
+const EXT_TIME: Duration = Duration::from_secs(600);
+/// R29 item 2 (security review L9): held events per stream.
+const EXT_EVENTS: usize = 16_384;
+const EXT_BYTES: usize = 4 << 20;
 
 #[derive(Debug, Clone)]
 struct Binding {
@@ -647,6 +693,14 @@ pub(crate) struct Machine {
     /// a consumed one, so a forged second copy right after a restart is not
     /// loud, which hides nothing either).
     follow_ups: HashMap<Key, FollowUp>,
+    /// R29: the external-source bindings whose events are held.
+    ext: HashMap<Key, ExtHold>,
+    /// Their held events and bytes (the stream's bounds).
+    ext_events: usize,
+    ext_bytes: usize,
+    /// Holds that ended with no verdict (the binding gone, a bound): their
+    /// records are ambiguous, emitted at the next record or expiry.
+    ext_fail: Vec<ExtHold>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -719,6 +773,10 @@ impl Machine {
             restore_facts: Vec::new(),
             restores_seen: HashMap::new(),
             follow_ups: HashMap::new(),
+            ext: HashMap::new(),
+            ext_events: 0,
+            ext_bytes: 0,
+            ext_fail: Vec::new(),
         }
     }
 
@@ -1192,6 +1250,9 @@ impl Machine {
         for t in self.gc_alone_since.values_mut() {
             *t += d;
         }
+        for h in self.ext.values_mut() {
+            h.started += d;
+        }
     }
 
     /// Test support: the pids remembered as failed.
@@ -1262,6 +1323,11 @@ impl Machine {
         self.failed_pids.clear();
         self.cooldown_until = None;
         self.follow_ups.clear();
+        // R29: the run's external-source holds end with no verdict.
+        let keys: Vec<Key> = self.ext.keys().copied().collect();
+        for k in keys {
+            self.fail_ext(k);
+        }
     }
 
     /// The stream's state in bytes, estimated (R1 rule 11's global cap).
@@ -1429,9 +1495,114 @@ impl Machine {
     }
 
     /// The position the persisted cursor may advance to: the first record
-    /// of the oldest pending group (R25 item 7), `None` when nothing pends.
+    /// of the oldest pending group (R25 item 7), or the attach of an
+    /// external-source binding whose events are held (R29 item 2), `None`
+    /// when nothing pends.
     pub(crate) fn held_from(&self) -> Option<u64> {
-        self.groups.iter().map(|g| g.first).min()
+        self.groups
+            .iter()
+            .map(|g| g.first)
+            .chain(self.ext.values().map(|h| h.attach_pos))
+            .min()
+    }
+
+    /// A hold the checkpoint cannot be taken in (a block-less group, or an
+    /// external-source binding's held events): the snapshot of its start
+    /// is used.
+    pub(crate) fn holds_pending(&self) -> bool {
+        self.blockless_pending() || !self.ext.is_empty() || !self.ext_fail.is_empty()
+    }
+
+    /// R29: the hold of `key` ends with no caller (the binding gone, a
+    /// bound reached, the run's end): its records are ambiguous.
+    fn fail_ext(&mut self, key: Key) {
+        if let Some(h) = self.ext.remove(&key) {
+            self.ext_events = self.ext_events.saturating_sub(h.events.len());
+            self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes);
+            self.ext_fail.push(h);
+        }
+        if let Some(b) = self.bindings.get_mut(&key)
+            && b.kind == Kind::External
+        {
+            b.poisoned = true;
+        }
+    }
+
+    /// Emits the records of the holds that ended with no caller, each
+    /// ambiguous (R29 item 2, as R18 item 3: always reported, `*`).
+    fn flush_ext_fail(&mut self, out: &mut Vec<Emitted>) {
+        for h in std::mem::take(&mut self.ext_fail) {
+            for e in h.events {
+                self.counts.ambiguous += 1;
+                *self.why.entry(2).or_default() += 1;
+                self.emit_keyed(e.db, e.loud, e.key, out);
+            }
+        }
+    }
+
+    /// R29 item 2: the external-source binding `key`'s transaction ended:
+    /// with a caller its held events are emitted as judged; without one,
+    /// every record is ambiguous and the binding poisoned.
+    fn ext_verdict(&mut self, key: Key, out: &mut Vec<Emitted>) {
+        let Some(h) = self.ext.get(&key) else {
+            return;
+        };
+        if !h.caller {
+            self.fail_ext(key);
+            self.flush_ext_fail(out);
+            return;
+        }
+        let Some(h) = self.ext.remove(&key) else {
+            return;
+        };
+        self.ext_events = self.ext_events.saturating_sub(h.events.len());
+        self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes);
+        for e in h.events {
+            if let Some(ev) = e.normal {
+                self.emit_keyed(e.db, ev, e.key, out);
+            }
+        }
+    }
+
+    /// R29 item 2: one record's outputs of the held external-source binding
+    /// `key`; past a bound, the hold ends with no caller.
+    fn hold_ext(&mut self, key: Key, db: usize, normal: Option<MaskedEvent>, loud: MaskedEvent) {
+        let b = held_bytes(&loud) + normal.as_ref().map_or(0, held_bytes);
+        let Some(h) = self.ext.get_mut(&key) else {
+            return;
+        };
+        h.events.push(ExtHeld {
+            db,
+            normal,
+            loud,
+            key: self.cur,
+        });
+        h.bytes += b;
+        self.ext_events += 1;
+        self.ext_bytes += b;
+        if self.ext_events > EXT_EVENTS || self.ext_bytes > EXT_BYTES {
+            self.fail_ext(key);
+        }
+    }
+
+    /// The key of the external-source binding a record belongs to, when its
+    /// events are held.
+    fn ext_key(&self, rec: &Record<'_>) -> Option<Key> {
+        if self.ext.is_empty() {
+            return None;
+        }
+        let att = rec.att?;
+        let Resolved::Db(d) = self.resolve(att.database) else {
+            return None;
+        };
+        let k = (d, att.id);
+        self.ext.contains_key(&k).then_some(k)
+    }
+
+    /// Test support: external-source holds pending.
+    #[cfg(test)]
+    pub(crate) fn ext_holds_for_tests(&self) -> usize {
+        self.ext.len()
     }
 
     /// R28 item 4, R41 item 8: what invalidates the dependent and
@@ -1914,10 +2085,14 @@ impl Machine {
         // R25 item 7: a block-less routine record may start a hold, and
         // the position is then held back to it: the state before it is the
         // checkpoint while the hold lasts.
+        // R29 item 2: so may an external-source attach (its events are held
+        // until its transaction's end).
+        let ext_attach = rec.header.event == Event::AttachDatabase
+            && rec.att.is_some_and(|a| a.protocol == Protocol::Internal);
         if self.snapshots
-            && matches!(rec.body, Body::Routine { .. })
-            && rec.trailer.block.is_none()
-            && !self.blockless_pending()
+            && ((matches!(rec.body, Body::Routine { .. }) && rec.trailer.block.is_none())
+                || ext_attach)
+            && !self.holds_pending()
             && self.snapshot.as_ref().is_none_or(|s| {
                 s.file != self.file || now.duration_since(s.taken) >= SNAPSHOT_EVERY
             })
@@ -2029,6 +2204,12 @@ impl Machine {
         while let Some(g) = self.groups.pop_front() {
             self.end_group(g, now, cat, out);
         }
+        // R29: held external-source bindings shed, ambiguous.
+        let keys: Vec<Key> = self.ext.keys().copied().collect();
+        for k in keys {
+            self.fail_ext(k);
+        }
+        self.flush_ext_fail(out);
         if self.hold_since.is_some() {
             self.release(false, out);
         }
@@ -2058,6 +2239,17 @@ impl Machine {
         if self.hold_since.is_some() && !self.groups.iter().any(Group::blockless) {
             self.release(false, out);
         }
+        // R29 item 2: 10 minutes of reading time per external-source hold.
+        let old: Vec<Key> = self
+            .ext
+            .iter()
+            .filter(|(_, h)| now.duration_since(h.started) >= EXT_TIME)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in old {
+            self.fail_ext(k);
+        }
+        self.flush_ext_fail(out);
         let linger = |d: &DbId| match d {
             DbId::Declared(i) => cat.get(*i).and_then(|c| c.linger()),
             DbId::Undeclared(_) => None,
@@ -2492,18 +2684,64 @@ impl Machine {
         if internal_line && att.user == "Garbage Collector" && att.role.is_none() {
             return self.internal_record(rec, key, token, now);
         }
-        if internal_line
-            && !(att.user == "SWEEPER" && att.role == Some("NONE") && att.charset == "NONE")
-        {
-            // R6 item 5, R29: other internal attachments.
+        let sweeper = att.user == "SWEEPER" && att.role == Some("NONE") && att.charset == "NONE";
+        // R29 item 1: a local external data source's attach, exactly
+        // `<name> (ATT_<n>, <user>:<role>, NONE, <internal>)` with no client
+        // line, on the current run's pid (checked above).
+        let ext_attach = internal_line
+            && !sweeper
+            && h.event == Event::AttachDatabase
+            && h.outcome == Outcome::Ok
+            && att.role.is_some()
+            && att.charset == "NONE"
+            && rec.client.is_none();
+        let ext_record = internal_line
+            && self
+                .bindings
+                .get(&key)
+                .is_some_and(|b| b.kind == Kind::External);
+        if internal_line && !sweeper && !ext_attach && !ext_record {
+            // R6 item 5: other internal attachments.
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
             };
         }
+        let kind = if ext_attach {
+            Kind::External
+        } else if internal_line {
+            Kind::Sweep
+        } else {
+            Kind::User
+        };
         match h.event {
             Event::AttachDatabase | Event::CreateDatabase if h.outcome == Outcome::Ok => {
-                self.attach(rec, key, token, now, in_window, internal_line)
+                let d = self.attach(rec, key, token, now, in_window, kind);
+                // R29 item 2: its events are held until its transaction's
+                // end, and a caller is looked for among the bindings with a
+                // transaction open now.
+                if kind == Kind::External && matches!(d, Decision::Normal { .. }) {
+                    let callers = self
+                        .bindings
+                        .iter()
+                        .filter(|(k, b)| {
+                            **k != key && b.kind == Kind::User && !b.open_tras.is_empty()
+                        })
+                        .map(|(k, _)| *k)
+                        .collect();
+                    self.ext.insert(
+                        key,
+                        ExtHold {
+                            started: now,
+                            attach_pos: pos,
+                            events: Vec::new(),
+                            bytes: 0,
+                            callers,
+                            caller: false,
+                        },
+                    );
+                }
+                d
             }
             Event::AttachDatabase => {
                 // FAILED / UNAUTHORIZED (R10): one live token is a breach.
@@ -2667,11 +2905,10 @@ impl Machine {
         token: (u32, u64),
         now: Instant,
         in_window: bool,
-        internal_line: bool,
+        kind: Kind,
     ) -> Decision {
         let (db, id) = key;
-        let sweep = internal_line;
-        if sweep && rec.client.is_some() {
+        if kind != Kind::User && rec.client.is_some() {
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
@@ -2784,7 +3021,7 @@ impl Machine {
                 anchored: true,
                 poisoned: false,
                 tainted: in_window || ambiguous,
-                kind: if sweep { Kind::Sweep } else { Kind::User },
+                kind,
                 first_tra: None,
                 open_tras: Vec::new(),
                 sweep_step: 0,
@@ -2804,6 +3041,8 @@ impl Machine {
     fn end_binding(&mut self, key: Key) {
         self.probe_records.remove(&key);
         self.follow_ups.remove(&key);
+        // R29: a binding gone before its transaction's end has no caller.
+        self.fail_ext(key);
         if let Some(b) = self.remove_binding(key) {
             self.token_live.remove(&b.token);
             self.end_token(b.token);
@@ -2886,6 +3125,14 @@ impl Machine {
             if let Some(b) = self.bindings.get_mut(&key) {
                 b.poisoned |= !b.anchored;
             }
+            // R29: a failed external-source binding ends at its detach (its
+            // records ambiguous to the last).
+            if b.token == token
+                && b.kind == Kind::External
+                && matches!(h.event, Event::DetachDatabase | Event::DropDatabase)
+            {
+                self.end_binding(key);
+            }
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
@@ -2909,6 +3156,42 @@ impl Machine {
                 window: false,
                 at: line!(),
             };
+        }
+        // R29 item 2: an external-source binding detached before its
+        // transaction's end has no caller; after its verdict, only its
+        // detach is expected.
+        if b.kind == Kind::External {
+            let held = self.ext.contains_key(&key);
+            let detach = matches!(h.event, Event::DetachDatabase | Event::DropDatabase);
+            if detach && held {
+                self.end_binding(key);
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+            if !detach && !held {
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+        }
+        // R29 item 2: a finish record of code on a binding that had a
+        // transaction open at an external-source attach is its caller.
+        if b.kind == Kind::User && !self.ext.is_empty() {
+            let code = match &rec.body {
+                Body::Routine { .. } => true,
+                Body::Statement { text, .. } => analyze_firebird(text).calls_code(),
+                _ => false,
+            };
+            if code {
+                for x in self.ext.values_mut() {
+                    if x.callers.contains(&key) {
+                        x.caller = true;
+                    }
+                }
+            }
         }
         // A database trigger waiting for its sequence (R15, R34).
         if let Some(wait) = b.trigger_wait {
@@ -3174,6 +3457,39 @@ impl Machine {
             return;
         };
         let key = Some(self.group_key(&g));
+        // R29 item 2: a group of a held external-source binding is held
+        // with it.
+        if self.ext.contains_key(&g.key) {
+            let mut d = g.full.draft();
+            if g.blockless() {
+                for o in g.bare.draft().objects {
+                    if !d.objects.contains(&o) {
+                        d.objects.push(o);
+                    }
+                }
+                d.star = true;
+                d.always = true;
+            }
+            let normal = finish(d.clone()).map(|d| self.draft_event(&d, None, db));
+            let mut l = d;
+            l.star = true;
+            l.always = true;
+            let loud = self.draft_event(&l, None, db);
+            let cur = std::mem::replace(&mut self.cur, key);
+            self.hold_ext(g.key, db, normal, loud);
+            self.cur = cur;
+            if g.blockless() {
+                // R25 item 3: its block-less part is ambiguous, with a window
+                // and the records held behind it.
+                *self.why.entry(1).or_default() += g.bare.count;
+                self.counts.ambiguous += g.bare.count;
+                self.window_until = Some(Instant::now() + WINDOW);
+                if self.hold_since.is_some() {
+                    self.release(true, out);
+                }
+            }
+            return;
+        }
         if g.full.count > 0
             && let Some(d) = finish(g.full.draft())
         {
@@ -3339,6 +3655,34 @@ impl Machine {
         for g in std::mem::take(&mut self.pending_end) {
             self.end_group(g, now, cat, out);
         }
+        self.flush_ext_fail(out);
+        // R29 item 2: a record of an external-source binding whose events
+        // are held.
+        let ext = self.ext_key(rec);
+        let tra_end = matches!(
+            rec.header.event,
+            Event::CommitTransaction | Event::RollbackTransaction
+        );
+        self.apply_in(decision, ext, rec, pos, now, cat, out);
+        if let Some(k) = ext
+            && tra_end
+        {
+            self.ext_verdict(k, out);
+        }
+        self.flush_ext_fail(out);
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn apply_in(
+        &mut self,
+        decision: Decision,
+        ext: Option<Key>,
+        rec: &Record<'_>,
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) {
         match decision {
             Decision::Nothing => {}
             Decision::Trigger { db } => {
@@ -3362,8 +3706,11 @@ impl Machine {
                     d.always = true;
                 }
                 d.rows = None;
-                if let Some(d) = finish(d) {
-                    let ev = self.draft_event(&d, Some(rec), db);
+                let normal = finish(d.clone()).map(|d| self.draft_event(&d, Some(rec), db));
+                if let Some(k) = ext {
+                    let loud = self.loud_form(Some(d), rec, db);
+                    self.hold_ext(k, db, normal, loud);
+                } else if let Some(ev) = normal {
                     self.emit(db, ev, out);
                 }
             }
@@ -3526,6 +3873,12 @@ impl Machine {
                     d.star = true;
                     d.always = true;
                 }
+                if let Some(k) = ext {
+                    let normal = draft.as_ref().map(|d| self.draft_event(d, Some(rec), db));
+                    let loud = self.loud_form(draft, rec, db);
+                    self.hold_ext(k, db, normal, loud);
+                    return;
+                }
                 let Some(d) = draft else {
                     return;
                 };
@@ -3533,6 +3886,32 @@ impl Machine {
                 self.emit(db, ev, out);
             }
         }
+    }
+
+    /// A record's ambiguous form (H1 fix 3): its draft, or a read, with `*`
+    /// and the always-reported mark.
+    fn loud_form(&self, d: Option<Draft>, rec: &Record<'_>, db: usize) -> MaskedEvent {
+        let mut d = d.unwrap_or_else(|| Draft {
+            action: Some(databastion_classifiers::masking::EventAction::Read),
+            rows: rec.trailer.fetched,
+            ..Draft::default()
+        });
+        d.star = true;
+        d.always = true;
+        self.draft_event(&d, Some(rec), db)
+    }
+
+    /// [`Self::emit`] for an event attributed to `key` (a held one).
+    fn emit_keyed(
+        &mut self,
+        db: usize,
+        ev: MaskedEvent,
+        key: Option<DKey>,
+        out: &mut Vec<Emitted>,
+    ) {
+        let cur = std::mem::replace(&mut self.cur, key);
+        self.emit(db, ev, out);
+        self.cur = cur;
     }
 
     fn emit(&mut self, db: usize, ev: MaskedEvent, out: &mut Vec<Emitted>) {

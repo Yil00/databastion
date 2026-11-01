@@ -300,6 +300,33 @@ fn the_server_trace_log_through_the_stream() {
     assert_eq!(m.counts.panics, 0);
     assert_eq!(m.counts.ambiguous, bare, "{:?}", m.why);
     assert!(!out.is_empty());
+    // R29: the local external data source's read (an `<internal>`
+    // attachment on crm.fdb), reported under its user, not ambiguous.
+    let ext: Vec<_> = out
+        .iter()
+        .filter(|(_, e)| {
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str().eq_ignore_ascii_case("payment_cards"))
+        })
+        .collect();
+    eprintln!(
+        "[measure] R29 external-source events {} (principals {:?})",
+        ext.len(),
+        ext.iter()
+            .map(|(_, e)| e.principal().account_name().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ext.iter()
+            .any(|(_, e)| e.principal().account_name() == "SYSDBA"),
+        "the external-source read"
+    );
+    assert_eq!(
+        m.ext_holds_for_tests(),
+        0,
+        "every external-source hold decided"
+    );
     // #82: no marker of the workload reaches an event through the stream.
     for (_, ev) in &out {
         let all = format!("{ev:?}");

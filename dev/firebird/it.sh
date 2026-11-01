@@ -343,6 +343,22 @@ SQL
 } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
   >/dev/null
 
+# ADR-0060 R29: a local external data source (EXECUTE STATEMENT ... ON EXTERNAL with a path and no
+# host, no AS USER: the caller's user), from an EXECUTE BLOCK on app.fdb reading crm.fdb. The server
+# writes an <internal> attachment with a user and a role; with its caller (this isql session, which
+# has a transaction open and writes the EXECUTE BLOCK's finish record), the stream reports its read
+# under its user with no ambiguous record (it_audit::the_server_trace_log_through_the_stream).
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TERM ^ ;
+EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM PAYMENT_CARDS' ON EXTERNAL '/var/lib/firebird/data/crm.fdb' INTO :N; SUSPEND; END^
+SET TERM ; ^
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+
 # The #82 marker cases the stock tools can write (ADR-0060 item 5): a routine's returned value,
 # `EXECUTE STATEMENT`'s inner text, a client process name, and a database-trigger record's process
 # name (an `ON CONNECT` trigger on crm.fdb while the renamed client attaches). A BLR literal
