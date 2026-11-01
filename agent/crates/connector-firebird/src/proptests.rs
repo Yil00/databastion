@@ -376,4 +376,97 @@ proptest! {
             let _ = c.conv();
         }
     }
+
+    /// The checkpoint decoders on any bytes (the fuzz target's property):
+    /// never a panic, a refused body keeps nothing, a restored state
+    /// restores to itself.
+    #[test]
+    fn checkpoint_decoders_never_panic(sel in 0u8..4, bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+        let mut input = vec![sel];
+        input.extend_from_slice(&bytes);
+        fuzz::checkpoint(&input);
+    }
+
+    /// A real parser state with bytes changed or cut: refused whole or
+    /// restored within its bounds, never a panic.
+    #[test]
+    fn a_changed_parser_state_never_panics(
+        flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..8),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let body = real_state();
+        let mut b = body.clone();
+        for (i, v) in flips {
+            let i = i.index(b.len());
+            b[i] = v;
+        }
+        let mut input = vec![3u8];
+        input.extend_from_slice(&b);
+        fuzz::checkpoint(&input);
+        let mut input = vec![3u8];
+        input.extend_from_slice(&body[..cut.index(body.len() + 1)]);
+        fuzz::checkpoint(&input);
+    }
+}
+
+/// The parser state (after its identity and run) of a stream that read
+/// bindings, a read, a pending group and an ambiguous record.
+fn real_state() -> Vec<u8> {
+    use crate::stream_tests::{APP, attach, select};
+    use crate::trace_log::{Assembled, Assembler};
+    use std::sync::Arc;
+    static STATE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            let key = Arc::new(
+                databastion_classifiers::masking::HmacKey::new(&[9; 32])
+                    .unwrap()
+                    .local_tag_key("databastion.audit.cursor")
+                    .unwrap(),
+            );
+            let mut m = crate::stream::Machine::new(
+                crate::fuzz_entry::fuzz_settings(),
+                Arc::new(crate::own::Ledger::default()),
+            );
+            m.enable_checkpoint(key);
+            m.confirm_run(crate::stream::Run {
+                pid: 24,
+                start: Some(4242),
+            });
+            let a = "24:0x7f0000000100";
+            let log = format!(
+                "{}{}{}{}",
+                attach(a, 3, APP),
+                select(a, 3, 5, APP, "CUSTOMERS", 2),
+                select("99:0x7f0000000900", 9, 9, APP, "LEDGER", 1),
+                attach("24:0x7f0000000300", 5, "/elsewhere/other.fdb"),
+            );
+            let mut asm = Assembler::new();
+            let mut recs = Vec::new();
+            for line in log.split('\n') {
+                recs.extend(asm.push_line(line.as_bytes()));
+            }
+            recs.extend(asm.flush());
+            struct Cat;
+            impl crate::trace_events::Catalog for Cat {
+                fn class(&self, _: &str) -> crate::trace_events::RelClass {
+                    crate::trace_events::RelClass::Table
+                }
+                fn always_view(&self, _: &str) -> bool {
+                    false
+                }
+            }
+            let cats: [&dyn crate::trace_events::Catalog; 2] = [&Cat, &Cat];
+            let now = std::time::Instant::now();
+            let mut out = Vec::new();
+            for (i, r) in recs.iter().enumerate() {
+                if let Assembled::Record(raw) = r {
+                    m.push(raw, i as u64 * 1000, now, &cats, &mut out);
+                }
+            }
+            let body = m.export(now).unwrap();
+            let prefix = m.body_prefix().unwrap();
+            body[prefix.len()..].to_vec()
+        })
+        .clone()
 }

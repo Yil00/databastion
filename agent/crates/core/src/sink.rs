@@ -115,9 +115,30 @@ impl FindingSink {
 }
 
 /// Bounded channel of masked access events, from a connector to the core.
+///
+/// It also tells the connector which of its events are **durably
+/// handled** ([`Self::durable`]): spooled to disk, or dropped by the
+/// `audit.configure` filter, by the core's flush after their aggregation
+/// window. A source that must not record a position as sent before its
+/// events are durably in the spool (the Firebird parser checkpoint,
+/// ADR-0060 R25 item 7) compares the [`Self::submitted`] count after its
+/// last event of a position with [`Self::durable`].
 #[derive(Debug, Clone)]
 pub struct EventSink {
     tx: mpsc::Sender<MaskedEvent>,
+    durability: Arc<Durability>,
+}
+
+/// The counts behind [`EventSink::submitted`] and [`EventSink::durable`].
+#[derive(Debug, Default)]
+struct Durability {
+    /// Events handed to the channel (each send that succeeded).
+    submitted: std::sync::atomic::AtomicU64,
+    /// The first this many events received are durably handled.
+    durable: std::sync::atomic::AtomicU64,
+    /// A flush failed to spool some events: nothing is durable from then
+    /// on, for the life of this sink (fail closed).
+    broken: std::sync::atomic::AtomicBool,
 }
 
 impl EventSink {
@@ -125,7 +146,13 @@ impl EventSink {
     #[must_use]
     pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<MaskedEvent>) {
         let (tx, rx) = mpsc::channel(capacity);
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                durability: Arc::default(),
+            },
+            rx,
+        )
     }
 
     /// Submits a masked access event, waiting if the channel is full.
@@ -133,7 +160,53 @@ impl EventSink {
     /// # Errors
     /// [`SinkClosed`] if the core stopped consuming.
     pub async fn submit(&self, event: MaskedEvent) -> Result<(), SinkClosed> {
-        self.tx.send(event).await.map_err(|_| SinkClosed)
+        self.tx.send(event).await.map_err(|_| SinkClosed)?;
+        self.durability
+            .submitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Events submitted through this sink (and its clones) so far. The
+    /// channel is FIFO, so for a source that submits from one task, the
+    /// `n`-th event it submitted is durably handled once
+    /// [`Self::durable`] is at least `n`.
+    #[must_use]
+    pub fn submitted(&self) -> u64 {
+        self.durability
+            .submitted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many of the events submitted first are durably handled (spooled
+    /// to disk, or dropped by the reporting filter); `None` once a flush
+    /// failed to spool some of them (spool full, write error): nothing is
+    /// durable then for the life of the sink, and a source re-sends after a
+    /// restart rather than trusting a loss.
+    #[must_use]
+    pub fn durable(&self) -> Option<u64> {
+        let d = &self.durability;
+        (!d.broken.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| d.durable.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// The core's flush handled the first `n` events received durably
+    /// (`ok`), or failed to spool some of them (`!ok`, for good).
+    pub(crate) fn mark_durable(&self, n: u64, ok: bool) {
+        let d = &self.durability;
+        if !ok {
+            d.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        d.durable.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test support: as the core's flush, the first `n` events received
+    /// are durably handled.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn mark_durable_for_tests(&self, n: u64) {
+        self.mark_durable(n, true);
     }
 }
 
@@ -179,5 +252,34 @@ mod tests {
         drop(rx);
         let finding = MaskedFinding::new(ClassifierId::PII_EMAIL, Vec::new());
         assert_eq!(sink.submit(finding).await, Err(SinkClosed));
+    }
+
+    /// The durable count follows the core's flushes, and a failed flush
+    /// makes nothing durable from then on.
+    #[tokio::test]
+    async fn event_sink_tells_what_is_durable() {
+        use databastion_classifiers::masking::{EventAction, EventPrincipal, EventSource};
+        let (sink, mut rx) = EventSink::channel(4);
+        let ev = || {
+            MaskedEvent::new(
+                EventSource::FirebirdAuditTrace,
+                EventAction::Read,
+                EventPrincipal::unidentified(),
+                std::time::SystemTime::now(),
+            )
+        };
+        sink.submit(ev()).await.unwrap();
+        sink.submit(ev()).await.unwrap();
+        assert_eq!(sink.submitted(), 2);
+        assert_eq!(sink.durable(), Some(0));
+        let _ = rx.recv().await;
+        sink.mark_durable(1, true);
+        assert_eq!(sink.durable(), Some(1));
+        sink.mark_durable(0, true);
+        assert_eq!(sink.durable(), Some(1), "never moves back");
+        sink.mark_durable(2, false);
+        assert_eq!(sink.durable(), None, "a failed flush, for good");
+        sink.mark_durable(2, true);
+        assert_eq!(sink.durable(), None);
     }
 }

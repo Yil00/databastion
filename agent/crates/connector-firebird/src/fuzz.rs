@@ -259,6 +259,93 @@ pub fn proc_net_tcp(data: &[u8]) {
 /// assembled into records, each parsed under both name-line grammars and
 /// converted with a fixed catalog, then made an event. Never a panic, and
 /// every record bounded.
+/// The Firebird Audit parser checkpoint (ADR-0060 R25 items 7 and 9): the
+/// first byte selects the decoder: the checkpoint body (position, parser
+/// state, deduplication positions), the persisted ledger, or the parser
+/// state restored into a stream (after the identity and run that a real
+/// body starts with, so the state decoder is reached). A state restored is
+/// exported again, and that export restores to itself: never a panic, a
+/// partial restore or a state past the stream's bounds.
+pub fn checkpoint(data: &[u8]) {
+    use std::sync::Arc;
+    use std::time::Instant;
+    let [sel, rest @ ..] = data else {
+        return;
+    };
+    match sel % 4 {
+        0 => {
+            let _ = crate::audit_ckpt::Body::decode(rest);
+        }
+        1 => {
+            let _ = crate::own::Saved::decode(rest);
+        }
+        2 => {
+            let _ = crate::ckpt::envelope_body(crate::audit_ckpt::MAGIC, rest)
+                .map(crate::audit_ckpt::Body::decode);
+        }
+        _ => {
+            let Some(key) = databastion_classifiers::masking::HmacKey::new(&[9; 32])
+                .ok()
+                .and_then(|k| k.local_tag_key("databastion.audit.cursor"))
+            else {
+                return;
+            };
+            let key = Arc::new(key);
+            let make = || {
+                let mut m = crate::stream::Machine::new(
+                    fuzz_settings(),
+                    Arc::new(crate::own::Ledger::default()),
+                );
+                m.enable_checkpoint(Arc::clone(&key));
+                m.confirm_run(crate::stream::Run {
+                    pid: 24,
+                    start: Some(4242),
+                });
+                m
+            };
+            let mut m = make();
+            let Some(mut body) = m.body_prefix() else {
+                return;
+            };
+            body.extend_from_slice(rest);
+            let now = Instant::now();
+            if m.import(&body, now).is_err() {
+                assert_eq!(m.state_bytes(), 0, "a refused body keeps nothing");
+                return;
+            }
+            assert!(m.state_bytes() <= crate::stream::MAX_STREAM_BYTES);
+            let Some(again) = m.export(now) else {
+                return;
+            };
+            let mut n = make();
+            assert!(n.import(&again, now).is_ok(), "an export restores");
+            assert_eq!(n.export(now), Some(again), "and restores to itself");
+        }
+    }
+}
+
+pub(crate) fn fuzz_settings() -> crate::stream::Settings {
+    let db = |label: &str| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(format!("/var/lib/firebird/data/{label}.fdb")),
+        alias: Some(label.to_owned()),
+        excluded: false,
+        attach: label.to_owned(),
+        read_at: None,
+    };
+    crate::stream::Settings {
+        databases: vec![db("app"), db("crm")],
+        aliases: Some(crate::trace_conf::AliasMap::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: crate::trace_log::ParseOptions {
+            max_sql_length: Some(65_000),
+            series: crate::trace_log::Series::V5,
+        },
+        superserver: true,
+    }
+}
+
 pub fn trace_log(data: &[u8]) {
     use crate::trace_events::{Catalog, Converted, RelClass, convert, to_event};
     use crate::trace_log::{Assembled, Assembler, MAX_RECORD, ParseOptions, Series, parse};

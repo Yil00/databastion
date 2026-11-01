@@ -33,8 +33,12 @@
 
 #[cfg_attr(not(test), allow(dead_code))]
 mod audit;
+#[cfg_attr(not(test), allow(dead_code))]
+mod audit_ckpt;
 mod catalog;
 mod check;
+#[cfg_attr(not(test), allow(dead_code))]
+mod ckpt;
 mod conn;
 mod crypt;
 mod discover;

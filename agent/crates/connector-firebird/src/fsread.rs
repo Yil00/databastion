@@ -205,17 +205,99 @@ pub(crate) fn process_start(pid: u32) -> Option<(u64, SystemTime)> {
     if !is_firebird(pid) {
         return None;
     }
+    start_of(pid)
+}
+
+/// What [`process_start`] gives for any process.
+///
+/// The wall-clock time is the time now less the time since the process
+/// started: the time since boot from `/proc/uptime` (centiseconds) less
+/// the start in ticks. `/proc/stat`'s `btime` is a whole second, cut
+/// down: a start computed from it can be up to a second early, so a file
+/// written in the second before the server started (a volume filled from
+/// the image when its container is created: their change times) looked
+/// changed since the start, and the trace configuration was not evaluated
+/// (`audit.trace_config_not_evaluated`, the declared database excluded as
+/// not shown not to be a security database, R9: the intermittent
+/// `e2e-firebird` Discovery failure with no finding). The result is moved
+/// [`START_MARGIN`] earlier, more than the ticks' and the centiseconds'
+/// cut together, so it is never later than the start (fail closed).
+/// `btime` is the fallback when `/proc/uptime` cannot be read.
+fn start_of(pid: u32) -> Option<(u64, SystemTime)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ticks = stat_start_ticks(&stat)?;
-    let btime = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())?;
     let hz = rustix::param::clock_ticks_per_second().max(1);
-    let started = SystemTime::UNIX_EPOCH
-        + Duration::from_secs(btime)
-        + Duration::from_millis(ticks.saturating_mul(1000) / hz);
-    Some((ticks, started))
+    let since_boot = Duration::from_millis(ticks.saturating_mul(1000) / hz);
+    // The time now is taken before `/proc/uptime` is read: a delay between
+    // the two reads (a preemption) makes the start earlier, never later.
+    let now = SystemTime::now();
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .as_deref()
+        .and_then(parse_uptime);
+    let btime = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())
+    });
+    let by_btime = btime.map(|b| SystemTime::UNIX_EPOCH + Duration::from_secs(b) + since_boot);
+    let by_uptime = uptime.and_then(|up| started_at(now, up, since_boot));
+    Some((ticks, choose_start(by_uptime, by_btime)?))
+}
+
+/// The start to use (security review M3 of round 2): the `/proc/uptime`
+/// one when it lies where the true start can be given the `btime` one
+/// (which is at most a second early, never late: from [`START_MARGIN`]
+/// before it to 1.1 s after it); otherwise the earlier of the two (a
+/// virtualised `/proc/uptime`, LXCFS in LXD, LXC or some Kubernetes nodes,
+/// counts from the container's start, not the host's boot). A wall-clock
+/// step between the server's start and now (NTP, `settimeofday`) moves
+/// both the same way (`btime` is the boot time on today's clock): the
+/// files' times, written on the earlier clock, are then compared with a
+/// start on today's, which a step back makes look later: a residual of any
+/// wall-clock comparison, as before.
+pub(crate) fn choose_start(
+    by_uptime: Option<SystemTime>,
+    by_btime: Option<SystemTime>,
+) -> Option<SystemTime> {
+    match (by_uptime, by_btime) {
+        (Some(u), Some(b)) => {
+            let low = b.checked_sub(START_MARGIN).unwrap_or(b);
+            let high = b + Duration::from_millis(1100);
+            Some(if u >= low && u <= high { u } else { u.min(b) })
+        }
+        (Some(u), None) => Some(u),
+        (None, b) => b,
+    }
+}
+
+/// How much earlier than measured a process start is taken: the tick
+/// (10 ms at 100 Hz) and `/proc/uptime`'s centisecond, each cut down, with
+/// room to spare.
+pub(crate) const START_MARGIN: Duration = Duration::from_millis(50);
+
+/// The first field of `/proc/uptime` (seconds since boot, two decimals).
+pub(crate) fn parse_uptime(text: &str) -> Option<Duration> {
+    let first = text.split_whitespace().next()?;
+    let (s, frac) = first.split_once('.').unwrap_or((first, "0"));
+    let secs: u64 = s.parse().ok()?;
+    if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let nanos: u32 = format!("{frac:0<9}").parse().ok()?;
+    Some(Duration::new(secs, nanos))
+}
+
+/// The wall-clock start of a process `since_boot` after boot, `uptime`
+/// after boot being `now`, moved [`START_MARGIN`] earlier.
+pub(crate) fn started_at(
+    now: SystemTime,
+    uptime: Duration,
+    since_boot: Duration,
+) -> Option<SystemTime> {
+    // An uptime below the process's time since boot is not the host's
+    // (a virtualised `/proc/uptime`): no start from it (never "now").
+    let ago = uptime.checked_sub(since_boot)? + START_MARGIN;
+    now.checked_sub(ago)
 }
 
 /// Field 22 of a `/proc/<pid>/stat` line (after the last `)`, the command
@@ -575,6 +657,89 @@ fn others_can(
 
 #[cfg(test)]
 mod tests {
+
+    /// The intermittent `e2e-firebird` failure: the computed start of a
+    /// process is within the margin of when it was started, never a second
+    /// early (as from `/proc/stat`'s whole-second `btime`), and never later.
+    #[test]
+    fn a_process_start_is_precise_and_never_late() {
+        let before = SystemTime::now();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let after = SystemTime::now();
+        let (_, started) = super::start_of(child.id()).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        // Never later than the start (ticks are cut down: up to one tick
+        // before `before`), never more than the margin and a tick early.
+        assert!(started <= after, "{started:?} after {after:?}");
+        let early = before.duration_since(started).unwrap_or_default();
+        assert!(
+            early <= super::START_MARGIN + Duration::from_millis(20),
+            "{early:?} early"
+        );
+    }
+
+    /// Security review M3 of round 2: the uptime start is used only where
+    /// the true start can be given the `btime` one; a late one (a
+    /// virtualised uptime) gives way to the earlier `btime` start, never
+    /// now.
+    #[test]
+    fn a_late_uptime_start_gives_way_to_btime() {
+        let b = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ms = Duration::from_millis;
+        // Within the window: the precise one.
+        assert_eq!(
+            super::choose_start(Some(b + ms(900)), Some(b)),
+            Some(b + ms(900))
+        );
+        assert_eq!(
+            super::choose_start(Some(b - ms(40)), Some(b)),
+            Some(b - ms(40))
+        );
+        // Later than 1.1 s after `btime`'s start: `btime`'s.
+        assert_eq!(super::choose_start(Some(b + ms(1200)), Some(b)), Some(b));
+        assert_eq!(
+            super::choose_start(Some(b + ms(3_600_000)), Some(b)),
+            Some(b)
+        );
+        // Earlier than the window: the earlier, itself.
+        assert_eq!(
+            super::choose_start(Some(b - ms(5000)), Some(b)),
+            Some(b - ms(5000))
+        );
+        assert_eq!(super::choose_start(None, Some(b)), Some(b));
+        assert_eq!(super::choose_start(Some(b), None), Some(b));
+        assert_eq!(super::choose_start(None, None), None);
+    }
+
+    #[test]
+    fn uptime_and_start_times() {
+        assert_eq!(
+            super::parse_uptime("7652.10 24577.93\n"),
+            Some(Duration::new(7652, 100_000_000))
+        );
+        assert_eq!(super::parse_uptime("12 3"), Some(Duration::from_secs(12)));
+        for bad in ["", "x.10 1", "1.x 2", "1. 2", "-1.0 2"] {
+            assert_eq!(super::parse_uptime(bad), None, "{bad}");
+        }
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // The local measurement: the volume filled at 11.766 s, the server
+        // started at 12.89 s; `btime` (cut to the second) put it at 11.93 s.
+        let started =
+            super::started_at(now, Duration::from_secs(500), Duration::from_secs(400)).unwrap();
+        assert_eq!(
+            now.duration_since(started).unwrap(),
+            Duration::from_secs(100) + super::START_MARGIN
+        );
+        // An uptime below the time since boot (LXCFS): no start from it.
+        assert_eq!(
+            super::started_at(now, Duration::from_secs(1), Duration::from_secs(2)),
+            None
+        );
+    }
     use super::*;
 
     #[test]

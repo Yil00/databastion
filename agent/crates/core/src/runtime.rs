@@ -2541,13 +2541,15 @@ impl Runtime {
 
     /// Converts and spools aggregated events of a target (the single
     /// conversion in `uplink::to_batches`).
+    /// Spools `events`; `false` when some of them could not be spooled
+    /// (not serializable, invalid, spool full, write error).
     fn spool_events(
         &self,
         target_id: &TargetId,
         events: &[databastion_classifiers::masking::MaskedEvent],
-    ) {
+    ) -> bool {
         if events.is_empty() {
-            return;
+            return true;
         }
         let fingerprints = crate::sanitize::HmacFingerprints(&self.hmac);
         let built = uplink::to_batches(uplink::MaskedResults::Events {
@@ -2556,6 +2558,7 @@ impl Runtime {
             fingerprints: &fingerprints,
         });
         self.count_unserializable(built.unserializable_batches);
+        let mut all = built.unserializable_batches == 0 && built.dropped_items == 0;
         let mut spool = self.lock_spool();
         spool.counters.dropped_items += built.dropped_items;
         if built.dropped_items > 0 {
@@ -2565,7 +2568,11 @@ impl Runtime {
             );
         }
         for batch in &built.batches {
-            if let Err(e) = spool.push(batch) {
+            let before = spool.counters.dropped_items;
+            let pushed = spool.push(batch);
+            // A batch the spool dropped (full, too large) is not durable.
+            all &= pushed.is_ok() && spool.counters.dropped_items == before;
+            if let Err(e) = pushed {
                 let lost = u64::try_from(batch.len()).unwrap_or(u64::MAX);
                 bump(&self.counters.events_lost, lost);
                 tracing::error!(
@@ -2578,10 +2585,12 @@ impl Runtime {
         }
         drop(spool);
         self.spool_pushed.notify_one();
+        all
     }
 
-    /// Filters and spools what the aggregator holds.
-    fn flush_events(&self, cfg: &AuditConfig, target_id: &TargetId, agg: &mut Aggregator) {
+    /// Filters and spools what the aggregator holds; `false` when some of
+    /// it could not be spooled.
+    fn flush_events(&self, cfg: &AuditConfig, target_id: &TargetId, agg: &mut Aggregator) -> bool {
         let (keep, drop): (Vec<_>, Vec<_>) = agg
             .drain()
             .into_iter()
@@ -2593,7 +2602,7 @@ impl Runtime {
             &self.counters.events_filtered,
             u64::try_from(drop.len()).unwrap_or(u64::MAX),
         );
-        self.spool_events(target_id, &keep);
+        self.spool_events(target_id, &keep)
     }
 
     /// Audit worker: runs one stream per target with enabled settings,
@@ -2829,6 +2838,14 @@ impl Runtime {
     ) -> AuditEnd {
         let (sink, mut rx) = EventSink::channel(EVENTS_CHANNEL);
         let mut agg = Aggregator::new(cfg.aggregation_window());
+        // Events received so far: once a flush spooled what the aggregator
+        // held, the first `received` events are durably handled (the
+        // connector reads it through `EventSink::durable`).
+        let mut received: u64 = 0;
+        let flush = |agg: &mut Aggregator, received: u64| {
+            let ok = self.flush_events(cfg, target_id, agg);
+            sink.mark_durable(received, ok);
+        };
         let mut stream = Box::pin(crate::panics::guard(connector.audit_stream(cfg, &sink)));
         let end = loop {
             let can_emit = self.events_can_emit();
@@ -2848,6 +2865,7 @@ impl Runtime {
                 }
                 ev = rx.recv(), if can_emit && !agg.is_full() => {
                     if let Some(e) = ev {
+                        received += 1;
                         bump(&self.counters.events_received, 1);
                         if agg.push(e, Instant::now()) {
                             bump(&self.counters.auth_failures_overflowed, 1);
@@ -2855,28 +2873,29 @@ impl Runtime {
                     }
                 }
                 () = tokio::time::sleep_until(sleep_to), if can_emit && deadline.is_some() => {
-                    self.flush_events(cfg, target_id, &mut agg);
+                    flush(&mut agg, received);
                 }
                 () = tokio::time::sleep(Duration::from_secs(1)), if !can_emit => {}
             }
             if agg.is_full() && self.events_can_emit() {
-                self.flush_events(cfg, target_id, &mut agg);
+                flush(&mut agg, received);
             }
         };
         // The connector future is dropped here (no more cursor updates);
         // what it handed over is kept.
         drop(stream);
-        drop(sink);
         while let Ok(e) = rx.try_recv() {
+            received += 1;
             bump(&self.counters.events_received, 1);
             if agg.push(e, Instant::now()) {
                 bump(&self.counters.auth_failures_overflowed, 1);
             }
             if agg.is_full() {
-                self.flush_events(cfg, target_id, &mut agg);
+                flush(&mut agg, received);
             }
         }
-        self.flush_events(cfg, target_id, &mut agg);
+        flush(&mut agg, received);
+        drop(sink);
         end
     }
 

@@ -54,12 +54,23 @@
 //!   credit's bounds, a block within the text's relations and the
 //!   metadata-loading set, no signal.
 //!
+//! - **The parser checkpoint** (R25 items 7 and 9, R39 (a)): the state is
+//!   exported where nothing is held ([`Machine::export`], module
+//!   `stream_ckpt`), or, while a block-less group pends, as it was before
+//!   the record that started the hold (a snapshot); every event carries
+//!   the position it is attributed to (its record, or a group's first
+//!   record), and a restored stream emits nothing for a position whose
+//!   events were durably spooled before the restart (deduplication by
+//!   position).
+//!
 //! Not implemented here (each fail closed or left to the stream's caller,
 //! listed in the lot 3 report): the stop of R1 rule 2 (records of an
-//! unconfirmed pid are ambiguous instead), R1 rule 9, the checkpoint of
-//! parser state (R25 items 7 and 9: positions are held back instead and
-//! the records re-read for state), local external data sources (R29:
-//! their `<internal>` attachments are ambiguous, as R18 item 3 accepted).
+//! unconfirmed pid are ambiguous instead), R1 rule 9, local external data
+//! sources (R29: their `<internal>` attachments are ambiguous, as R18 item
+//! 3 accepted).
+
+#[path = "stream_ckpt.rs"]
+mod stream_ckpt;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -130,7 +141,7 @@ pub(crate) struct DeclaredNames {
 }
 
 /// Database identity (R1 rule 3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum DbId {
     Declared(usize),
     /// A keyed hash of the printed name (never kept in clear).
@@ -191,7 +202,7 @@ type Key = (DbId, u64);
 /// What a held DDL record's database waits on (re-review M-1, round 4
 /// M-1b): a transaction's end record (or its binding's end), or a
 /// binding's end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Pend {
     Tra(Key, u64),
     Binding(Key),
@@ -232,6 +243,8 @@ struct Group {
     first: u64,
     /// The position of its first block-less record (R25 item 1).
     first_bare: Option<u64>,
+    /// The position of its last record (its events' key).
+    last: u64,
 }
 
 impl Group {
@@ -339,7 +352,52 @@ struct Member {
 struct Held {
     db: Vec<usize>,
     event: MaskedEvent,
+    /// The position it is attributed to.
+    key: Option<DKey>,
 }
+
+/// The position an event is attributed to (R25 item 7's deduplication by
+/// position): its record's, or for the events of a group that ended
+/// without folding, the group's members: its first record's position, its
+/// number of records and its last record's position (`group`). A re-read
+/// that groups the records otherwise (a group ended by reading time, a cap
+/// or shedding on the first reading, not on the re-read) gives another
+/// key, so its events are sent, never suppressed for another group's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct DKey {
+    /// The log file's `(st_dev, st_ino)`.
+    pub(crate) file: (u64, u64),
+    /// The record's first byte (a group: its first record's).
+    pub(crate) off: u64,
+    pub(crate) group: bool,
+    /// A group's records (0 for a record).
+    pub(crate) members: u64,
+    /// A group's last record's first byte (0 for a record).
+    pub(crate) last: u64,
+}
+
+/// The state as it was before the record that started a block-less hold
+/// (the checkpoint while the hold lasts, R25 item 7).
+#[derive(Debug, Clone)]
+pub(crate) struct Snapshot {
+    pub(crate) file: (u64, u64),
+    pub(crate) pos: u64,
+    pub(crate) body: Vec<u8>,
+    /// [`Machine::step`] when it was taken.
+    pub(crate) step: u64,
+    /// Reading time when it was taken.
+    taken: Instant,
+}
+
+/// Snapshots are taken at most this often (each copies the state): a
+/// hold that starts sooner after the last one keeps the older snapshot, a
+/// valid state at an earlier position (a longer re-read, never a loss).
+const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
+/// The largest state a snapshot is taken of (each block-less hold copies
+/// it); past it, no snapshot, so no new checkpoint while the hold lasts
+/// (the last one stays: a longer re-read, fail closed).
+const MAX_SNAPSHOT_STATE: usize = 4 << 20;
 
 /// The held state of one event, in bytes (R25 item 6's budget).
 fn held_bytes(ev: &MaskedEvent) -> usize {
@@ -369,6 +427,9 @@ pub(crate) struct Counts {
     pub(crate) reread: u64,
     /// Bindings evicted under R1 rule 11's global cap.
     pub(crate) evicted: u64,
+    /// Events not emitted again after a restart: their position's events
+    /// had been durably spooled (R25 item 7).
+    pub(crate) deduped: u64,
     /// Statement records of the agent's own anchored attachments whose
     /// block or count matched no credit's own-statement table row (the
     /// engine-matrix test of R20 expects none).
@@ -486,6 +547,36 @@ pub(crate) struct Machine {
     /// Ambiguous records by the rule (source line) that judged them, for
     /// the tests and the local detail.
     pub(crate) why: std::collections::BTreeMap<u32, u64>,
+    /// The agent key's sub-key: undeclared databases' hashes stable across
+    /// restarts, and the checkpoint's identity tag (`None`: no checkpoint).
+    tag_key: Option<std::sync::Arc<databastion_classifiers::masking::LocalTagKey>>,
+    /// The position of each event pushed to the caller's output, and the
+    /// step it was emitted at (taken with [`Self::take_keys`]).
+    keys: Vec<(Option<DKey>, u64)>,
+    /// The position the record being read attributes its events to.
+    cur: Option<DKey>,
+    /// Positions whose events were durably spooled before a restart: not
+    /// emitted again (R25 item 7).
+    suppress: std::collections::HashSet<DKey>,
+    /// The positions suppressed, with their step (still sent: kept for the
+    /// next checkpoint).
+    suppressed: Vec<(DKey, u64)>,
+    /// Events emitted so far (held ones at their release).
+    step: u64,
+    /// Snapshots are taken (the stream checkpoints).
+    snapshots: bool,
+    snapshot: Option<Snapshot>,
+    /// Events are pushed with no position (a poll across a log reset: a
+    /// position there may name other content).
+    pub(crate) unkeyed: bool,
+    /// The suppressed positions were dropped (a run change, a log reset):
+    /// the checkpoint drops its restored ones too.
+    pub(crate) suppress_cleared: bool,
+    /// After a restore, the declared databases whose check results differ
+    /// from the previous process's (the decision of 2026-11-01 on L10):
+    /// every relation counts as dependent for the records re-read before
+    /// that process's read end, `(database, file, end)`.
+    reread_invalid: Vec<(usize, (u64, u64), u64)>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -540,6 +631,182 @@ impl Machine {
             window_ender: false,
             probe_seen: None,
             why: std::collections::BTreeMap::new(),
+            tag_key: None,
+            keys: Vec::new(),
+            cur: None,
+            suppress: std::collections::HashSet::new(),
+            suppressed: Vec::new(),
+            step: 0,
+            snapshots: false,
+            snapshot: None,
+            unkeyed: false,
+            suppress_cleared: false,
+            reread_invalid: Vec::new(),
+        }
+    }
+
+    /// The suppressed positions the read has passed are dropped: those
+    /// before `pos` in `file` (a group's while a pending group starts
+    /// there), and every one of another file.
+    pub(crate) fn prune_suppress(&mut self, file: (u64, u64), pos: u64) {
+        if self.suppress.is_empty() {
+            return;
+        }
+        let firsts = self.group_firsts();
+        self.suppress
+            .retain(|k| k.file == file && (k.off >= pos || (k.group && firsts.contains(&k.off))));
+        self.reread_invalid
+            .retain(|(_, f, end)| *f == file && *end > pos);
+    }
+
+    /// A log reset (a truncation, a rotation): positions read before it may
+    /// name other content now. Nothing is suppressed any more, the snapshot
+    /// is dropped, and the re-read invalidation ends.
+    pub(crate) fn reset_positions(&mut self) {
+        self.suppress.clear();
+        self.suppress_cleared = true;
+        self.snapshot = None;
+        self.reread_invalid.clear();
+    }
+
+    /// After a restore: the databases invalidated for the records re-read
+    /// before `end` of `file` (the decision of 2026-11-01 on L10).
+    pub(crate) fn set_reread_invalid(&mut self, file: (u64, u64), dbs: &[(usize, u64)]) {
+        self.reread_invalid = dbs
+            .iter()
+            .filter(|(d, _)| *d < self.s.databases.len())
+            .map(|(d, e)| (*d, file, *e))
+            .collect();
+    }
+
+    /// The re-read invalidations still to apply, `(database, end)` in
+    /// `file` (written with the next checkpoint).
+    pub(crate) fn reread_invalid(&self, file: (u64, u64)) -> Vec<(usize, u64)> {
+        self.reread_invalid
+            .iter()
+            .filter(|(_, f, _)| *f == file)
+            .map(|(d, _, e)| (*d, *e))
+            .collect()
+    }
+
+    fn reread_dirty(&self, db: usize, pos: u64) -> bool {
+        self.reread_invalid
+            .iter()
+            .any(|(d, f, e)| *d == db && *f == self.file && pos < *e)
+    }
+
+    /// Enables the checkpoint: the agent key's sub-key (stable hashes of
+    /// undeclared databases, the identity tag) and the snapshots of R25
+    /// item 7. Before any record.
+    pub(crate) fn enable_checkpoint(
+        &mut self,
+        key: std::sync::Arc<databastion_classifiers::masking::LocalTagKey>,
+    ) {
+        self.tag_key = Some(key);
+        self.snapshots = true;
+    }
+
+    /// The positions not to emit again (restored with a checkpoint).
+    pub(crate) fn set_suppress(&mut self, keys: std::collections::HashSet<DKey>) {
+        self.suppress = keys;
+    }
+
+    /// The positions of the events pushed since the last call, in order,
+    /// with their step.
+    pub(crate) fn take_keys(&mut self) -> Vec<(Option<DKey>, u64)> {
+        std::mem::take(&mut self.keys)
+    }
+
+    /// The positions suppressed since the last call.
+    pub(crate) fn take_suppressed(&mut self) -> Vec<(DKey, u64)> {
+        std::mem::take(&mut self.suppressed)
+    }
+
+    /// The positions some of whose events are still held.
+    pub(crate) fn held_keys(&self) -> std::collections::HashSet<DKey> {
+        self.held.iter().filter_map(|h| h.key).collect()
+    }
+
+    /// Events emitted so far.
+    pub(crate) fn step(&self) -> u64 {
+        self.step
+    }
+
+    /// A block-less group pends: the position is held back to it.
+    pub(crate) fn blockless_pending(&self) -> bool {
+        self.groups.iter().any(Group::blockless)
+    }
+
+    /// The first positions of the pending groups (their keys may come
+    /// again).
+    pub(crate) fn group_firsts(&self) -> std::collections::HashSet<u64> {
+        self.groups.iter().map(|g| g.first).collect()
+    }
+
+    /// The pending groups' state in bytes (R25 item 4).
+    pub(crate) fn group_bytes(&self) -> usize {
+        self.groups.iter().map(Group::bytes).sum()
+    }
+
+    /// R25 item 9, first step: the oldest pending groups end, as item 3
+    /// says (their outputs to `out`), until the groups' state is at most
+    /// `budget` bytes. The number ended.
+    pub(crate) fn shed_groups(
+        &mut self,
+        budget: usize,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) -> usize {
+        let mut n = 0;
+        while self.group_bytes() > budget {
+            let Some(g) = self.groups.pop_front() else {
+                break;
+            };
+            self.end_group(g, now, cat, out);
+            n += 1;
+        }
+        if n > 0 && self.hold_since.is_some() && !self.blockless_pending() {
+            self.release(false, out);
+        }
+        n
+    }
+
+    /// The declared `attach` names (the ledger's keys).
+    pub(crate) fn attaches(&self) -> Vec<String> {
+        self.s.databases.iter().map(|d| d.attach.clone()).collect()
+    }
+
+    /// The snapshot of the current hold, if one was taken.
+    pub(crate) fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// Pushes one event to the caller's output, attributed to `key`; not
+    /// emitted again when its position was durably spooled before a
+    /// restart.
+    fn put(&mut self, out: &mut Vec<Emitted>, db: usize, ev: MaskedEvent, key: Option<DKey>) {
+        self.step += 1;
+        let key = key.filter(|_| !self.unkeyed);
+        if let Some(k) = key
+            && self.suppress.contains(&k)
+        {
+            self.counts.deduped += 1;
+            self.suppressed.push((k, self.step));
+            return;
+        }
+        out.push((db, ev));
+        self.keys.push((key, self.step));
+    }
+
+    /// The key of a group's events.
+    fn group_key(&self, g: &Group) -> DKey {
+        DKey {
+            file: self.file,
+            off: g.first,
+            group: true,
+            members: g.full.count + g.bare.count,
+            last: g.last,
         }
     }
 
@@ -579,6 +846,12 @@ impl Machine {
     /// New settings from a re-evaluation (names, map, proof 11).
     pub(crate) fn reconfigure(&mut self, s: Settings) {
         self.s = s;
+        self.clear_invalidations();
+    }
+
+    /// The invalidations a check's catalog read clears (after a new check,
+    /// and after a restore under the current check's settings).
+    pub(crate) fn clear_invalidations(&mut self) {
         // R41 item 8: a database's sets are valid again only when this
         // check's catalog read started after every DDL transaction seen
         // since ended (none still open) and after the latest invalidating
@@ -660,6 +933,12 @@ impl Machine {
             self.invalidate(db, wall);
         }
         self.probe_records.clear();
+        // The positions restored for the old run are not suppressed in the
+        // new one (fail closed: sent again).
+        if !self.suppress.is_empty() {
+            self.suppress.clear();
+            self.suppress_cleared = true;
+        }
         // Review L-B: the run's pending groups end as R25 item 3 says (at the
         // next record or reading-time bound), never dropped silently.
         let groups: Vec<Group> = self.groups.drain(..).collect();
@@ -1146,7 +1425,21 @@ impl Machine {
 
     fn hash(&self, name: &str) -> u64 {
         use std::hash::BuildHasher;
-        self.hash_key.hash_one(name)
+        // R1 rule 11: a keyed hash under the agent's key, stable across
+        // restarts (the checkpoint keeps undeclared identities by it).
+        match &self.tag_key {
+            Some(k) => {
+                let t = crate::ckpt::tag(
+                    k,
+                    b"databastion.firebird.undeclared_database.v1",
+                    &[name.as_bytes()],
+                );
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&t[..8]);
+                u64::from_be_bytes(b)
+            }
+            None => self.hash_key.hash_one(name),
+        }
     }
 
     fn resolve(&self, printed: &str) -> Resolved {
@@ -1229,6 +1522,13 @@ impl Machine {
         out: &mut Vec<Emitted>,
     ) {
         self.counts.records += 1;
+        self.cur = Some(DKey {
+            file: self.file,
+            off: pos,
+            group: false,
+            members: 0,
+            last: 0,
+        });
         // Review L3: the whole record (parse, judgement, view sets, event)
         // under the panic isolation; a record that panics, or whose header
         // does not parse, is ambiguous (loud), never dropped.
@@ -1246,6 +1546,7 @@ impl Machine {
                 self.loud(now, cat, out);
             }
         }
+        self.cur = None;
     }
 
     /// One record; `false` when it does not parse.
@@ -1262,8 +1563,16 @@ impl Machine {
         // dependent.
         let named = std::mem::take(&mut self.ddl_named);
         self.ddl_named_lent = named.keys().copied().collect();
-        let all = self.all_relations.clone();
-        let invalid = self.views_invalid.clone();
+        let mut all = self.all_relations.clone();
+        let mut invalid = self.views_invalid.clone();
+        // L10 (decision of 2026-11-01): a database whose check results
+        // changed while the agent was stopped, in the re-read region.
+        for db in 0..self.s.databases.len() {
+            if self.reread_dirty(db, pos) {
+                all.insert(db);
+                invalid.insert(db);
+            }
+        }
         let wrapped: Vec<Invalidated<'_>> = cat
             .iter()
             .enumerate()
@@ -1298,6 +1607,28 @@ impl Machine {
         let Some(rec) = parse(raw, self.s.parse) else {
             return false;
         };
+        // R25 item 7: a block-less routine record may start a hold, and
+        // the position is then held back to it: the state before it is the
+        // checkpoint while the hold lasts.
+        if self.snapshots
+            && matches!(rec.body, Body::Routine { .. })
+            && rec.trailer.block.is_none()
+            && !self.blockless_pending()
+            && self.snapshot.as_ref().is_none_or(|s| {
+                s.file != self.file || now.duration_since(s.taken) >= SNAPSHOT_EVERY
+            })
+        {
+            self.snapshot = (self.state_bytes() <= MAX_SNAPSHOT_STATE)
+                .then(|| self.export(now))
+                .flatten()
+                .map(|body| Snapshot {
+                    file: self.file,
+                    pos,
+                    body,
+                    step: self.step,
+                    taken: now,
+                });
+        }
         self.window_ender = false;
         // Test support: a record that makes the rules panic (L3's test).
         #[cfg(test)]
@@ -1327,6 +1658,26 @@ impl Machine {
         self.counts.records += 1;
         self.counts.oversized += 1;
         self.loud(now, cat, out);
+    }
+
+    /// [`Self::unreadable`] for the record at `pos` (its events attributed
+    /// to that position).
+    pub(crate) fn unreadable_at(
+        &mut self,
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) {
+        self.cur = Some(DKey {
+            file: self.file,
+            off: pos,
+            group: false,
+            members: 0,
+            last: 0,
+        });
+        self.unreadable(now, cat, out);
+        self.cur = None;
     }
 
     /// A record of which nothing is known (unreadable, unparsable, or its
@@ -1430,7 +1781,7 @@ impl Machine {
                 h.event
             };
             for d in h.db {
-                out.push((d, ev.clone()));
+                self.put(out, d, ev.clone(), h.key);
             }
         }
     }
@@ -2316,6 +2667,7 @@ impl Machine {
             } else {
                 g.full.add(m);
             }
+            g.last = g.last.max(pos);
             return true;
         }
         let per = self.groups.iter().filter(|g| g.key == key).count();
@@ -2338,6 +2690,7 @@ impl Machine {
             started: now,
             first: pos,
             first_bare: None,
+            last: pos,
         };
         if m.block_less {
             g.first_bare = Some(pos);
@@ -2362,10 +2715,12 @@ impl Machine {
         let DbId::Declared(db) = g.key.0 else {
             return;
         };
+        let key = Some(self.group_key(&g));
         if g.full.count > 0
             && let Some(d) = finish(g.full.draft())
         {
-            out.push((db, self.draft_event(&d, None, db)));
+            let ev = self.draft_event(&d, None, db);
+            self.put(out, db, ev, key);
         }
         if g.blockless() {
             *self.why.entry(1).or_default() += g.bare.count;
@@ -2375,7 +2730,8 @@ impl Machine {
             d.star = true;
             d.always = true;
             if let Some(d) = finish(d) {
-                out.push((db, self.draft_event(&d, None, db)));
+                let ev = self.draft_event(&d, None, db);
+                self.put(out, db, ev, key);
             }
             if self.hold_since.is_some() {
                 self.release(true, out);
@@ -2732,11 +3088,13 @@ impl Machine {
                 self.held.push(Held {
                     db: vec![db],
                     event: ev,
+                    key: self.cur,
                 });
                 return;
             }
         }
-        out.push((db, ev));
+        let key = self.cur;
+        self.put(out, db, ev, key);
     }
 
     /// The own-record rule (decision 6, R8 item 4, R13, R22, R35).
@@ -2825,8 +3183,11 @@ impl Machine {
         // The own-statement table's row (R13, R20, R23), the credit's
         // R22 / R35 bounds and its life on both sides (R42 item 5),
         // checked before the credit is consumed.
+        let tag_key = self.tag_key.as_deref();
         let accept = |a: &crate::conn::FetchAccount, table: Option<&str>, at: SystemTime| {
-            crate::own_table::matches(text, table, &block, fetched, a)
+            // A restored credit's table is a tag: the block's relation it is.
+            let table = crate::own::credit_table(table, &block, tag_key);
+            crate::own_table::matches(text, table.as_deref(), &block, fetched, a)
                 && crate::own::within(a, fetched, failed)
                 && t <= at + crate::own::LIFETIME_SLACK
                 && t + crate::own::CREDIT_LIFE >= at

@@ -462,6 +462,17 @@ sleep 3
 # The log is the server's (0600, uid 84): read through the container, written here by the caller.
 timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log > "$WORK/audit.log"
 [ -s "$WORK/audit.log" ] || { echo "[it] the audit log is empty" >&2; exit 1; }
+# R39 (a) with the parser checkpoint (ADR-0060 R25 items 7 and 9): an agent restart in the middle
+# of one of its own records, on this log and the ledger of the reads that wrote it. Two runs of the
+# test binary, so two agent processes: the first reads up to the cut and leaves its checkpoint and
+# ledger in a 0700 directory; the second, with an empty ledger, reads the rest and must read the
+# log as one process without a restart does (own records credited, nothing made ambiguous). Right
+# after the matrix phase, within the credits' 15-minute life.
+mkdir -m 0700 "$WORK/restart"
+for phase in 1 2; do
+  run_tests "audit::ckpt_tests::it_restart_phase_$phase" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
+    FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_RESTART_DIR="$WORK/restart" >&2
+done
 
 # Round 4 M-1b (ADR-0060 R41 item 8): DDL records whose text the reader cannot take, each
 # committed after an intervening check (placed by the test), written after the log above was

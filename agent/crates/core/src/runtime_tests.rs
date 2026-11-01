@@ -3795,6 +3795,119 @@ impl Connector for FakeAudit {
     }
 }
 
+/// Submits three events, then records what the sink says is durable once
+/// the core flushed them (ADR-0060 R25 item 7's durability order).
+struct DurableAudit {
+    durable: Arc<AtomicU64>,
+    submitted: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl Connector for DurableAudit {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Full,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        sink: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        for i in 0..3 {
+            sink.submit(fake_event(10 + i)).await?;
+        }
+        self.submitted.store(sink.submitted(), Ordering::SeqCst);
+        loop {
+            if let Some(d) = sink.durable() {
+                self.durable.store(d, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    fn supports_audit(&self) -> bool {
+        true
+    }
+    fn audit_source(
+        &self,
+        _: &crate::config::TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        Some(databastion_classifiers::masking::EventSource::Pgaudit)
+    }
+}
+
+/// The sink's durable count reaches the events submitted only once the
+/// core spooled them (after the aggregation window), never before.
+#[tokio::test]
+async fn the_event_sink_tells_when_events_are_spooled() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let durable = Arc::new(AtomicU64::new(0));
+    let submitted = Arc::new(AtomicU64::new(0));
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(DurableAudit {
+            durable: Arc::clone(&durable),
+            submitted: Arc::clone(&submitted),
+        })],
+    )
+    .unwrap();
+    const ON: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f8a";
+    let body = serde_json::json!({ "jobs": [
+        audit_job(ON, serde_json::json!({
+            "enabled": true, "aggregation_window_s": 1, "poll_interval_s": 1,
+            "sensitive_objects": []})),
+    ]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let (stop, shutdown) = watch::channel(false);
+    let worker = rt.audit_loop(shutdown);
+    let driver = async {
+        let mut before_spool = None;
+        for _ in 0..200 {
+            if rt.lock_spool().status().batches.0 > 0 {
+                break;
+            }
+            before_spool.get_or_insert(durable.load(Ordering::SeqCst));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..100 {
+            if durable.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop.send(true).unwrap();
+        before_spool
+    };
+    let (r, before_spool) = tokio::join!(worker, driver);
+    r.unwrap();
+    assert_eq!(before_spool, Some(0), "nothing durable before the spool");
+    assert_eq!(submitted.load(Ordering::SeqCst), 3);
+    assert_eq!(durable.load(Ordering::SeqCst), 3);
+}
+
 fn audit_job(id: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "job_id": id, "type": "audit.configure", "created_at": "2026-09-28T14:00:00Z",

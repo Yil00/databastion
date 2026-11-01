@@ -95,6 +95,8 @@ jobs:
           # ADR-0060 refinement of 2026-10-31 (R52 item 4): the identity files of the readers
           # check and the mount-id lookup.
           - { target: firebird_host_identity, seconds: 180 }
+          # ADR-0060 R25 items 7 and 9: the Audit stream's persisted parser checkpoint and ledger.
+          - { target: firebird_checkpoint, seconds: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
