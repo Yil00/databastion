@@ -2313,3 +2313,69 @@ fn an_ambiguous_ddl_record_of_an_undeclared_database_invalidates_nothing() {
     assert!(!marked, "{n:?}");
     assert!(!m.all_relations_for_tests(0));
 }
+
+/// A catalog with the linger the last check read (R30 item 3).
+struct LingerCat(Option<u32>);
+impl Catalog for LingerCat {
+    fn class(&self, r: &str) -> RelClass {
+        Cat.class(r)
+    }
+    fn always_view(&self, _: &str) -> bool {
+        false
+    }
+    fn linger(&self) -> Option<u32> {
+        self.0
+    }
+}
+
+/// R30 item 3, with the linger `check()` reads (ADR-0060 R60): a Garbage
+/// Collector alone on its database is expected to end within 10 s of
+/// reading time, or within L + 10 s when the linger L is known and above
+/// 0. Its `COMMIT_TRANSACTION` 20 s later is well formed under a linger of
+/// 15 s, and ambiguous with no linger, a linger of 0 or one not known (the
+/// binding ended at 10 s: fail closed, as before).
+#[test]
+fn the_garbage_collectors_end_follows_the_linger() {
+    let gc = "24:0x7f0000000500";
+    let ctx = format!(
+        "\t{APP} (ATT_2, Garbage Collector, NONE, <internal>)\n\t\t(TRA_8, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)\n"
+    );
+    let start = format!(
+        "{HEAD} ({gc}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({gc}) START_TRANSACTION\n{ctx}\n"
+    );
+    let end = format!(
+        "{HEAD} ({gc}) COMMIT_TRANSACTION\n{ctx}      0 ms\n\n{HEAD} ({gc}) TRACE_FINI\n\tSESSION_1 Firebird Audit\n\t\n\n"
+    );
+    for (linger, after, ambiguous) in [
+        (Some(15), 20, false),
+        (Some(15), 26, true),
+        (Some(0), 20, true),
+        (None, 20, true),
+        (None, 5, false),
+        (Some(3600), 3000, false),
+    ] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1),
+        });
+        let cat = LingerCat(linger);
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let now = Instant::now();
+        feed_raw(&mut m, &cats, start.as_bytes(), 0, now);
+        assert_eq!(m.counts.ambiguous, 0, "{linger:?}: {:?}", m.why);
+        let later = now + Duration::from_secs(after);
+        let mut out = Vec::new();
+        m.expire(later, &cats, &mut out);
+        feed_raw(&mut m, &cats, end.as_bytes(), 10_000, later);
+        assert_eq!(
+            m.counts.ambiguous > 0,
+            ambiguous,
+            "linger {linger:?}, {after} s: {:?}",
+            m.why
+        );
+    }
+    assert_eq!(gc_end(None), Duration::from_secs(10));
+    assert_eq!(gc_end(Some(0)), Duration::from_secs(10));
+    assert_eq!(gc_end(Some(15)), Duration::from_secs(25));
+}

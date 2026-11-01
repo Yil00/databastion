@@ -1149,6 +1149,45 @@ async fn the_lot_3_texts_and_the_ledger() {
     s.close().await;
 }
 
+/// R30 item 3 (ADR-0060 R60): `check()`'s linger read, as the minimal
+/// account with no grant on the database: 0 on a database whose linger was
+/// never set (`RDB$LINGER` NULL), 7 on `linger.fdb` (`dev/firebird/it.sh`
+/// sets `LINGER TO 7` there, outside the trace and the dev seed).
+#[tokio::test]
+async fn the_linger_on_the_server() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    for (db, want) in [
+        (attach(), Some(0)),
+        ("/var/lib/firebird/data/linger.fdb".to_owned(), Some(7)),
+    ] {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut s = crate::conn::connect(
+            &endpoint,
+            password.as_bytes(),
+            &db,
+            deadline,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        crate::check::prepare(&mut s, false, deadline)
+            .await
+            .unwrap();
+        let state = crate::check::read_db_state(&mut s, deadline).await.unwrap();
+        eprintln!(
+            "[measure] linger read by the minimal account: {:?}",
+            state.linger
+        );
+        assert_eq!(state.linger, want, "{db}");
+        s.close().await;
+    }
+}
+
 /// The engine-matrix own-statement test of R20, phase 1 (`dev/firebird/
 /// it.sh` runs it before it copies the server's trace log): `check()` and a
 /// Discovery scan of the main database as the agent account, then the
@@ -1187,6 +1226,8 @@ async fn own_reads_for_the_matrix() {
         .await
         .unwrap();
     crate::views::read(&mut s, deadline).await.unwrap();
+    // R30 item 3 (R20: its row of the own-statement table).
+    crate::check::read_db_state(&mut s, deadline).await.unwrap();
     let _ = s
         .query(
             crate::sql::READ_BACK_PROBE,

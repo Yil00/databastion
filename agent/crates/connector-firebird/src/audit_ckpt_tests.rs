@@ -1320,6 +1320,7 @@ fn catalog(views: &[&str], dependent: &[&str], external: &[&str]) -> Classes {
             routines: Default::default(),
             complete: true,
         },
+        linger: None,
     }
 }
 
@@ -1520,6 +1521,28 @@ fn a_restore_while_stopped_invalidates_the_re_read() {
     );
     assert_eq!(k.invalidated, 1);
     assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+}
+
+/// ADR-0060 R60: the linger joins the digest (it sets the Garbage
+/// Collector's expected end, R30 item 3). A linger changed while the agent
+/// was stopped invalidates the re-read; the same linger, or none read
+/// twice, does not.
+#[test]
+fn a_linger_changed_while_stopped_invalidates_the_re_read() {
+    let c = |l: Option<u32>| catalog(&[], &[], &[]).with_linger(l);
+    let (k, out) = restart_with_catalogs("digest-linger", c(Some(0)), c(Some(15)));
+    assert_eq!((k.restored, k.invalidated), (1, 1));
+    assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+    let (k, _) = restart_with_catalogs("digest-linger-read", c(None), c(Some(0)));
+    assert_eq!((k.restored, k.invalidated), (1, 1), "a linger read since");
+    for l in [None, Some(0), Some(15)] {
+        let (k, out) = restart_with_catalogs("digest-linger-same", c(l), c(l));
+        assert_eq!((k.restored, k.invalidated), (1, 0), "{l:?}");
+        assert_eq!(marked(&out, "ORDERS"), Some(false), "{:?}", objects(&out));
+    }
+    let key = key();
+    assert_ne!(c(Some(1)).digest(&key), c(Some(2)).digest(&key));
+    assert_ne!(c(None).digest(&key), c(Some(0)).digest(&key));
 }
 
 /// The invalidation of a re-read goes on in the next checkpoint: a second

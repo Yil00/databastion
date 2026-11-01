@@ -120,8 +120,20 @@ const HOLD_TIME: Duration = Duration::from_secs(10);
 /// The largest change of a confirmed clock offset a credited record other
 /// than the read-back probe may make (one hour: a daylight-saving change).
 const OFFSET_STEP: i64 = 3600;
-/// R30 item 3: the Garbage Collector's expected end.
+/// R30 item 3: the Garbage Collector's expected end after the last other
+/// binding of its database ends, past the database's linger when the last
+/// check read one above 0 (with no linger, or the linger not known, this
+/// alone: a later record of the Garbage Collector is ambiguous, loud).
 const GC_END: Duration = Duration::from_secs(10);
+
+/// R30 item 3: the Garbage Collector's expected end for a database whose
+/// last check read the linger `linger` (seconds).
+pub(crate) fn gc_end(linger: Option<u32>) -> Duration {
+    match linger {
+        Some(l) if l > 0 => GC_END + Duration::from_secs(u64::from(l)),
+        _ => GC_END,
+    }
+}
 
 /// The names one declared database can be printed under (R2 rule 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1754,10 +1766,14 @@ impl Machine {
         if self.hold_since.is_some() && !self.groups.iter().any(Group::blockless) {
             self.release(false, out);
         }
+        let linger = |d: &DbId| match d {
+            DbId::Declared(i) => cat.get(*i).and_then(|c| c.linger()),
+            DbId::Undeclared(_) => None,
+        };
         let gone: Vec<DbId> = self
             .gc_alone_since
             .iter()
-            .filter(|(_, t)| now.duration_since(**t) > GC_END)
+            .filter(|(d, t)| now.duration_since(**t) > gc_end(linger(d)))
             .map(|(d, _)| *d)
             .collect();
         for d in gone {
@@ -1836,6 +1852,10 @@ impl Catalog for Invalidated<'_> {
 
     fn computed(&self, relation: &str) -> bool {
         self.inner.computed(relation)
+    }
+
+    fn linger(&self) -> Option<u32> {
+        self.inner.linger()
     }
 }
 

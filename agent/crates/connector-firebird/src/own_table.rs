@@ -248,6 +248,8 @@ const STATEMENT_ROWS: &[Row] = &[
         loading: NONE,
         bound: limit(crate::views::MAX_ROWS),
     },
+    // R30 item 3: one row of `RDB$DATABASE`.
+    own_row(sql::LINGER, DB),
 ];
 
 /// The probe of `relation` (decision 4): `RDB$DATABASE` always, the probed

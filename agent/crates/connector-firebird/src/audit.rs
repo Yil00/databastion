@@ -86,6 +86,8 @@ pub(crate) struct Classes {
     complete: bool,
     /// The views that depend on an always-reported relation (R12 item 5).
     deps: crate::views::ViewDeps,
+    /// The database's linger in seconds (R30 item 3), `None` when not read.
+    linger: Option<u32>,
 }
 
 impl Classes {
@@ -113,7 +115,15 @@ impl Classes {
             user,
             complete: !c.relations_cut && c.relations_dropped == 0,
             deps,
+            linger: None,
         }
+    }
+
+    /// With the linger the check read (R30 item 3).
+    #[must_use]
+    pub(crate) fn with_linger(mut self, linger: Option<u32>) -> Self {
+        self.linger = linger;
+        self
     }
 }
 
@@ -125,7 +135,9 @@ impl Classes {
     /// relations classed as external-file tables (the block-blind set of
     /// R28) and as views; the dependent set of R41 (dependent objects,
     /// tables with a computed column and whether the columns were read,
-    /// routine names, whether those reads were complete). Names are sorted;
+    /// routine names, whether those reads were complete); the linger of R30
+    /// item 3 (ADR-0060 R60: it sets the Garbage Collector's expected end,
+    /// a state the checkpoint carries). Names are sorted;
     /// only the tag is kept. Any relation class or check result the stream
     /// comes to use beyond these must join the digest.
     pub(crate) fn digest(&self, key: &databastion_classifiers::masking::LocalTagKey) -> [u8; 32] {
@@ -152,6 +164,7 @@ impl Classes {
         w.bool(self.deps.computed_known);
         set(&mut w, &mut self.deps.routines.iter());
         w.bool(self.deps.complete);
+        w.opt_u64(self.linger.map(u64::from));
         crate::ckpt::tag(
             key,
             b"databastion.firebird.checkpoint.check_digest.v1",
@@ -212,6 +225,10 @@ impl Catalog for Classes {
     /// R41 item 6: any identifier token equal to a dependent object's name.
     fn dependent_token(&self, name: &str) -> bool {
         self.deps.dependent.contains(name.trim_end_matches(' '))
+    }
+
+    fn linger(&self) -> Option<u32> {
+        self.linger
     }
 }
 
@@ -281,6 +298,7 @@ impl std::fmt::Debug for Classes {
             .field("complete", &self.complete)
             .field("dependent_views", &self.deps.dependent.len())
             .field("dependencies_complete", &self.deps.complete)
+            .field("linger", &self.linger)
             .finish()
     }
 }
@@ -2376,6 +2394,7 @@ mod tests {
                 user: HashMap::from([("SECRET_TABLE".to_owned(), RelClass::Table)]),
                 complete: true,
                 deps: crate::views::ViewDeps::default(),
+                linger: None,
             },
             excluded: false,
             read_at: None,
@@ -2408,6 +2427,7 @@ mod tests {
                     .collect(),
                 complete: true,
             },
+            linger: None,
         };
         assert_eq!(c.class("RDB$CUSTOMER_ARCHIVE"), RelClass::Table);
         assert_eq!(c.class("RDB$RELATIONS"), RelClass::System);

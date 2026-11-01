@@ -432,6 +432,14 @@ else
   echo "[measure] expression index over a virtual relation: refused" >&2
 fi
 
+# ADR-0060 R30 item 3 (R60): a database with a linger, outside the trace and the dev seed, for
+# check()'s RDB$LINGER read (it::the_linger_on_the_server).
+{
+  cat "$WORK/root.pw"
+  printf "CREATE DATABASE '127.0.0.1/%s:/var/lib/firebird/data/linger.fdb';\n" "$PORT"
+  printf 'ALTER DATABASE SET LINGER TO 7;\nCOMMIT;\n'
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA >/dev/null
+
 # The tests run in the network namespace, as the calling user.
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
 run_tests() { # filter, then extra NAME=value settings

@@ -112,6 +112,11 @@ pub(crate) trait Catalog {
     fn computed(&self, _relation: &str) -> bool {
         false
     }
+    /// The database's linger in seconds, as the last check read it (R30
+    /// item 3); `None` when not known.
+    fn linger(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// An event before its principal and database are attached.
