@@ -70,6 +70,11 @@ const WRITE_EVERY: Duration = Duration::from_secs(1);
 const ENVELOPE: usize = 4 + 2 + 4 + 32;
 /// Declared databases of one target at most, in a checkpoint.
 const MAX_DATABASES: usize = 4096;
+/// Digests kept per database between two checkpoints; past it, one that
+/// never matches (the database is invalidated at a restart, fail closed).
+const MAX_DIGESTS: usize = 16;
+/// The digest kept past [`MAX_DIGESTS`].
+const NEVER: [u8; 32] = [0; 32];
 /// Commits in a row whose checkpoint does not fit the cap before the last
 /// one is dropped and the position held back as without one (review L3).
 const MAX_TOO_LARGE: u32 = 3;
@@ -87,10 +92,12 @@ pub(crate) struct Body {
     /// The end of what the writing process had read in `file` (the re-read
     /// region's end; `u64::MAX` when it read past `file`).
     pub(crate) read_end: u64,
-    /// Per declared database, a keyed digest of what its last check gave
-    /// the stream ([`crate::audit::Classes::digest`]: the decision of
-    /// 2026-11-01 on L10).
-    pub(crate) digests: Vec<[u8; 32]>,
+    /// Per declared database, the keyed digests of what the checks gave the
+    /// stream ([`crate::audit::Classes::digest`]: the decision of
+    /// 2026-11-01 on L10), every one in force since the state's position
+    /// (security review M2 of round 2): a restart whose check differs from
+    /// any of them invalidates the database.
+    pub(crate) digests: Vec<Vec<[u8; 32]>>,
     /// Re-read invalidations still running when it was written:
     /// `(database, end in file)`.
     pub(crate) invalid: Vec<(u32, u64)>,
@@ -107,8 +114,11 @@ impl Body {
         w.u64(self.pos);
         w.u64(self.read_end);
         w.len(self.digests.len());
-        for d in &self.digests {
-            w.bytes32(d);
+        for set in &self.digests {
+            w.len(set.len());
+            for d in set {
+                w.bytes32(d);
+            }
         }
         w.len(self.invalid.len());
         for (db, end) in &self.invalid {
@@ -139,10 +149,15 @@ impl Body {
         if read_end < pos {
             return Err(Bad);
         }
-        let n = r.len(MAX_DATABASES, 32)?;
+        let n = r.len(MAX_DATABASES, 4)?;
         let mut digests = Vec::with_capacity(n);
         for _ in 0..n {
-            digests.push(r.bytes32()?);
+            let m = r.len(MAX_DIGESTS, 32)?;
+            let mut set = Vec::with_capacity(m);
+            for _ in 0..m {
+                set.push(r.bytes32()?);
+            }
+            digests.push(set);
         }
         let n = r.len(MAX_DATABASES, 12)?;
         let mut invalid = Vec::with_capacity(n);
@@ -223,6 +238,27 @@ struct Pending {
     ticket: u64,
     /// The pending groups' first positions then.
     firsts: HashSet<u64>,
+    /// The digests in force since it was taken.
+    since: Vec<Vec<[u8; 32]>>,
+}
+
+/// Adds `current` to the digests in force per database.
+fn merge(sets: &mut Vec<Vec<[u8; 32]>>, current: &[[u8; 32]]) {
+    if sets.len() < current.len() {
+        sets.resize(current.len(), Vec::new());
+    }
+    for (set, d) in sets.iter_mut().zip(current) {
+        if set.contains(d) {
+            continue;
+        }
+        if set.len() + 1 >= MAX_DIGESTS {
+            if !set.contains(&NEVER) {
+                set.push(NEVER);
+            }
+        } else {
+            set.push(*d);
+        }
+    }
 }
 
 /// Counters of the checkpoint, for the tests and the local detail.
@@ -295,6 +331,9 @@ pub(crate) struct Checkpointer {
     boot: [u8; 32],
     /// Commits in a row whose checkpoint did not fit.
     too_large: u32,
+    /// Per declared database, the digests in force since the state of the
+    /// last checkpoint written (or restored) was taken.
+    hist: Vec<Vec<[u8; 32]>>,
 }
 
 impl Checkpointer {
@@ -364,6 +403,7 @@ impl Checkpointer {
             cap: databastion_core::audit::MAX_CHECKPOINT_BYTES,
             boot,
             too_large: 0,
+            hist: Vec::new(),
         })
     }
 
@@ -421,6 +461,7 @@ impl Checkpointer {
         resumed: Option<Resumed>,
         m: &mut Machine,
         digests: &[[u8; 32]],
+        len: Option<u64>,
         now: Instant,
     ) {
         let Some(l) = self.loaded.take() else {
@@ -440,21 +481,33 @@ impl Checkpointer {
             Ok(()) => {
                 m.clear_invalidations();
                 // L10 (decision of 2026-11-01): a database whose check
-                // results differ from the writing process's last check is
-                // invalidated for the records re-read up to that process's
-                // read end; the invalidations still running then go on.
+                // results differ from any in force since the state's
+                // position is invalidated for every record of the file read
+                // up to its length now (security review M2 of round 2: the
+                // records written while the agent was stopped too); the
+                // invalidations still running then go on.
                 let mut inv: Vec<(usize, u64)> = l
                     .body
                     .invalid
                     .iter()
                     .filter_map(|(d, e)| usize::try_from(*d).ok().map(|d| (d, *e)))
                     .collect();
+                let end = len.unwrap_or(u64::MAX);
                 for (i, d) in digests.iter().enumerate() {
-                    if l.body.digests.get(i) != Some(d) && l.body.read_end > l.body.pos {
-                        inv.push((i, l.body.read_end));
+                    let differs = l
+                        .body
+                        .digests
+                        .get(i)
+                        .is_none_or(|set| set.is_empty() || set.iter().any(|x| x != d));
+                    if differs && end > l.body.pos {
+                        inv.push((i, end));
                         self.counts.invalidated += 1;
                     }
                 }
+                // The digests in force since the restored state: its own
+                // and the current check's.
+                self.hist = l.body.digests.clone();
+                merge(&mut self.hist, digests);
                 m.set_reread_invalid(l.body.file, &inv);
                 // The next checkpoint carries the invalidation and the new
                 // digests, even with no other change.
@@ -587,12 +640,21 @@ impl Checkpointer {
         if self.pending.as_ref().is_some_and(|p| Some(p.file) != open) {
             self.pending = None;
         }
+        // Every check result in force since the last state written, and
+        // since the one taken (security review M2 of round 2).
+        merge(&mut self.hist, facts.0);
+        if let Some(p) = self.pending.as_mut() {
+            merge(&mut p.since, facts.0);
+        }
         let throttled = self
             .last
             .as_ref()
             .is_some_and(|l| now.duration_since(l.at) < self.every);
         if self.pending.is_none() && self.shed_until.is_none() && !throttled {
             self.pending = self.candidate(m, live, open, submitted, now);
+            if let Some(p) = self.pending.as_mut() {
+                merge(&mut p.since, facts.0);
+            }
         }
         let ready = self
             .pending
@@ -660,6 +722,7 @@ impl Checkpointer {
             step,
             ticket: submitted,
             firsts: m.group_firsts(),
+            since: Vec::new(),
         })
     }
 
@@ -668,6 +731,7 @@ impl Checkpointer {
     /// not passed.
     fn write(&mut self, p: Pending, m: &Machine, facts: Facts<'_>, now: Instant) {
         let (digests, read) = facts;
+        let since = p.since.clone();
         self.durable.retain(|_, s| *s >= p.step);
         self.restored.retain(|k| {
             k.file == p.file && (k.off >= p.pos || (k.group && p.firsts.contains(&k.off)))
@@ -701,7 +765,14 @@ impl Checkpointer {
             file: p.file,
             pos: p.pos,
             read_end,
-            digests: digests.to_vec(),
+            // Every digest in force since the last state written: a superset
+            // of those since this one's (taken after it, or a snapshot of a
+            // hold newer than it).
+            digests: {
+                let mut d = self.hist.clone();
+                merge(&mut d, digests);
+                d
+            },
             invalid: m
                 .reread_invalid(p.file)
                 .into_iter()
@@ -724,6 +795,8 @@ impl Checkpointer {
         }
         self.counts.written += 1;
         self.dirty = false;
+        // From now on, the digests in force since this state was taken.
+        self.hist = since;
         self.last = Some(Written {
             file: body.file,
             pos: body.pos,

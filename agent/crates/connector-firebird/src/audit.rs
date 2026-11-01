@@ -126,7 +126,8 @@ impl Classes {
     /// R28) and as views; the dependent set of R41 (dependent objects,
     /// tables with a computed column and whether the columns were read,
     /// routine names, whether those reads were complete). Names are sorted;
-    /// only the tag is kept.
+    /// only the tag is kept. Any relation class or check result the stream
+    /// comes to use beyond these must join the digest.
     pub(crate) fn digest(&self, key: &databastion_classifiers::masking::LocalTagKey) -> [u8; 32] {
         let mut w = crate::ckpt::Writer::default();
         let set = |w: &mut crate::ckpt::Writer, names: &mut dyn Iterator<Item = &String>| {
@@ -720,6 +721,7 @@ pub(crate) async fn stream(
         machine.confirm_run(r);
     }
     let mut runner = Runner {
+        log: audit.log.clone(),
         digests: ckpt
             .as_ref()
             .map(|c| cats.iter().map(|x| x.digest(&c.key())).collect())
@@ -958,6 +960,8 @@ struct Seen {
 }
 
 struct Runner {
+    /// The log's path (its length at a restore).
+    log: PathBuf,
     /// The parser checkpoint (`None` without a state directory or key).
     ckpt: Option<Checkpointer>,
     /// Per declared database, the digest of the current check's results
@@ -1021,7 +1025,17 @@ impl Runner {
         // The checkpoint, restored only when bound to exactly the position
         // the tailer resumed from (before any record is handed).
         if let Some(c) = self.ckpt.as_mut() {
-            c.on_open(self.tailer.take_resumed(), m, &self.digests, now);
+            let resumed = self.tailer.take_resumed();
+            // The log's length now (the re-read invalidation's end: the
+            // records written while the agent was stopped included).
+            let len = resumed.and_then(|r| {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::symlink_metadata(&self.log)
+                    .ok()
+                    .filter(|md| (md.dev(), md.ino()) == r.file)
+                    .map(|md| md.len())
+            });
+            c.on_open(resumed, m, &self.digests, len, now);
         }
         // A log reset in this poll (a truncation, a rotation; review M1): no
         // position read before it is trusted any more, and this poll's
@@ -1294,6 +1308,7 @@ mod tests {
         store: Option<databastion_core::audit::CursorStore>,
     ) -> Runner {
         Runner {
+            log: log.to_path_buf(),
             ckpt: None,
             digests: Vec::new(),
             shed: 0,
@@ -1934,6 +1949,7 @@ mod tests {
         let classes = Classes::default();
         let cats: Vec<&dyn Catalog> = vec![&classes];
         let mut r = Runner {
+            log: log.clone(),
             ckpt: None,
             digests: Vec::new(),
             shed: 0,

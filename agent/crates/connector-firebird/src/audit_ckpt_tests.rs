@@ -133,6 +133,7 @@ impl Proc {
         m.confirm_run(run);
         let digests = classes.iter().map(|c| c.digest(&k)).collect();
         let r = Runner {
+            log: dir.join("audit.log"),
             digests,
             ckpt: Some(ck),
             shed: 0,
@@ -1373,10 +1374,98 @@ fn restart_with_catalogs(
         vec![after],
     );
     p.read();
+    // After the restore: a read of CUSTOMERS, past the file's length then.
+    append(
+        &dir,
+        &format!(
+            "{}{}",
+            select(a, 3, 8, APP, "CUSTOMERS", 1),
+            attach("24:0x7f0000000400", 6, APP)
+        ),
+    );
+    p.read();
     let k = p.counts().1;
     let out = std::mem::take(&mut p.out);
     let _ = std::fs::remove_dir_all(&dir);
     (k, out)
+}
+
+impl Proc {
+    /// A new check's results (the stream's digests follow, as at a new
+    /// check generation).
+    fn set_classes(&mut self, classes: Vec<Classes>) {
+        let key = self.r.ckpt.as_ref().unwrap().key();
+        self.r.digests = classes.iter().map(|c| c.digest(&key)).collect();
+        self.classes = classes;
+    }
+}
+
+/// Security review M2 of round 2: the catalog changes between the commit
+/// that takes the checkpoint and the one that writes it; the restart's
+/// check equals the writer's last one. The records re-read from the
+/// checkpoint's position were first judged under the earlier catalog, so
+/// the database is invalidated for them (every digest in force since the
+/// state's position is kept).
+#[test]
+fn a_catalog_changed_before_the_checkpoint_is_written_invalidates() {
+    let dir = temp("digest-pending");
+    first_start(&dir);
+    let a = "24:0x7f0000000100";
+    let orders = select(a, 3, 6, APP, "ORDERS", 4);
+    let cut = orders.len() / 2;
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            attach(a, 3, APP),
+            select(a, 3, 5, APP, "CUSTOMERS", 2),
+            &orders[..cut]
+        ),
+    );
+    let c1 = || catalog(&[], &[], &[]);
+    let c2 = || catalog(&["V_NEW"], &["V_NEW"], &[]);
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![c1()],
+    );
+    p.read();
+    // Taken under c1 (CUSTOMERS not spooled yet: not written).
+    p.commit();
+    assert_eq!(p.counts().1.written, 0);
+    // A new check: c2; then the spool: written under c2.
+    p.set_classes(vec![c2()]);
+    p.read();
+    p.spooled();
+    p.commit();
+    assert_eq!(p.counts().1.written, 1);
+    drop(p);
+    append(
+        &dir,
+        &format!("{}{}", &orders[cut..], attach("24:0x7f0000000300", 5, APP)),
+    );
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![c2()],
+    );
+    p.read();
+    assert_eq!(
+        p.counts().1.invalidated,
+        1,
+        "c1 was in force since the state"
+    );
+    assert_eq!(
+        marked(&p.out, "ORDERS"),
+        Some(true),
+        "{:?}",
+        objects(&p.out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn marked(out: &[Emitted], rel: &str) -> Option<bool> {
@@ -1387,10 +1476,11 @@ fn marked(out: &[Emitted], rel: &str) -> Option<bool> {
 
 /// L10, decision of 2026-11-01: a view created while the agent was stopped
 /// (the check after the restart reads another dependent set) invalidates
-/// the database for the records re-read up to the previous process's read
-/// end: the `ORDERS` read cut by the restart is `*` and always reported;
-/// the `PAYROLL` read after that end is not. With the same check results,
-/// neither is.
+/// the database for the records of the log up to its length at the
+/// restore (security review M2 of round 2): the `ORDERS` read cut by the
+/// restart and the `PAYROLL` read written while stopped are `*` and always
+/// reported; the `CUSTOMERS` read written after the restore is not. With the
+/// same check results, none is.
 #[test]
 fn a_view_changed_while_stopped_invalidates_the_re_read() {
     let (k, out) = restart_with_catalogs(
@@ -1401,7 +1491,13 @@ fn a_view_changed_while_stopped_invalidates_the_re_read() {
     assert_eq!(k.restored, 1);
     assert_eq!(k.invalidated, 1);
     assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
-    assert_eq!(marked(&out, "PAYROLL"), Some(false), "{:?}", objects(&out));
+    assert_eq!(marked(&out, "PAYROLL"), Some(true), "{:?}", objects(&out));
+    assert_eq!(
+        marked(&out, "CUSTOMERS"),
+        Some(false),
+        "{:?}",
+        objects(&out)
+    );
     let (k, out) = restart_with_catalogs(
         "digest-same",
         catalog(&[], &[], &[]),
@@ -1409,6 +1505,7 @@ fn a_view_changed_while_stopped_invalidates_the_re_read() {
     );
     assert_eq!((k.restored, k.invalidated), (1, 0));
     assert_eq!(marked(&out, "ORDERS"), Some(false), "{:?}", objects(&out));
+    assert_eq!(marked(&out, "PAYROLL"), Some(false), "{:?}", objects(&out));
 }
 
 /// The same for a database restored while the agent was stopped from a
@@ -1473,7 +1570,9 @@ fn a_re_read_invalidation_survives_a_second_restart() {
         vec![changed()],
     );
     p.read();
-    assert_eq!(p.counts().1.invalidated, 0, "the digests agree now");
+    // The state is still the first process's (taken under the earlier
+    // check): its digest is kept, so the re-read is invalidated again.
+    assert_eq!(p.counts().1.invalidated, 1);
     assert_eq!(
         marked(&p.out, "ORDERS"),
         Some(true),
