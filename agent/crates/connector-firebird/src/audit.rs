@@ -909,10 +909,9 @@ pub(crate) async fn stream(
             if verdict.is_none() && waited < crate::stream::STOP_LIMIT {
                 // R1 rule 2: an immediate check, not merged with the early
                 // checks; again until one starts (a check running since
-                // before the stop does not confirm it).
-                if !st.requested {
-                    st.requested = early();
-                }
+                // before the stop does not confirm it), and again when one
+                // ended with no new result (a failed check, review L3).
+                st.request(&*early);
                 tokio::time::sleep(STOP_POLL).await;
                 continue;
             }
@@ -935,10 +934,8 @@ pub(crate) async fn stream(
         (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, sink).await?;
         // R1 rule 2: a stop asks for an immediate check at once; so does a
         // start-time change (R5 item 4).
-        if let Some(st) = runner.stop.as_mut()
-            && !st.requested
-        {
-            st.requested = early();
+        if let Some(st) = runner.stop.as_mut() {
+            st.request(&*early);
         }
         if std::mem::take(&mut machine.run_check_requested) && runner.stop.is_none() && !early() {
             machine.check_requested = true;
@@ -1256,8 +1253,22 @@ pub(crate) struct Stop {
     /// When it started (agent time, and wall time for the checks).
     since: Instant,
     wall: SystemTime,
-    /// An immediate check was started.
-    requested: bool,
+    /// When the last immediate check was started.
+    requested: Option<Instant>,
+}
+
+/// R1 rule 2 (review L3 of #402): a stopped stream asks for a check
+/// again this long after the last one it started, when no result came.
+const STOP_RETRY: Duration = Duration::from_secs(5);
+
+impl Stop {
+    /// Starts an immediate check, unless one was started less than
+    /// [`STOP_RETRY`] ago (`early` refuses while a check runs).
+    fn request(&mut self, early: &dyn Fn() -> bool) {
+        if self.requested.is_none_or(|t| t.elapsed() >= STOP_RETRY) && early() {
+            self.requested = Some(Instant::now());
+        }
+    }
 }
 
 impl Runner {
@@ -1546,7 +1557,7 @@ impl Runner {
                         pid: h.pid,
                         since: Instant::now(),
                         wall: SystemTime::now(),
-                        requested: false,
+                        requested: None,
                     });
                     tracing::info!(
                         "Firebird Audit stream stopped before a record of a new server pid; \
@@ -1849,6 +1860,39 @@ mod tests {
         let mut out = Vec::new();
         while r.poll(m, &cats, &mut out).unwrap() {}
         out
+    }
+
+    /// R1 rule 2 (review L3 of #402): a stopped stream starts its
+    /// immediate check, and starts another when the first ended with no
+    /// result (a failed check gives no new generation), never while one
+    /// runs.
+    #[test]
+    fn a_stop_asks_again_for_a_check_that_gave_no_result() {
+        let mut st = Stop {
+            pid: 99,
+            since: Instant::now(),
+            wall: SystemTime::now(),
+            requested: None,
+        };
+        let started = std::cell::Cell::new(0u32);
+        let running = std::cell::Cell::new(true);
+        let early = || {
+            if running.get() {
+                return false;
+            }
+            started.set(started.get() + 1);
+            true
+        };
+        st.request(&early);
+        assert_eq!(started.get(), 0, "a check runs: not started");
+        running.set(false);
+        st.request(&early);
+        assert_eq!(started.get(), 1);
+        st.request(&early);
+        assert_eq!(started.get(), 1, "not again at once");
+        st.requested = Some(Instant::now() - STOP_RETRY);
+        st.request(&early);
+        assert_eq!(started.get(), 2, "again: the first gave no result");
     }
 
     /// R1 rule 2, the stop: the record of a new pid stops the stream
