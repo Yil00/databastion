@@ -583,6 +583,37 @@ as_sysdba /opt/firebird/bin/gbak -rep -se "127.0.0.1/$PORT:service_mgr" \
 timeout 60 docker exec "$NAME" rm -f /tmp/it-restore.fbk
 run_tests it::restore_state_phase_2 FIREBIRD_IT_RESTORE_FILE="$WORK/restore.txt" >&2
 
+# ADR-0060 R1 rule 2 (the stop): the main server restarted under another pid (a shell starts a few
+# processes before the server, so its pid differs from the first run's, which was the container's
+# first process), then an isql workload. The log written from just before the restart is read by
+# audit::tests::it_run_change: the stream stops at the first record of the new pid, the agent's own
+# attachment reads the server's pid, and with it no record of the new run is ambiguous.
+LOGF=/var/lib/firebird/audit/audit.log
+L0="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
+OLD_PID="$(timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" \
+  | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ \([0-9]+:' | tail -n 1 | sed 's/.*(//; s/://')"
+[ -n "$OLD_PID" ] || { echo "[it] run change: no header in the log" >&2; exit 1; }
+timeout 60 docker stop "$NAME" >/dev/null
+timeout 60 docker rm "$NAME" >/dev/null
+# shellcheck disable=SC2016 # The inner shell's loop.
+timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" "${SERVER_TZ[@]}" --user 84:84 \
+  -v "$VOLUME:/var/lib/firebird/data" -v "$AUDIT_VOLUME:/var/lib/firebird/audit" \
+  -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
+  -v "$WORK/fbtrace.conf:/databastion/fbtrace.conf:ro" \
+  --entrypoint /bin/sh "$LOCAL_IMAGE" -c \
+  'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do /bin/true; done; /opt/firebird/bin/firebird' >/dev/null
+listening "$PORT"
+{
+  cat "$WORK/root.pw"
+  printf 'SELECT * FROM CUSTOMERS;\nSELECT COUNT(*) FROM CUSTOMERS;\nCOMMIT;\n'
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+sleep 3
+timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L0 + 1))" > "$WORK/run-change.log"
+[ -s "$WORK/run-change.log" ] || { echo "[it] run change: nothing logged after the restart" >&2; exit 1; }
+run_tests audit::tests::it_run_change FIREBIRD_IT_RUN_CHANGE_LOG="$WORK/run-change.log" \
+  FIREBIRD_IT_RUN_OLD_PID="$OLD_PID" >&2
+
 # 5. The host identity files of the readers check (ADR-0060 refinement of 2026-10-31, R52 items 1
 # to 3), on the real kernel: single-file read-only bind mounts of this host's own identity files in
 # a private mount namespace (nothing outside it changes; the tmpfs goes with it), the negative

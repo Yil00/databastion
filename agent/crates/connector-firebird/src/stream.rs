@@ -10,11 +10,16 @@
 //!
 //! Implemented, fail closed:
 //! - **Runs** (R1 rules 1 and 2, R5): the run is the pid and start time
-//!   `check()` and `/proc` confirm; a record of another pid is ambiguous
-//!   (the stream is not stopped: such records are loud until a check
-//!   confirms a new run, which ends every binding of the old one); a start
-//!   time change of the same pid makes the records read until the next
-//!   confirmation ambiguous (R5 item 4).
+//!   `check()` and `/proc` confirm. A record of a new pid stops the
+//!   stream before it ([`Machine::stop_wanted`], the stop itself is the
+//!   runner's, `crate::audit`) until a check started after the stop
+//!   confirms that pid, and the run changes at that record, or the
+//!   confirmation fails (another pid read, or 60 s): the pid is remembered
+//!   and its records are ambiguous, a 10-minute cooldown starts. A run a
+//!   check read before the stream reaches its records is pending until the
+//!   first record of its pid. A start-time change of the same pid makes the
+//!   records read until the next confirmation ambiguous, and asks for an
+//!   immediate check (R5 item 4).
 //! - **Bindings** (R1 rules 3 to 6, R7): per database identity and
 //!   attachment id, anchored at `ATTACH_DATABASE` (or learned from the
 //!   first record after a gap); every record of an attachment carries its
@@ -63,11 +68,9 @@
 //!   events were durably spooled before the restart (deduplication by
 //!   position).
 //!
-//! Not implemented here (each fail closed or left to the stream's caller,
-//! listed in the lot 3 report): the stop of R1 rule 2 (records of an
-//! unconfirmed pid are ambiguous instead), R1 rule 9, local external data
-//! sources (R29: their `<internal>` attachments are ambiguous, as R18 item
-//! 3 accepted).
+//! Not implemented here (each fail closed, listed in the lot 3 report):
+//! R1 rule 9, local external data sources (R29: their `<internal>`
+//! attachments are ambiguous, as R18 item 3 accepted).
 
 #[path = "stream_ckpt.rs"]
 mod stream_ckpt;
@@ -94,6 +97,13 @@ const ORDER_IDS: u64 = 256;
 const ORDER_TIME: Duration = Duration::from_secs(10);
 /// R1 rule 5: the margin above the agent's latest own id.
 const ID_MARGIN: u64 = 4096;
+/// R1 rule 2 (security review L-b): pids remembered as failed per run.
+pub(crate) const MAX_FAILED_PIDS: usize = 64;
+/// R1 rule 2: a stop lasts at most this long (agent time).
+pub(crate) const STOP_LIMIT: Duration = Duration::from_secs(60);
+/// R1 rule 2 (security review M-3): the cooldown after a failed
+/// confirmation.
+pub(crate) const STOP_COOLDOWN: Duration = Duration::from_secs(600);
 /// R1 rule 11.
 const MAX_BINDINGS_DECLARED: usize = 16_384;
 const MAX_BINDINGS_UNDECLARED: usize = 4096;
@@ -484,7 +494,20 @@ pub(crate) struct Machine {
     run: Option<Run>,
     /// Records are ambiguous until the next confirmation (R5 item 4).
     unconfirmed: bool,
+    /// The run was taken from the first pid seen, before any check (R40
+    /// item 4): records of another pid are ambiguous, with no stop.
+    provisional: bool,
+    /// Pids that failed a confirmation (R1 rule 2): ambiguous at once,
+    /// with no stop; at most [`MAX_FAILED_PIDS`].
     failed_pids: Vec<u32>,
+    /// A run a check read that differs by its pid from the current run
+    /// (R1 rule 2): the run changes at the first record that carries its
+    /// pid, never before (the stream may still be reading the old run).
+    pending_run: Option<Run>,
+    /// R1 rule 2 (security review M-3): after a failed confirmation,
+    /// records of any new pid are ambiguous without a stop until then
+    /// (reading time).
+    cooldown_until: Option<Instant>,
     bindings: HashMap<Key, Binding>,
     token_live: HashMap<(u32, u64), Key>,
     /// Tokens whose binding ended at the last record that carried them
@@ -567,6 +590,9 @@ pub(crate) struct Machine {
     pub(crate) counts: Counts,
     /// A view DDL record asks for an early check (R28 item 4).
     pub(crate) check_requested: bool,
+    /// A start-time change asks for an immediate check (R5 item 4), not
+    /// merged with the early checks of R11 8d.
+    pub(crate) run_check_requested: bool,
     /// The record being judged is of the agent's own anchored binding
     /// inside a split window: it ends the window only if it is the agent's
     /// own (R1 rule 7, re-review L-C).
@@ -621,7 +647,10 @@ impl Machine {
             s,
             run: None,
             unconfirmed: false,
+            provisional: false,
             failed_pids: Vec::new(),
+            pending_run: None,
+            cooldown_until: None,
             bindings: HashMap::new(),
             token_live: HashMap::new(),
             token_ended: HashMap::new(),
@@ -661,6 +690,7 @@ impl Machine {
             pending_end: Vec::new(),
             counts: Counts::default(),
             check_requested: false,
+            run_check_requested: false,
             window_ender: false,
             probe_seen: None,
             why: std::collections::BTreeMap::new(),
@@ -1050,21 +1080,130 @@ impl Machine {
     pub(crate) fn confirm_run(&mut self, run: Run) {
         // Review N1: a provisional run (no start time, the first pid seen)
         // is compared by its pid only.
-        let other = self.run.is_some_and(|r| match r.start {
+        let old = self.run;
+        let other = old.is_some_and(|r| match r.start {
             None => r.pid != run.pid,
             Some(_) => r != run,
         });
         if other {
             self.end_run();
+            // R1 rule 2: the own-attachment lifetimes of the old run close
+            // (a new pid; a restart with the same pid is closed by the
+            // connector's lost-connection rule, decision 3).
+            if let Some(o) = old
+                && o.pid != run.pid
+            {
+                self.ledger.end_run(o.pid);
+            }
         }
         self.run = Some(run);
         self.unconfirmed = false;
+        self.provisional = false;
+        if self.pending_run.is_some_and(|p| p.pid == run.pid) {
+            self.pending_run = None;
+        }
+    }
+
+    /// The run a new check read (R1 rules 1 and 2). The same run, or a run
+    /// of the same pid with a new start time (R5 item 4: placed by the
+    /// start-time samples), or any run while the current one is
+    /// provisional (R40 item 4), is confirmed at once. A run of another pid
+    /// is kept pending: the run changes at the first record that carries
+    /// that pid (the stream may still be reading records of the old run,
+    /// which stay judged as the old run's).
+    pub(crate) fn check_run(&mut self, run: Run) {
+        match self.run {
+            Some(r) if r.pid != run.pid && !self.provisional => {
+                self.pending_run = Some(run);
+            }
+            _ => self.confirm_run(run),
+        }
     }
 
     /// A `/proc` sample that shows another start time than the current
     /// run's: records are ambiguous until `check()` confirms (R5 item 4).
+    /// The stream asks for an immediate check (`run_check_requested`).
     pub(crate) fn start_time_changed(&mut self) {
+        if !self.unconfirmed {
+            self.run_check_requested = true;
+        }
         self.unconfirmed = true;
+    }
+
+    /// R1 rule 2: whether the record whose header is `h` stops the stream
+    /// before it: a pid other than the current run's, of a confirmed run
+    /// (never before the first check, R40 item 4), that no check has shown
+    /// to be the server's (a pending run), that did not fail a
+    /// confirmation, outside the cooldown, with fewer than
+    /// [`MAX_FAILED_PIDS`] pids remembered. `TRACE_INIT` / `TRACE_FINI`
+    /// carry no run boundary (R5 item 1): only the pid decides.
+    pub(crate) fn stop_wanted(&self, h: &crate::trace_log::Header, now: Instant) -> bool {
+        let Some(r) = self.run else {
+            return false;
+        };
+        !self.provisional
+            && h.pid != r.pid
+            && !self.pending_run.is_some_and(|p| p.pid == h.pid)
+            && !self.failed_pids.contains(&h.pid)
+            && self.failed_pids.len() < MAX_FAILED_PIDS
+            && self.cooldown_until.is_none_or(|u| now >= u)
+    }
+
+    /// R1 rule 2: the confirmation of a stop on `pid` failed (the check read
+    /// another run, or none answered within [`STOP_LIMIT`]): the pid is
+    /// remembered for the run, and the cooldown starts. Its records are
+    /// ambiguous (they carry a pid other than the run's).
+    pub(crate) fn confirmation_failed(&mut self, pid: u32, now: Instant) {
+        if !self.failed_pids.contains(&pid) && self.failed_pids.len() < MAX_FAILED_PIDS {
+            self.failed_pids.push(pid);
+        }
+        self.cooldown_until = Some(now + STOP_COOLDOWN);
+    }
+
+    /// R1 rule 7 and R25: time while the stream is stopped (R1 rule 2) is
+    /// not reading time: every reading-time instant moves by `d` (split
+    /// windows, fold groups, holds, the order rule's times, the Garbage
+    /// Collector's expected end, the cooldown is agent time and stays).
+    pub(crate) fn pause(&mut self, d: Duration) {
+        if let Some(u) = self.window_until.as_mut() {
+            *u += d;
+        }
+        for g in &mut self.groups {
+            g.started += d;
+        }
+        if let Some(h) = self.hold_since.as_mut() {
+            *h += d;
+        }
+        for (_, t) in self.highest.values_mut() {
+            *t += d;
+        }
+        for t in self.gc_alone_since.values_mut() {
+            *t += d;
+        }
+    }
+
+    /// Test support: the pids remembered as failed.
+    #[cfg(test)]
+    pub(crate) fn failed_pids_for_tests(&self) -> &[u32] {
+        &self.failed_pids
+    }
+
+    /// Test support: the split window's end, if one is open at `now`.
+    #[cfg(test)]
+    pub(crate) fn window_for_tests(&self, now: Instant) -> Option<Instant> {
+        self.window_until.filter(|u| now < *u)
+    }
+
+    /// Test support: a split window opened at `now`.
+    #[cfg(test)]
+    pub(crate) fn open_window_for_tests(&mut self, now: Instant) {
+        self.window_until = Some(now + WINDOW);
+    }
+
+    /// Test support: the current run.
+    #[cfg(test)]
+    pub(crate) fn run_for_tests(&self) -> Option<Run> {
+        self.run
     }
 
     fn end_run(&mut self) {
@@ -1109,6 +1248,7 @@ impl Machine {
         self.internal.clear();
         self.gc_alone_since.clear();
         self.failed_pids.clear();
+        self.cooldown_until = None;
     }
 
     /// The stream's state in bytes, estimated (R1 rule 11's global cap).
@@ -2026,7 +2166,15 @@ impl Machine {
     ) -> Decision {
         let h = &rec.header;
         let token = h.token();
-        // Runs (R1 rules 1 and 2, R5).
+        // Runs (R1 rules 1 and 2, R5). A run a check read, of this record's
+        // pid, starts here (R1 rule 2: the first record that carries the
+        // new pid is the run boundary).
+        if let (Some(r), Some(p)) = (self.run, self.pending_run)
+            && r.pid != h.pid
+            && p.pid == h.pid
+        {
+            self.confirm_run(p);
+        }
         let pid_ok = match self.run {
             Some(r) => r.pid == h.pid && !self.unconfirmed,
             // Before the first confirmation, a history walk: the first pid
@@ -2036,13 +2184,15 @@ impl Machine {
                     pid: h.pid,
                     start: None,
                 });
+                self.provisional = true;
                 true
             }
         };
         if !pid_ok {
-            if !self.failed_pids.contains(&h.pid) && self.failed_pids.len() < 64 {
-                self.failed_pids.push(h.pid);
-            }
+            // Ambiguous: a pid that failed its confirmation (remembered by
+            // `confirmation_failed`), one met in the cooldown or past the
+            // remembered pids, a provisional run's other pid, or records
+            // after a start-time change until the next confirmation.
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),

@@ -148,6 +148,10 @@ impl Proc {
             last_end: None,
             lost_in: None,
             ended: None,
+            backlog: std::collections::VecDeque::new(),
+            batch: None,
+            stop: None,
+            sample: None,
         };
         Self {
             r,
@@ -187,6 +191,13 @@ impl Proc {
             let mut out = Vec::new();
             let more = self.r.poll(&mut self.m, &cats, &mut out).unwrap();
             self.deliver(out);
+            // R1 rule 2: a stop before a record of another pid; no check
+            // confirms it here (the confirmation fails: the record and the
+            // pid's later ones are ambiguous).
+            if let Some(st) = self.r.stop.take() {
+                self.m.confirmation_failed(st.pid, Instant::now());
+                continue;
+            }
             if !more {
                 break;
             }

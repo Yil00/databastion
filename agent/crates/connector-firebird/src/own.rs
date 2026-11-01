@@ -501,6 +501,27 @@ impl Ledger {
         }
     }
 
+    /// R1 rule 2: a confirmed run change from server pid `pid`: the own
+    /// attachments of that run still open in the ledger close now (their
+    /// connections went with the server process).
+    pub(crate) fn end_run(&self, pid: u32) {
+        let now = SystemTime::now();
+        let mut s = self.state();
+        let mut changed = false;
+        for a in s
+            .attachments
+            .iter_mut()
+            .filter(|a| a.pid == pid && a.closed.is_none())
+        {
+            a.closed = Some(now);
+            changed = true;
+        }
+        drop(s);
+        if changed {
+            self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// The stream read the attachment's `DETACH_DATABASE`.
     pub(crate) fn note_detach(&self, attach: &str, id: u64) {
         let mut s = self.state();

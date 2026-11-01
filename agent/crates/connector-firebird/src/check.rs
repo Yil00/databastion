@@ -228,6 +228,9 @@ async fn run(
         .read()
         .map_err(|_| FbError::new(FailureCode::AuthenticationFailed, Stage::Secret))?;
     let endpoint = Endpoint::of(target)?;
+    // R1 rule 2: the server pid this check reads comes from attachments
+    // made after this time.
+    let started = std::time::SystemTime::now();
     let mut notes = Notes::default();
     let mut detail: Vec<String> = Vec::new();
     if settings.tunnel {
@@ -369,6 +372,7 @@ async fn run(
                         dbs: audit_dbs,
                         server_pid,
                         peer_uid,
+                        started,
                     },
                     &mut n,
                     &mut d,
