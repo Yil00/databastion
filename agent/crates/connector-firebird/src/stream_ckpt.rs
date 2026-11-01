@@ -532,6 +532,17 @@ impl Machine {
         self.bindings = m.bindings;
         self.next_seq = m.next_seq;
         self.tra_pos = m.tra_pos;
+        self.tra_pos_entries = self.tra_pos.values().map(Vec::len).sum();
+        self.by_addr = HashMap::new();
+        for (k, b) in &self.bindings {
+            if let Some(a) = b.addr {
+                let e = self.by_addr.entry(a).or_default();
+                if !b.poisoned {
+                    e.0.push(*k);
+                }
+                e.1 += 1;
+            }
+        }
         // R29: an external-source binding's hold starts again empty (its
         // caller is looked for again; held events are never in a
         // checkpoint).
@@ -611,6 +622,8 @@ impl Machine {
         self.failed_pids.clear();
         self.bindings.clear();
         self.tra_pos.clear();
+        self.tra_pos_entries = 0;
+        self.by_addr.clear();
         self.ext.clear();
         self.ext_events = 0;
         self.ext_bytes = 0;

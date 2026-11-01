@@ -172,24 +172,55 @@ pub(crate) fn lookup(_server: SocketAddr, _client: SocketAddr, _deadline: Instan
     }
 }
 
-/// R1 rule 9 (ADR-0060): the client endpoints of the server's TCP
-/// connections, from `/proc/net/tcp` and `/proc/net/tcp6`: for every row in
-/// any state but `LISTEN` whose local port is the server's, its remote
-/// end, and for every row whose remote port is the server's (the client
-/// side of a connection on this host, which outlives a close in
-/// `TIME_WAIT`), its local end. Bounded by lines and by `deadline`; `None`
-/// when a bound was reached (the condition is then not evaluated).
-pub(crate) fn client_endpoints(
+/// R1 rule 9 (ADR-0060; review L1 of #402): what one scan of the tables
+/// gathers: the server's listening addresses on its port, and its
+/// connections there (local end, client end), only rows owned by the
+/// server's uid.
+#[derive(Debug, Default)]
+pub(crate) struct ServerRows {
+    listen: std::collections::HashSet<IpAddr>,
+    conns: Vec<(IpAddr, SocketAddr)>,
+    /// Lines read, in every table (one bound for all of them).
+    lines: usize,
+}
+
+impl ServerRows {
+    /// The client ends of the server's connections: rows on the server's
+    /// port whose local address is one it listens on (or it listens on
+    /// every address); `None` when no listening row was seen.
+    pub(crate) fn clients(&self) -> Option<std::collections::HashSet<SocketAddr>> {
+        if self.listen.is_empty() {
+            return None;
+        }
+        let any = self.listen.iter().any(IpAddr::is_unspecified);
+        Some(
+            self.conns
+                .iter()
+                .filter(|(l, _)| any || self.listen.contains(l))
+                .map(|(_, r)| *r)
+                .collect(),
+        )
+    }
+}
+
+/// Scans one table's lines into `into` (rows owned by `server_uid` on
+/// `server_port`, any state, the listening ones apart). `false` when the
+/// line bound (shared by every table) or the deadline is reached.
+pub(crate) fn server_rows(
     lines: impl Iterator<Item = String>,
     server_port: u16,
+    server_uid: u32,
     deadline: Option<Instant>,
-    into: &mut std::collections::HashSet<SocketAddr>,
+    into: &mut ServerRows,
 ) -> bool {
-    for (i, line) in lines.enumerate() {
-        if i >= MAX_LINES || (i % 4096 == 0 && deadline.is_some_and(|d| Instant::now() > d)) {
+    for line in lines {
+        into.lines += 1;
+        if into.lines > MAX_LINES
+            || (into.lines.is_multiple_of(4096) && deadline.is_some_and(|d| Instant::now() > d))
+        {
             return false;
         }
-        if line.len() > MAX_LINE_BYTES || into.len() >= MAX_LINES {
+        if line.len() > MAX_LINE_BYTES {
             continue;
         }
         let mut cols = line.split_whitespace();
@@ -198,48 +229,80 @@ pub(crate) fn client_endpoints(
         else {
             continue;
         };
-        if state == "0A" {
+        let uid = cols.nth(3).and_then(|u| u.parse::<u32>().ok());
+        if uid != Some(server_uid) {
             continue;
         }
         let (Some(local), Some(remote)) = (parse_endpoint(local), parse_endpoint(remote)) else {
             continue;
         };
-        if local.port() == server_port {
-            into.insert(remote);
+        if local.port() != server_port {
+            continue;
         }
-        if remote.port() == server_port {
-            into.insert(local);
+        if state == "0A" {
+            into.listen.insert(local.ip());
+        } else if into.conns.len() < MAX_LINES {
+            into.conns.push((local.ip(), remote));
         }
     }
     true
 }
 
-/// [`client_endpoints`] of the host's tables, bounded by [`LOOKUP_TIME`].
+/// [`server_rows`] of the host's `/proc/net/tcp` and `/proc/net/tcp6`,
+/// bounded by [`LOOKUP_TIME`] and one line bound for both: `None` when a
+/// bound is reached, a table cannot be read, or a read fails part-way. A
+/// missing `tcp6` (IPv6 disabled in the namespace) holds no row.
 #[cfg(target_os = "linux")]
-pub(crate) fn server_clients(server_port: u16) -> Option<std::collections::HashSet<SocketAddr>> {
+pub(crate) fn server_clients(
+    server_port: u16,
+    server_uid: u32,
+) -> Option<std::collections::HashSet<SocketAddr>> {
     let deadline = Instant::now() + LOOKUP_TIME;
-    let mut out = std::collections::HashSet::new();
-    let mut read = false;
+    let mut rows = ServerRows::default();
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(file) = std::fs::File::open(path) else {
-            continue;
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if path.ends_with('6') && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        read = true;
+        // A read error part-way ends the lines and fails the lookup.
+        let failed = std::cell::Cell::new(false);
         let lines = BufReader::new(file)
             .split(b'\n')
-            .map_while(Result::ok)
-            .map(|l| String::from_utf8_lossy(&l).into_owned());
-        if !client_endpoints(lines.skip(1), server_port, Some(deadline), &mut out) {
+            .skip(1)
+            .map_while(|l| match l {
+                Ok(l) => Some(String::from_utf8_lossy(&l).into_owned()),
+                Err(_) => {
+                    failed.set(true);
+                    None
+                }
+            });
+        if !server_rows(lines, server_port, server_uid, Some(deadline), &mut rows) || failed.get() {
             return None;
         }
     }
-    read.then_some(out)
+    rows.clients()
 }
 
 /// Off Linux there is no table: not evaluated.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn server_clients(_server_port: u16) -> Option<std::collections::HashSet<SocketAddr>> {
+pub(crate) fn server_clients(
+    _server_port: u16,
+    _server_uid: u32,
+) -> Option<std::collections::HashSet<SocketAddr>> {
     None
+}
+
+/// R1 rule 9 (review L1 of #402): the server process `pid` is in this
+/// process's network namespace, so the tables read here are its.
+pub(crate) fn same_netns(pid: u32) -> bool {
+    match (
+        std::fs::read_link("/proc/self/ns/net"),
+        std::fs::read_link(format!("/proc/{pid}/ns/net")),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The canonical form of a printed client address (IPv4-mapped IPv6 as
@@ -355,24 +418,56 @@ mod tests {
         assert_eq!(out.verdict(85), Err(Detail::PeerUidMismatch));
     }
 
-    /// R1 rule 9: the client ends of the server's connections, from either
-    /// side's row, in any state but `LISTEN`; other ports ignored.
+    /// R1 rule 9 (review L1 of #402): only server-side rows owned by the
+    /// server's uid, on a listening address of its port, count; a client
+    /// side's row, another uid's (a `TIME_WAIT` row is uid 0), another
+    /// port's or an address it does not listen on do not; with no
+    /// listening row, nothing is evaluated; the line bound holds across
+    /// tables.
     #[test]
-    fn the_clients_of_the_server_port() {
+    fn only_the_servers_own_connections_count() {
         let lo = le_hex(Ipv4Addr::LOCALHOST);
+        let other = le_hex(Ipv4Addr::new(127, 0, 0, 2));
         let rows = table(&[
             row(&format!("{lo}:0BEA"), "00000000:0000", "0A", 84),
             row(&format!("{lo}:0BEA"), &format!("{lo}:9C43"), "01", 84),
-            row(&format!("{lo}:9C44"), &format!("{lo}:0BEA"), "06", 0),
-            row(&format!("{lo}:1F90"), &format!("{lo}:9C45"), "01", 1000),
+            row(&format!("{lo}:0BEA"), &format!("{lo}:9C46"), "06", 0),
+            row(&format!("{lo}:9C44"), &format!("{lo}:0BEA"), "01", 1000),
+            row(&format!("{other}:0BEA"), &format!("{lo}:9C47"), "01", 84),
+            row(&format!("{lo}:1F90"), &format!("{lo}:9C45"), "01", 84),
         ]);
-        let mut out = std::collections::HashSet::new();
-        assert!(client_endpoints(rows.into_iter(), 3050, None, &mut out));
+        let mut r = ServerRows::default();
+        assert!(server_rows(
+            rows.clone().into_iter(),
+            3050,
+            84,
+            None,
+            &mut r
+        ));
+        let c = r.clients().unwrap();
         let ep = |p| SocketAddr::from((Ipv4Addr::LOCALHOST, p));
-        assert!(out.contains(&ep(40003)));
-        assert!(out.contains(&ep(40004)), "the client side, TIME_WAIT");
-        assert!(!out.contains(&ep(40005)), "another port's connection");
-        assert_eq!(out.len(), 2);
+        assert!(c.contains(&ep(40003)));
+        assert_eq!(c.len(), 1, "{c:?}");
+        let mut none = ServerRows::default();
+        assert!(server_rows(
+            rows.into_iter().skip(1),
+            3050,
+            84,
+            None,
+            &mut none
+        ));
+        assert!(none.clients().is_none(), "no listening row");
+        let mut cut = ServerRows {
+            lines: MAX_LINES,
+            ..ServerRows::default()
+        };
+        assert!(!server_rows(
+            table(&[row(&format!("{lo}:0BEA"), "00000000:0000", "0A", 84)]).into_iter(),
+            3050,
+            84,
+            None,
+            &mut cut
+        ));
     }
 
     #[test]

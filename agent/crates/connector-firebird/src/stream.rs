@@ -728,6 +728,11 @@ pub(crate) struct Machine {
     follow_ups: HashMap<Key, FollowUp>,
     /// R1 rule 9: the runner's observation of the current read.
     tcp: Option<TcpView>,
+    /// R1 rule 9: the live bindings by their client end's hash.
+    /// Per hash: the live bindings not yet poisoned for it, and how many
+    /// live bindings hold it (a reuse poisons the first ones once; the
+    /// count keeps the end held while any of them lives).
+    by_addr: HashMap<u64, (Vec<Key>, usize)>,
     /// R29: the external-source bindings (each holds its events until a
     /// transaction of it ends after a caller was seen).
     ext: HashMap<Key, ExtHold>,
@@ -735,6 +740,8 @@ pub(crate) struct Machine {
     /// `START_TRANSACTION` of each open transaction of a user binding, for
     /// the caller test; bounded with the bindings' open transactions.
     tra_pos: HashMap<Key, Vec<(u64, u64)>>,
+    /// The positions kept in `tra_pos` (the state's size).
+    tra_pos_entries: usize,
     /// Their held events and bytes (the stream's bounds).
     ext_events: usize,
     ext_bytes: usize,
@@ -814,8 +821,10 @@ impl Machine {
             restores_seen: HashMap::new(),
             follow_ups: HashMap::new(),
             tcp: None,
+            by_addr: HashMap::new(),
             ext: HashMap::new(),
             tra_pos: HashMap::new(),
+            tra_pos_entries: 0,
             ext_events: 0,
             ext_bytes: 0,
             ext_fail: Vec::new(),
@@ -1361,6 +1370,8 @@ impl Machine {
         self.pending_end.extend(groups);
         self.bindings.clear();
         self.tra_pos.clear();
+        self.tra_pos_entries = 0;
+        self.by_addr.clear();
         self.token_live.clear();
         self.token_ended.clear();
         self.token_ended_order.clear();
@@ -1395,11 +1406,9 @@ impl Machine {
             + self.evictable.len() * 32
             + self.groups.iter().map(Group::bytes).sum::<usize>()
             + self.held_bytes
-            + self
-                .tra_pos
-                .values()
-                .map(|v| 48 + v.len() * 16)
-                .sum::<usize>()
+            + self.tra_pos.len() * 48
+            + self.tra_pos_entries * 24
+            + self.by_addr.len() * 48
             + self.ext_bytes
     }
 
@@ -1518,6 +1527,13 @@ impl Machine {
             self.evictable.push_back((b.seq, key));
         }
         *self.binding_count.entry(key.0).or_insert(0) += 1;
+        if let Some(a) = b.addr {
+            let e = self.by_addr.entry(a).or_default();
+            if !b.poisoned {
+                e.0.push(key);
+            }
+            e.1 += 1;
+        }
         if let Some(old) = self.bindings.insert(key, b) {
             // Replaced (not expected): the count stays one.
             let _ = old;
@@ -1528,8 +1544,19 @@ impl Machine {
     }
 
     fn remove_binding(&mut self, key: Key) -> Option<Binding> {
-        self.tra_pos.remove(&key);
+        if let Some(v) = self.tra_pos.remove(&key) {
+            self.tra_pos_entries = self.tra_pos_entries.saturating_sub(v.len());
+        }
         let b = self.bindings.remove(&key)?;
+        if let Some(a) = b.addr
+            && let Some(v) = self.by_addr.get_mut(&a)
+        {
+            v.0.retain(|k| *k != key);
+            v.1 = v.1.saturating_sub(1);
+            if v.1 == 0 {
+                self.by_addr.remove(&a);
+            }
+        }
         if let Some(n) = self.binding_count.get_mut(&key.0) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -1763,19 +1790,36 @@ impl Machine {
         ep: std::net::SocketAddr,
         token: (u32, u64),
         pos: u64,
+        att: (&str, u64),
     ) -> bool {
-        if self.bindings.values().any(|b| b.addr == Some(addr)) {
+        // Review L2 of #402: a reused client end poisons every binding that
+        // holds it, as a duplicate id does (R1 rule 3).
+        let mut reused = false;
+        if let Some(e) = self.by_addr.get_mut(&addr) {
+            reused = e.1 > 0;
+            for k in std::mem::take(&mut e.0) {
+                if let Some(b) = self.bindings.get_mut(&k) {
+                    b.poisoned = true;
+                    b.own = false;
+                }
+            }
+        }
+        if reused {
             self.counts.tcp_reused += 1;
+            self.check_offset_binding();
             return true;
         }
         let Some(v) = self.tcp.as_ref() else {
             return false;
         };
         let fresh = v.file == self.file && v.fresh_from.is_some_and(|f| pos >= f);
-        let detached = v
-            .detached
-            .get(&token)
-            .is_some_and(|ps| ps.iter().any(|p| *p > pos));
+        // Review M1 of #402: only a later `DETACH_DATABASE` of this same
+        // binding (its token, its database name and its attachment id).
+        let db = db_hash(att.0);
+        let detached = v.detached.get(&token).is_some_and(|ps| {
+            ps.iter()
+                .any(|(p, id, d)| *p > pos && *id == att.1 && *d == db)
+        });
         if !fresh || detached {
             return false;
         }
@@ -2643,9 +2687,22 @@ pub(crate) struct TcpView {
     /// The client endpoints of the server's connections, read after the
     /// read (`None`: not read, a bound reached, or no table).
     pub(crate) clients: Option<std::collections::HashSet<std::net::SocketAddr>>,
-    /// Tokens with a `DETACH_DATABASE` in the read, and its offset: such
-    /// a binding was no longer live when the table was read.
-    pub(crate) detached: HashMap<(u32, u64), Vec<u64>>,
+    /// Tokens with a `DETACH_DATABASE` in the read: its offset, its
+    /// attachment id and its printed database name's [`db_hash`]. Such a
+    /// binding was no longer live when the table was read.
+    pub(crate) detached: Detaches,
+}
+
+/// [`TcpView::detached`]: per token, `(offset, attachment id, db_hash)`.
+pub(crate) type Detaches = HashMap<(u32, u64), Vec<(u64, u64, u64)>>;
+
+/// An in-memory hash of a printed database name (R1 rule 9's detach
+/// match; never persisted or sent).
+pub(crate) fn db_hash(name: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    h.finish()
 }
 
 /// The verdict on one record before its event is built.
@@ -3170,14 +3227,17 @@ impl Machine {
         // R1 rule 9: the remote 4-tuple of a TCP line (not the server's
         // internal attachments, which have none).
         let mut addr = None;
+        let mut poison_new = false;
         if kind == Kind::User
             && let Some(att) = rec.att
             && let Protocol::Tcp(ip, port) = att.protocol
         {
             let ep = crate::peer::canonical_endpoint(ip, port);
             let tag = self.hash(&ep.to_string());
-            if self.tcp_breach(tag, ep, token, pos) {
+            let before = self.counts.tcp_reused;
+            if self.tcp_breach(tag, ep, token, pos, (att.database, att.id)) {
                 ambiguous = true;
+                poison_new = self.counts.tcp_reused > before;
             }
             addr = Some(tag);
         }
@@ -3246,7 +3306,7 @@ impl Machine {
                 seq: 0,
                 token,
                 anchored: true,
-                poisoned: false,
+                poisoned: poison_new,
                 tainted: in_window || ambiguous,
                 kind,
                 first_tra: None,
@@ -3354,10 +3414,12 @@ impl Machine {
             if let Some(b) = self.bindings.get_mut(&key) {
                 b.poisoned |= !b.anchored;
             }
-            // R29: a failed external-source binding ends at its detach (its
-            // records ambiguous to the last).
+            // A poisoned binding (a failed external-source binding, R29; a
+            // reused client end, review L2 of #402) ends at its own detach,
+            // which is ambiguous too; its id stays seen, so a later record
+            // of it is ambiguous as well.
             if b.token == token
-                && b.kind == Kind::External
+                && b.poisoned
                 && matches!(h.event, Event::DetachDatabase | Event::DropDatabase)
             {
                 self.end_binding(key);
@@ -3497,6 +3559,7 @@ impl Machine {
                             let v = self.tra_pos.entry(key).or_default();
                             if !v.iter().any(|(x, _)| *x == t) {
                                 v.push((t, pos));
+                                self.tra_pos_entries += 1;
                             }
                         }
                     }
@@ -3509,7 +3572,9 @@ impl Machine {
                         bm.open_tras.retain(|x| *x != t);
                     }
                     if let Some(v) = self.tra_pos.get_mut(&key) {
+                        let n = v.len();
                         v.retain(|(x, _)| *x != t);
+                        self.tra_pos_entries -= n - v.len();
                         if v.is_empty() {
                             self.tra_pos.remove(&key);
                         }

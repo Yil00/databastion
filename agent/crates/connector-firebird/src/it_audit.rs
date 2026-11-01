@@ -874,3 +874,86 @@ fn header_times_ignore_the_session_time_zone() {
     }
     assert!(found, "the session marker is in the log");
 }
+
+/// ADR-0060 R29 with the maintainer's decision of 2026-11-01 (review of
+/// #402), on the restarted server with pooled external connections
+/// (`dev/firebird/it.sh`: `ExtConnPoolSize = 4`): a target with an `ON
+/// CONNECT` trigger (its own first transaction), two caller sessions in
+/// turn on one pooled target, two calls in one caller transaction
+/// (`FIREBIRD_IT_EXT_LOG`). Every hold is released with its caller; none
+/// fails, nothing is ambiguous.
+#[test]
+fn external_sources() {
+    let Some(log) = file("FIREBIRD_IT_EXT_LOG") else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&log).into_owned();
+    let pid = text
+        .lines()
+        .find_map(|l| crate::trace_log::header(l.as_bytes()))
+        .map(|h| h.pid)
+        .unwrap();
+    let names = |label: &str, path: &str| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+        read_at: None,
+    };
+    let settings = crate::stream::Settings {
+        databases: vec![names("app", APP), names("crm", CRM)],
+        aliases: Some(Default::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        },
+        superserver: true,
+    };
+    let mut m =
+        crate::stream::Machine::new(settings, std::sync::Arc::new(crate::own::Ledger::default()));
+    m.confirm_run(crate::stream::Run {
+        pid,
+        start: Some(1),
+    });
+    let cats: [&dyn Catalog; 2] = [&Cat, &Cat];
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let mut out = Vec::new();
+    let now = std::time::Instant::now();
+    let mut pos = 0u64;
+    for r in &recs {
+        let Assembled::Record(raw) = r else { continue };
+        m.push(raw, pos, now, &cats, &mut out);
+        pos += raw.len() as u64 + 1;
+    }
+    let attaches = text
+        .lines()
+        .filter(|l| l.ends_with("NONE, <internal>)"))
+        .filter(|l| !l.contains("Garbage Collector"))
+        .count();
+    let detaches = text
+        .lines()
+        .zip(text.lines().skip(1))
+        .filter(|(h, l)| h.ends_with(") DETACH_DATABASE") && l.ends_with("NONE, <internal>)"))
+        .count();
+    eprintln!(
+        "[measure] R29 pooled: external-source lines {attaches}, detaches {detaches}, released {}, \
+         failed {}, holds left {}, ambiguous {} {:?}",
+        m.counts.ext_released,
+        m.counts.ext_failed,
+        m.ext_holds_for_tests(),
+        m.counts.ambiguous,
+        m.why
+    );
+    assert!(m.counts.ext_released >= 3, "{:?}", m.counts);
+    assert_eq!(m.counts.ext_failed, 0, "{:?}", m.counts);
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    assert!(!m.holds_pending(), "no event left held");
+}

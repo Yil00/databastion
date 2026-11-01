@@ -723,7 +723,7 @@ fn routine_name(line: &str, kind: RoutineKind, series: Series) -> Option<Routine
     }
 }
 
-fn att_line(line: &str) -> Option<AttLine<'_>> {
+pub(crate) fn att_line(line: &str) -> Option<AttLine<'_>> {
     let line = line.strip_prefix('\t')?;
     if line.starts_with('\t') {
         return None;

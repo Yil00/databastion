@@ -633,9 +633,26 @@ timeout 30 $SUDO nsenter --net="/proc/$PID/ns/net" sh -c 'cat /proc/net/tcp /pro
 timeout 60 docker exec "$NAME" rm -f /tmp/it-crm.fbk
 sleep 2
 timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L2 + 1))" > "$WORK/svc.log"
+SERVER_HOST_PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NAME")"
 run_tests audit::tests::it_tcp_corroboration FIREBIRD_IT_TCP_LOG="$WORK/tcp.log" \
-  FIREBIRD_IT_SVC_LOG="$WORK/svc.log" FIREBIRD_IT_SVC_SAMPLES="$WORK/svc-samples.txt" >&2
+  FIREBIRD_IT_SVC_LOG="$WORK/svc.log" FIREBIRD_IT_SVC_SAMPLES="$WORK/svc-samples.txt" \
+  FIREBIRD_IT_SERVER_HOST_PID="$SERVER_HOST_PID" FIREBIRD_IT_HELD_PORT_FILE="$WORK/held-port" >&2
 wait "$HELD" || true
+# Security review M1 of #402: the rows the held session's connection leaves once it detached (an
+# orderly isql exit), on the server's side (local port = the server's) and the client's side,
+# with their state and owner uid (01 ESTABLISHED, 06 TIME_WAIT, 08 CLOSE_WAIT, ...).
+if [ -s "$WORK/held-port" ]; then
+  HELD_HEX="$(printf '%04X' "$(cat "$WORK/held-port")")"
+  SERVER_HEX="$(printf '%04X' "$PORT")"
+  for when in 0 1 5; do
+    sleep "$when"
+    timeout 30 $SUDO nsenter --net="/proc/$PID/ns/net" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; true' \
+      | awk -v h=":$HELD_HEX" -v s=":$SERVER_HEX" -v w="$when" '
+        index($2, s) && index($3, h) { print "[measure] M1 after the detach (+" w " s): server side, state " $4 ", uid " $8; n++ }
+        index($2, h) && index($3, s) { print "[measure] M1 after the detach (+" w " s): client side, state " $4 ", uid " $8; n++ }
+        END { if (!n) print "[measure] M1 after the detach (+" w " s): no row" }' >&2
+  done
+fi
 
 # ADR-0060 R1 rule 2 (the stop): the main server restarted under another pid (a shell starts a few
 # processes before the server, so its pid differs from the first run's, which was the container's
@@ -648,10 +665,14 @@ OLD_PID="$(timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" \
 [ -n "$OLD_PID" ] || { echo "[it] run change: no header in the log" >&2; exit 1; }
 timeout 60 docker stop "$NAME" >/dev/null
 timeout 60 docker rm "$NAME" >/dev/null
+# The restarted server pools external connections (R29 below).
+cp "$WORK/firebird.conf" "$WORK/firebird-pool.conf"
+printf 'ExtConnPoolSize = 4\nExtConnPoolLifetime = 600\n' >> "$WORK/firebird-pool.conf"
+chmod 0644 "$WORK/firebird-pool.conf"
 # shellcheck disable=SC2016 # The inner shell's loop.
 timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" "${SERVER_TZ[@]}" --user 84:84 \
   -v "$VOLUME:/var/lib/firebird/data" -v "$AUDIT_VOLUME:/var/lib/firebird/audit" \
-  -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
+  -v "$WORK/firebird-pool.conf:/opt/firebird/firebird.conf:ro" \
   -v "$WORK/fbtrace.conf:/databastion/fbtrace.conf:ro" \
   --entrypoint /bin/sh "$LOCAL_IMAGE" -c \
   'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do /bin/true; done; /opt/firebird/bin/firebird' >/dev/null
@@ -666,6 +687,31 @@ timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L0 + 1))"
 [ -s "$WORK/run-change.log" ] || { echo "[it] run change: nothing logged after the restart" >&2; exit 1; }
 run_tests audit::tests::it_run_change FIREBIRD_IT_RUN_CHANGE_LOG="$WORK/run-change.log" \
   FIREBIRD_IT_RUN_OLD_PID="$OLD_PID" >&2
+
+# ADR-0060 R29 with the maintainer's decision of 2026-11-01 (review of #402): local external data
+# sources on the restarted server, with ExtConnPoolSize > 0 (pooled external connections):
+# a target with an ON CONNECT trigger (crm.fdb, the dev seed's), two caller sessions in turn on one
+# pooled target (app.fdb), and two calls in one caller transaction. it_audit::external_sources reads
+# the records: every external-source hold released with its caller, none failed or ambiguous.
+L3="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
+ext_call() { # caller database, target database, statements
+  {
+    cat "$WORK/root.pw"
+    printf 'SET TERM ^ ;\n'
+    for t in $3; do
+      # shellcheck disable=SC2016 # Firebird names, not shell expansions.
+      printf "EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM %s' ON EXTERNAL '/var/lib/firebird/data/%s' INTO :N; SUSPEND; END^\n" "$t" "$2"
+    done
+    printf 'SET TERM ; ^\nCOMMIT;\n'
+  } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/$1" \
+    >/dev/null
+}
+ext_call app.fdb crm.fdb "CUSTOMERS"
+ext_call crm.fdb app.fdb "CUSTOMERS"
+ext_call crm.fdb app.fdb "CUSTOMERS NOGRANT"
+sleep 3
+timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L3 + 1))" > "$WORK/ext.log"
+run_tests it::audit::external_sources FIREBIRD_IT_EXT_LOG="$WORK/ext.log" >&2
 
 # 5. The host identity files of the readers check (ADR-0060 refinement of 2026-10-31, R52 items 1
 # to 3), on the real kernel: single-file read-only bind mounts of this host's own identity files in

@@ -2862,6 +2862,10 @@ fn tcp_lines_are_corroborated_by_the_servers_connections() {
         "{:?}",
         m.why
     );
+    // Review L2 of #402: both bindings are poisoned (as duplicate ids):
+    // the first binding's next record is ambiguous too.
+    let _ = feed(&mut m, &cats, &select(a, 3, 5, APP, "LEDGER", 1), 5_000);
+    assert!(m.counts.ambiguous >= 3, "{:?}", m.why);
     let detach_a = format!(
         "{HEAD} ({a}) DETACH_DATABASE\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\n"
     );
@@ -2904,7 +2908,24 @@ fn tcp_lines_are_corroborated_by_the_servers_connections() {
     // read, not evaluated.
     let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
     let mut v = view(Some(vec![]), Some(0));
-    v.detached.insert((24, 0x7f00_0000_0100), vec![1_000_000]);
+    // Review M1 of #402: a later detach of another binding (another id)
+    // with the same token does not exempt it; one of this binding does.
+    v.detached.insert(
+        (24, 0x7f00_0000_0100),
+        vec![
+            (1_000_000, 8, db_hash(APP)),
+            (1_000_000, 7, db_hash("/other.fdb")),
+        ],
+    );
+    let mut m2 = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m2.set_tcp_view(Some(v.clone()));
+    let _ = feed(&mut m2, &cats, &attach(a, 7, APP), 0);
+    assert_eq!(
+        m2.counts.tcp_no_socket, 1,
+        "a forged detach of another binding"
+    );
+    v.detached
+        .insert((24, 0x7f00_0000_0100), vec![(1_000_000, 7, db_hash(APP))]);
     m.set_tcp_view(Some(v));
     let _ = feed(&mut m, &cats, &attach(a, 7, APP), 0);
     assert_eq!((m.counts.tcp_no_socket, m.counts.ambiguous), (0, 0));

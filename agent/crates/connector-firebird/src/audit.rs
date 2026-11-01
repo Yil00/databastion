@@ -1463,17 +1463,28 @@ impl Runner {
             ..Default::default()
         };
         let mut need = false;
-        for l in &self.backlog {
+        let lines: Vec<&Line> = self.backlog.iter().collect();
+        for (i, l) in lines.iter().enumerate() {
             let line = l.bytes.strip_suffix(b"\n").unwrap_or(&l.bytes);
             let Some(h) = header(line) else {
                 continue;
             };
             match h.event {
                 crate::trace_log::Event::DetachDatabase => {
-                    view.detached
-                        .entry(h.token())
-                        .or_default()
-                        .push(l.pos.start);
+                    // Review M1 of #402: with the binding it ends (its
+                    // attachment line: the database name and the id, as the
+                    // record parser reads them).
+                    let next = lines.get(i + 1).map(|n| {
+                        String::from_utf8_lossy(n.bytes.strip_suffix(b"\n").unwrap_or(&n.bytes))
+                            .into_owned()
+                    });
+                    if let Some(a) = next.as_deref().and_then(crate::trace_log::att_line) {
+                        view.detached.entry(h.token()).or_default().push((
+                            l.pos.start,
+                            a.id,
+                            crate::stream::db_hash(a.database),
+                        ));
+                    }
                 }
                 crate::trace_log::Event::AttachDatabase => {
                     need |=
@@ -1492,7 +1503,14 @@ impl Runner {
         }
         let port = self.server_port?;
         if need {
-            view.clients = crate::peer::server_clients(port);
+            // Review L1 of #402: only for a server process visible here, in
+            // this network namespace, with its uid (the tables are then its
+            // own); otherwise not evaluated.
+            view.clients = self
+                .sample
+                .filter(|r| crate::peer::same_netns(r.pid))
+                .and_then(|r| crate::fsread::server_ids(r.pid))
+                .and_then(|(uid, _)| crate::peer::server_clients(port, uid));
         }
         Some(view)
     }
@@ -2168,6 +2186,25 @@ mod tests {
         std::fs::write(&log, b"").unwrap();
         let mut r = runner(&log, None);
         r.server_port = Some(port);
+        // The server process as this namespace sees it (its host pid,
+        // `FIREBIRD_IT_SERVER_HOST_PID`): rule 9 reads the tables only for a
+        // visible server in the same network namespace (review L1).
+        let uid: u32 = std::env::var("FIREBIRD_IT_PEER_UID")
+            .ok()
+            .and_then(|u| u.parse().ok())
+            .unwrap_or(84);
+        let host_pid = std::env::var("FIREBIRD_IT_SERVER_HOST_PID")
+            .ok()
+            .and_then(|p| p.trim().parse::<u32>().ok());
+        r.sample = host_pid.and_then(|p| {
+            crate::fsread::process_start(p).map(|(t, _)| Run {
+                pid: p,
+                start: Some(t),
+            })
+        });
+        let gate = r.sample.is_some_and(|s| crate::peer::same_netns(s.pid))
+            && host_pid.and_then(crate::fsread::server_ids).is_some();
+        eprintln!("[measure] rule 9 gate (server visible, same network namespace): {gate}");
         let mut m = Machine::new(s, Arc::new(crate::own::Ledger::default()));
         m.confirm_run(Run {
             pid,
@@ -2189,8 +2226,28 @@ mod tests {
              evaluated {}",
             c.tcp_corroborated, c.tcp_no_socket, c.tcp_reused, c.tcp_not_evaluated
         );
-        assert!(c.tcp_corroborated >= 1, "{c:?}");
         assert_eq!((c.tcp_no_socket, c.tcp_reused), (0, 0), "{:?}", m.why);
+        if !gate {
+            assert_eq!(c.tcp_corroborated, 0, "not evaluated without the gate");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(c.tcp_corroborated >= 1, "{c:?}");
+        // Review M1: the held session's client port, for the measurement
+        // of the rows left after its detach.
+        if let Ok(f) = std::env::var("FIREBIRD_IT_HELD_PORT_FILE") {
+            let port_of = text
+                .lines()
+                .rev()
+                .filter(|l| l.contains("SYSDBA:NONE") && l.contains("TCPv4:127.0.0.1/"))
+                .find_map(|l| {
+                    l.rsplit_once("TCPv4:127.0.0.1/")
+                        .and_then(|(_, p)| p.trim_end_matches(')').parse::<u16>().ok())
+                });
+            if let Some(p) = port_of {
+                std::fs::write(f, format!("{p}\n")).unwrap();
+            }
+        }
         append(
             &log,
             &format!(
@@ -2247,7 +2304,9 @@ mod tests {
         let chunks: Vec<&str> = samples.split("==\n").collect();
         let found = |p: u16, chunk: &str| {
             let mut out = std::collections::HashSet::new();
-            crate::peer::client_endpoints(chunk.lines().map(str::to_owned), port, None, &mut out);
+            let mut rows = crate::peer::ServerRows::default();
+            crate::peer::server_rows(chunk.lines().map(str::to_owned), port, uid, None, &mut rows);
+            out.extend(rows.clients().unwrap_or_default());
             out.contains(&std::net::SocketAddr::from(([127, 0, 0, 1], p)))
         };
         for p in &ports {
