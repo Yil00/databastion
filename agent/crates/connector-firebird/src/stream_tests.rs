@@ -2933,11 +2933,11 @@ fn tcp_lines_are_corroborated_by_the_servers_connections() {
 /// Measured on 5.0.4 (`dev/firebird/it.sh`): on a target database with an
 /// `ON CONNECT` trigger, the external attachment runs the trigger in a
 /// first transaction of its own, committed before the caller's code record.
-/// R29 item 2 decides at "its transaction-end record": with no caller yet,
-/// every record of the binding is ambiguous (fail closed, as before R29);
-/// which transaction decides is for a refinement.
+/// The maintainer's decision of 2026-11-01: the events stay held across
+/// that transaction's end (no caller yet) and are released at the end of
+/// the next one, after the caller's code record; nothing is ambiguous.
 #[test]
-fn an_external_source_with_a_connect_trigger_transaction_stays_ambiguous() {
+fn an_external_source_with_a_connect_trigger_transaction_is_held_across_it() {
     let c = "24:0x7f0000000100";
     let e = "24:0x7f0000000500";
     let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
@@ -2968,7 +2968,8 @@ fn an_external_source_with_a_connect_trigger_transaction_stays_ambiguous() {
         ),
         0,
     );
-    assert_eq!((m.counts.ext_released, m.counts.ext_failed), (0, 1));
+    assert_eq!((m.counts.ext_released, m.counts.ext_failed), (1, 0));
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
     let cust: Vec<_> = out
         .iter()
         .filter(|(_, ev)| {
@@ -2977,5 +2978,161 @@ fn an_external_source_with_a_connect_trigger_transaction_stays_ambiguous() {
                 .any(|o| o.object().as_str() == "CUSTOMERS")
         })
         .collect();
-    assert!(!cust.is_empty() && cust.iter().all(|(_, ev)| ev.always_report()));
+    assert_eq!(cust.len(), 1);
+    assert!(!cust[0].1.always_report());
+}
+
+/// Review H1 of #402: the external-source holds are O(1) each and
+/// charged to their bound: many user bindings with an open transaction and
+/// many external attaches keep the stream's state within its caps; past
+/// the holds' budget, a new external attach is ambiguous at once.
+#[test]
+fn external_source_holds_stay_within_their_bounds() {
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut log = String::new();
+    for i in 0..3000u64 {
+        let t = format!("24:0x7e{i:010x}");
+        log.push_str(&format!(
+            "{HEAD} ({t}) ATTACH_DATABASE\n\t{APP} (ATT_{}, APP:NONE, UTF8, TCPv4:127.0.0.1/{})\n\t/usr/bin/app:28\n\n{HEAD} ({t}) START_TRANSACTION\n\t{APP} (ATT_{}, APP:NONE, UTF8, TCPv4:127.0.0.1/{})\n\t/usr/bin/app:28\n\t\t(TRA_{i}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n",
+            100 + i,
+            10_000 + i,
+            100 + i,
+            10_000 + i
+        ));
+    }
+    let _ = feed(&mut m, &cats, &log, 0);
+    let mut ext = String::new();
+    for i in 0..20_000u64 {
+        let t = format!("24:0x7d{i:010x}");
+        ext.push_str(&format!(
+            "{HEAD} ({t}) ATTACH_DATABASE\n\t{APP} (ATT_{}, SYSDBA:NONE, NONE, <internal>)\n\n",
+            10_000 + i
+        ));
+    }
+    let _ = feed(&mut m, &cats, &ext, 10_000_000);
+    assert!(m.state_bytes() <= MAX_STREAM_BYTES, "{}", m.state_bytes());
+    assert!(
+        m.ext_holds_for_tests() <= (4 << 20) / 256,
+        "{}",
+        m.ext_holds_for_tests()
+    );
+    assert!(m.counts.ambiguous > 0, "past the budget: ambiguous");
+}
+
+/// The maintainer's decision of 2026-11-01 (pooled external connections):
+/// a caller seen releases the held events at the next transaction end of
+/// the external binding, then the test starts again; a later transaction
+/// with no caller stays held and fails at the detach (ambiguous). A
+/// binding whose transaction started after the external transaction's
+/// start is no caller (review L4).
+#[test]
+fn a_pooled_external_source_needs_a_caller_per_release() {
+    let c = "24:0x7f0000000100";
+    let late = "24:0x7f0000000600";
+    let e = "24:0x7f0000000500";
+    let (start, _, _) = ext_source(e, 9, 20, "CUSTOMERS");
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx = |t: u64| {
+        format!("{line}\t\t(TRA_{t}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n")
+    };
+    let commit = |t: u64| {
+        format!(
+            "{HEAD} ({e}) COMMIT_TRANSACTION\n{}      0 ms, 1 fetch(es)\n\n",
+            ctx(t)
+        )
+    };
+    let second = format!(
+        "{HEAD} ({e}) START_TRANSACTION\n{}\n{HEAD} ({e}) EXECUTE_STATEMENT_FINISH\n{}\nStatement 2:\n{}\nSELECT * FROM ORDERS\n1 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n\n",
+        ctx(21),
+        ctx(21),
+        "-".repeat(79),
+        "Table",
+        "*".repeat(115),
+        "ORDERS",
+        1,
+        ""
+    );
+    let detach = format!("{HEAD} ({e}) DETACH_DATABASE\n{line}\n");
+    let code =
+        |tok: &str, id: u64, tra: u64| stmt(tok, id, tra, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    // A binding whose transaction starts after the external one's.
+    let late_open = format!(
+        "{}{HEAD} ({late}) START_TRANSACTION\n\t{APP} (ATT_6, APP:NONE, UTF8, TCPv4:127.0.0.1/40006)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n",
+        attach(late, 6, APP)
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{start}{}{}{}{second}{late_open}{}{}{detach}",
+            caller_open(c),
+            code(c, 3, 5),
+            commit(20),
+            caller_commit(c),
+            code(late, 6, 7),
+            commit(21)
+        ),
+        0,
+    );
+    assert_eq!((m.counts.ext_released, m.counts.ext_failed), (1, 1));
+    let ev = |name: &str| -> Vec<bool> {
+        out.iter()
+            .filter(|(_, e)| e.objects().iter().any(|o| o.object().as_str() == name))
+            .map(|(_, e)| e.always_report())
+            .collect()
+    };
+    assert_eq!(ev("CUSTOMERS"), vec![false], "released with its caller");
+    assert!(
+        !ev("ORDERS").is_empty() && ev("ORDERS").iter().all(|a| *a),
+        "no caller: loud"
+    );
+}
+
+/// Review M2 of #402: an external-source hold that fails (a bound, here
+/// the 10 minutes of reading time) ends its pending fold groups in their
+/// ambiguous form: never a quiet event.
+#[test]
+fn a_failed_external_hold_ends_its_groups_loud() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx =
+        format!("{line}\t\t(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n");
+    let blk = format!(
+        "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n",
+        "Table",
+        "*".repeat(115),
+        "SECRETS",
+        5,
+        ""
+    );
+    let log = format!(
+        "{}{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({e}) ATTACH_DATABASE\n{line}\n{HEAD} ({e}) START_TRANSACTION\n{ctx}\n{HEAD} ({e}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n{blk}\n",
+        caller_open(c)
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut out = feed(&mut m, &cats, &log, 0);
+    assert!(!names(&out).contains(&"SECRETS".to_owned()), "pending");
+    m.expire(Instant::now() + Duration::from_secs(601), &cats, &mut out);
+    let secrets: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "SECRETS")
+        })
+        .collect();
+    assert!(!secrets.is_empty(), "{:?}", names(&out));
+    assert!(
+        secrets.iter().all(|(_, ev)| ev.always_report()),
+        "never quiet"
+    );
+    assert_eq!(m.counts.ext_failed, 1);
 }

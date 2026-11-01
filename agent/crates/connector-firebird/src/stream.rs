@@ -68,16 +68,19 @@
 //!   events were durably spooled before the restart (deduplication by
 //!   position).
 //!
-//! - **Local external data sources** (R29): an `<internal>` attach with
-//!   a user and a role, no client line, on the run's pid, anchors an
+//! - **Local external data sources** (R29, with the maintainer's decision
+//!   of 2026-11-01 on the review of #402): an `<internal>` attach with a
+//!   user and a role, no client line, on the run's pid, anchors an
 //!   external-source binding (never own, never internal) whose events are
-//!   held until its transaction's end (10 minutes of reading time, 16 384
-//!   events and 4 MiB per stream, not persisted: the position is held back
-//!   at its attach) and emitted as judged only when a caller exists
-//!   (another binding with a transaction open at the attach that wrote a
-//!   finish record of code meanwhile); otherwise every record of it is
-//!   ambiguous.
-//!
+//!   held across its transactions and released, as judged, at a
+//!   transaction end once a caller was seen (a user binding's finish
+//!   record of code in a transaction that started before the external
+//!   binding's open transaction); the caller test then starts again (a
+//!   pooled connection serves several callers). With none, they stay held
+//!   and are ambiguous at its detach or at a bound (10 minutes of reading
+//!   time, 16 384 events and 4 MiB per stream with each hold charged, not
+//!   persisted: the position is held back at the first held record). A
+//!   failed hold ends its pending fold groups ambiguous too.
 //! - **The remote 4-tuple** (R1 rule 9, with security review L11 of
 //!   2026-10-26): a new TCP binding whose client address and port another
 //!   live binding holds is ambiguous (tainted until it detaches); so is
@@ -221,23 +224,31 @@ enum Kind {
     External,
 }
 
-/// R29 item 2: the events of an external-source binding, held until its
-/// transaction's end, and the callers that can vouch for it.
+/// R29 item 2 (with the maintainer's decision of 2026-11-01 on the
+/// review of #402): the events of an external-source binding, held across
+/// its transactions until one of them ends after a caller was seen. O(1)
+/// per binding (review H1): no candidate set is kept; a caller is a
+/// binding whose code finish record's transaction started before the
+/// external binding's open transaction (positions, `Machine::tra_pos`).
 #[derive(Debug)]
 struct ExtHold {
-    /// Reading time of its `ATTACH_DATABASE` (the 10-minute bound).
-    started: Instant,
-    /// The position of its `ATTACH_DATABASE` (the persisted position is
-    /// held back to it).
-    attach_pos: u64,
+    /// Reading time of the first event held since the last release (the
+    /// 10-minute bound).
+    started: Option<Instant>,
+    /// Its position (the persisted position is held back to it).
+    first_pos: Option<u64>,
     events: Vec<ExtHeld>,
     bytes: usize,
-    /// Other live bindings of the run with a transaction open at the
-    /// attach (started before it).
-    callers: std::collections::HashSet<Key>,
-    /// One of them wrote a finish record of code since the attach.
+    /// The position of the `START_TRANSACTION` of the external binding's
+    /// open transaction (candidates are taken there, review L4).
+    tx_start: Option<u64>,
+    /// A caller was seen since the last release (reset at each release:
+    /// a pooled external connection serves several callers).
     caller: bool,
 }
+
+/// The bytes one external-source hold is charged, held events apart.
+const EXT_HOLD_BYTES: usize = 256;
 
 /// One record of an external-source binding: its event as judged, if
 /// any, and its ambiguous form (`*`, always reported).
@@ -717,8 +728,13 @@ pub(crate) struct Machine {
     follow_ups: HashMap<Key, FollowUp>,
     /// R1 rule 9: the runner's observation of the current read.
     tcp: Option<TcpView>,
-    /// R29: the external-source bindings whose events are held.
+    /// R29: the external-source bindings (each holds its events until a
+    /// transaction of it ends after a caller was seen).
     ext: HashMap<Key, ExtHold>,
+    /// R29 (review H1 and L4 of #402): the position of the
+    /// `START_TRANSACTION` of each open transaction of a user binding, for
+    /// the caller test; bounded with the bindings' open transactions.
+    tra_pos: HashMap<Key, Vec<(u64, u64)>>,
     /// Their held events and bytes (the stream's bounds).
     ext_events: usize,
     ext_bytes: usize,
@@ -799,6 +815,7 @@ impl Machine {
             follow_ups: HashMap::new(),
             tcp: None,
             ext: HashMap::new(),
+            tra_pos: HashMap::new(),
             ext_events: 0,
             ext_bytes: 0,
             ext_fail: Vec::new(),
@@ -1116,6 +1133,15 @@ impl Machine {
 
     /// The log file the next records come from.
     pub(crate) fn set_file(&mut self, file: (u64, u64)) {
+        if file != self.file {
+            // Transactions started in an earlier file started before
+            // anything of this one (R29's caller test compares positions).
+            for v in self.tra_pos.values_mut() {
+                for (_, p) in v.iter_mut() {
+                    *p = 0;
+                }
+            }
+        }
         self.file = file;
     }
 
@@ -1276,7 +1302,9 @@ impl Machine {
             *t += d;
         }
         for h in self.ext.values_mut() {
-            h.started += d;
+            if let Some(t) = h.started.as_mut() {
+                *t += d;
+            }
         }
     }
 
@@ -1332,6 +1360,7 @@ impl Machine {
         let groups: Vec<Group> = self.groups.drain(..).collect();
         self.pending_end.extend(groups);
         self.bindings.clear();
+        self.tra_pos.clear();
         self.token_live.clear();
         self.token_ended.clear();
         self.token_ended_order.clear();
@@ -1366,6 +1395,12 @@ impl Machine {
             + self.evictable.len() * 32
             + self.groups.iter().map(Group::bytes).sum::<usize>()
             + self.held_bytes
+            + self
+                .tra_pos
+                .values()
+                .map(|v| 48 + v.len() * 16)
+                .sum::<usize>()
+            + self.ext_bytes
     }
 
     /// Whether `id` was seen for the database identity: kept, or at or
@@ -1493,6 +1528,7 @@ impl Machine {
     }
 
     fn remove_binding(&mut self, key: Key) -> Option<Binding> {
+        self.tra_pos.remove(&key);
         let b = self.bindings.remove(&key)?;
         if let Some(n) = self.binding_count.get_mut(&key.0) {
             *n = n.saturating_sub(1);
@@ -1520,14 +1556,14 @@ impl Machine {
     }
 
     /// The position the persisted cursor may advance to: the first record
-    /// of the oldest pending group (R25 item 7), or the attach of an
-    /// external-source binding whose events are held (R29 item 2), `None`
-    /// when nothing pends.
+    /// of the oldest pending group (R25 item 7), or the first held record
+    /// of an external-source binding (R29 item 2), `None` when nothing
+    /// pends.
     pub(crate) fn held_from(&self) -> Option<u64> {
         self.groups
             .iter()
             .map(|g| g.first)
-            .chain(self.ext.values().map(|h| h.attach_pos))
+            .chain(self.ext.values().filter_map(|h| h.first_pos))
             .min()
     }
 
@@ -1535,23 +1571,82 @@ impl Machine {
     /// external-source binding's held events): the snapshot of its start
     /// is used.
     pub(crate) fn holds_pending(&self) -> bool {
-        self.blockless_pending() || !self.ext.is_empty() || !self.ext_fail.is_empty()
+        self.blockless_pending()
+            || self.ext.values().any(|h| !h.events.is_empty())
+            || !self.ext_fail.is_empty()
     }
 
-    /// R29: the hold of `key` ends with no caller (the binding gone, a
-    /// bound reached, the run's end): its records are ambiguous.
-    fn fail_ext(&mut self, key: Key) {
-        if let Some(h) = self.ext.remove(&key) {
-            self.counts.ext_failed += 1;
-            self.ext_events = self.ext_events.saturating_sub(h.events.len());
-            self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes);
-            self.ext_fail.push(h);
+    /// R29: a new external-source binding's hold, charged to the stream's
+    /// bounds; `false` past them (its records are then ambiguous).
+    fn new_ext_hold(&mut self, key: Key) -> bool {
+        if self.ext_bytes + EXT_HOLD_BYTES > EXT_BYTES {
+            return false;
         }
+        self.ext_bytes += EXT_HOLD_BYTES;
+        self.ext.insert(
+            key,
+            ExtHold {
+                started: None,
+                first_pos: None,
+                events: Vec::new(),
+                bytes: 0,
+                tx_start: None,
+                caller: false,
+            },
+        );
+        true
+    }
+
+    /// R29: the hold of `key` ends. Its held events, and its fold groups
+    /// still pending (review M2 of #402: never a quiet event), become
+    /// ambiguous; the binding, if live, is poisoned (`poison`: a failure;
+    /// otherwise its end with nothing held).
+    fn fail_ext(&mut self, key: Key) {
+        let Some(mut h) = self.ext.remove(&key) else {
+            return;
+        };
+        self.ext_events = self.ext_events.saturating_sub(h.events.len());
+        self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes + EXT_HOLD_BYTES);
+        // Its pending groups end loud, wherever they wait.
+        let mut gs: Vec<Group> = self
+            .groups
+            .iter()
+            .filter(|g| g.key == key)
+            .cloned()
+            .collect();
+        self.groups.retain(|g| g.key != key);
+        gs.extend(self.pending_end.iter().filter(|g| g.key == key).cloned());
+        self.pending_end.retain(|g| g.key != key);
+        for g in gs {
+            let DbId::Declared(db) = g.key.0 else {
+                continue;
+            };
+            let mut d = g.full.draft();
+            for o in g.bare.draft().objects {
+                if !d.objects.contains(&o) {
+                    d.objects.push(o);
+                }
+            }
+            d.star = true;
+            d.always = true;
+            let loud = self.draft_event(&d, None, db);
+            h.events.push(ExtHeld {
+                db,
+                normal: None,
+                loud,
+                key: Some(self.group_key(&g)),
+            });
+        }
+        if h.events.is_empty() {
+            return;
+        }
+        self.counts.ext_failed += 1;
         if let Some(b) = self.bindings.get_mut(&key)
             && b.kind == Kind::External
         {
             b.poisoned = true;
         }
+        self.ext_fail.push(h);
     }
 
     /// Emits the records of the holds that ended with no caller, each
@@ -1566,38 +1661,46 @@ impl Machine {
         }
     }
 
-    /// R29 item 2: the external-source binding `key`'s transaction ended:
-    /// with a caller its held events are emitted as judged; without one,
-    /// every record is ambiguous and the binding poisoned.
-    fn ext_verdict(&mut self, key: Key, out: &mut Vec<Emitted>) {
-        let Some(h) = self.ext.get(&key) else {
+    /// R29 item 2 (decision of 2026-11-01): a transaction of the
+    /// external-source binding `key` ended. Once a caller was seen, its
+    /// held events are emitted as judged and the caller test starts again;
+    /// with none, they stay held (the binding's detach or a bound decides).
+    fn ext_tx_end(&mut self, key: Key, out: &mut Vec<Emitted>) {
+        let Some(h) = self.ext.get_mut(&key) else {
             return;
         };
+        h.tx_start = None;
         if !h.caller {
-            self.fail_ext(key);
-            self.flush_ext_fail(out);
             return;
         }
-        let Some(h) = self.ext.remove(&key) else {
-            return;
-        };
+        h.caller = false;
+        h.started = None;
+        h.first_pos = None;
+        let events = std::mem::take(&mut h.events);
+        let bytes = std::mem::take(&mut h.bytes);
         self.counts.ext_released += 1;
-        self.ext_events = self.ext_events.saturating_sub(h.events.len());
-        self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes);
-        for e in h.events {
+        self.ext_events = self.ext_events.saturating_sub(events.len());
+        self.ext_bytes = self.ext_bytes.saturating_sub(bytes);
+        for e in events {
             if let Some(ev) = e.normal {
                 self.emit_keyed(e.db, ev, e.key, out);
             }
         }
     }
 
-    /// R29 item 2: one record's outputs of the held external-source binding
-    /// `key`; past a bound, the hold ends with no caller.
+    /// R29 item 2: one record's outputs of the external-source binding
+    /// `key`, held; past a bound, the hold fails.
     fn hold_ext(&mut self, key: Key, db: usize, normal: Option<MaskedEvent>, loud: MaskedEvent) {
         let b = held_bytes(&loud) + normal.as_ref().map_or(0, held_bytes);
+        let now = Instant::now();
+        let pos = self.cur.map(|k| k.off);
         let Some(h) = self.ext.get_mut(&key) else {
             return;
         };
+        h.started.get_or_insert(now);
+        if h.first_pos.is_none() {
+            h.first_pos = pos;
+        }
         h.events.push(ExtHeld {
             db,
             normal,
@@ -1609,6 +1712,25 @@ impl Machine {
         self.ext_bytes += b;
         if self.ext_events > EXT_EVENTS || self.ext_bytes > EXT_BYTES {
             self.fail_ext(key);
+        }
+    }
+
+    /// R29 item 2: a finish record of code of the user binding `key` in
+    /// transaction `tra` is the caller of every external-source binding
+    /// whose open transaction started after `tra` did (so `tra` was open
+    /// at it, and is still open: it writes this record).
+    fn note_caller(&mut self, key: Key, tra: Option<u64>) {
+        let Some(p) = tra.and_then(|t| {
+            self.tra_pos
+                .get(&key)
+                .and_then(|v| v.iter().find(|(x, _)| *x == t).map(|(_, p)| *p))
+        }) else {
+            return;
+        };
+        for h in self.ext.values_mut() {
+            if h.tx_start.is_some_and(|s| p < s) {
+                h.caller = true;
+            }
         }
     }
 
@@ -2161,8 +2283,11 @@ impl Machine {
         // checkpoint while the hold lasts.
         // R29 item 2: so may an external-source attach (its events are held
         // until its transaction's end).
-        let ext_attach = rec.header.event == Event::AttachDatabase
-            && rec.att.is_some_and(|a| a.protocol == Protocol::Internal);
+        let ext_attach = (rec.header.event == Event::AttachDatabase
+            && rec.att.is_some_and(|a| a.protocol == Protocol::Internal))
+            || self
+                .ext_key(&rec)
+                .is_some_and(|k| self.ext.get(&k).is_some_and(|h| h.events.is_empty()));
         if self.snapshots
             && ((matches!(rec.body, Body::Routine { .. }) && rec.trailer.block.is_none())
                 || ext_attach)
@@ -2317,7 +2442,7 @@ impl Machine {
         let old: Vec<Key> = self
             .ext
             .iter()
-            .filter(|(_, h)| now.duration_since(h.started) >= EXT_TIME)
+            .filter(|(_, h)| h.started.is_some_and(|t| now.duration_since(t) >= EXT_TIME))
             .map(|(k, _)| *k)
             .collect();
         for k in old {
@@ -2811,29 +2936,20 @@ impl Machine {
         match h.event {
             Event::AttachDatabase | Event::CreateDatabase if h.outcome == Outcome::Ok => {
                 let d = self.attach(rec, key, token, now, in_window, kind, pos);
-                // R29 item 2: its events are held until its transaction's
-                // end, and a caller is looked for among the bindings with a
-                // transaction open now.
-                if kind == Kind::External && matches!(d, Decision::Normal { .. }) {
-                    let callers = self
-                        .bindings
-                        .iter()
-                        .filter(|(k, b)| {
-                            **k != key && b.kind == Kind::User && !b.open_tras.is_empty()
-                        })
-                        .map(|(k, _)| *k)
-                        .collect();
-                    self.ext.insert(
-                        key,
-                        ExtHold {
-                            started: now,
-                            attach_pos: pos,
-                            events: Vec::new(),
-                            bytes: 0,
-                            callers,
-                            caller: false,
-                        },
-                    );
+                // R29 item 2: its events are held across its transactions
+                // until one ends after a caller was seen; past the stream's
+                // bound for holds, it is ambiguous at once.
+                if kind == Kind::External
+                    && matches!(d, Decision::Normal { .. })
+                    && !self.new_ext_hold(key)
+                {
+                    if let Some(b) = self.bindings.get_mut(&key) {
+                        b.poisoned = true;
+                    }
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
                 }
                 d
             }
@@ -3270,28 +3386,25 @@ impl Machine {
                 at: line!(),
             };
         }
-        // R29 item 2: an external-source binding detached before its
-        // transaction's end has no caller; after its verdict, only its
-        // detach is expected.
+        // R29 item 2: an external-source binding detached with events still
+        // held saw no caller for them: they, and the detach, are ambiguous.
         if b.kind == Kind::External {
-            let held = self.ext.contains_key(&key);
-            let detach = matches!(h.event, Event::DetachDatabase | Event::DropDatabase);
-            if detach && held {
+            let held = self.ext.get(&key).is_some_and(|h| !h.events.is_empty());
+            if matches!(h.event, Event::DetachDatabase | Event::DropDatabase) && held {
+                self.fail_ext(key);
                 self.end_binding(key);
                 return Decision::Ambiguous {
                     window: false,
                     at: line!(),
                 };
             }
-            if !detach && !held {
-                return Decision::Ambiguous {
-                    window: false,
-                    at: line!(),
-                };
+            if h.event == Event::StartTransaction
+                && let Some(x) = self.ext.get_mut(&key)
+            {
+                x.tx_start = Some(pos);
             }
         }
-        // R29 item 2: a finish record of code on a binding that had a
-        // transaction open at an external-source attach is its caller.
+        // R29 item 2: a finish record of code on a user binding.
         if b.kind == Kind::User && !self.ext.is_empty() {
             let code = match &rec.body {
                 Body::Routine { .. } => true,
@@ -3299,11 +3412,7 @@ impl Machine {
                 _ => false,
             };
             if code {
-                for x in self.ext.values_mut() {
-                    if x.callers.contains(&key) {
-                        x.caller = true;
-                    }
-                }
+                self.note_caller(key, rec.tra.map(|t| t.id));
             }
         }
         // A database trigger waiting for its sequence (R15, R34).
@@ -3383,6 +3492,13 @@ impl Machine {
                     bm.first_tra.get_or_insert(t);
                     if bm.open_tras.len() < MAX_GROUPS_PER_BINDING * 4 {
                         bm.open_tras.push(t);
+                        // R29: where it started (the caller test).
+                        if bm.kind == Kind::User {
+                            let v = self.tra_pos.entry(key).or_default();
+                            if !v.iter().any(|(x, _)| *x == t) {
+                                v.push((t, pos));
+                            }
+                        }
                     }
                 }
                 return self.normal(db, Some(key));
@@ -3391,6 +3507,12 @@ impl Machine {
                 if let Some(t) = tra {
                     if let Some(bm) = self.bindings.get_mut(&key) {
                         bm.open_tras.retain(|x| *x != t);
+                    }
+                    if let Some(v) = self.tra_pos.get_mut(&key) {
+                        v.retain(|(x, _)| *x != t);
+                        if v.is_empty() {
+                            self.tra_pos.remove(&key);
+                        }
                     }
                     let gs: Vec<Group> = self
                         .groups
@@ -3780,7 +3902,7 @@ impl Machine {
         if let Some(k) = ext
             && tra_end
         {
-            self.ext_verdict(k, out);
+            self.ext_tx_end(k, out);
         }
         self.flush_ext_fail(out);
     }
