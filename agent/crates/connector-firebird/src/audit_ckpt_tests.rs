@@ -148,6 +148,13 @@ impl Proc {
             last_end: None,
             lost_in: None,
             ended: None,
+            backlog: std::collections::VecDeque::new(),
+            batch: None,
+            stop: None,
+            sample: None,
+            server_port: None,
+            eofs: std::collections::VecDeque::new(),
+            last_eof: None,
         };
         Self {
             r,
@@ -187,6 +194,13 @@ impl Proc {
             let mut out = Vec::new();
             let more = self.r.poll(&mut self.m, &cats, &mut out).unwrap();
             self.deliver(out);
+            // R1 rule 2: a stop before a record of another pid; no check
+            // confirms it here (the confirmation fails: the record and the
+            // pid's later ones are ambiguous).
+            if let Some(st) = self.r.stop.take() {
+                self.m.confirmation_failed(st.pid, Instant::now());
+                continue;
+            }
             if !more {
                 break;
             }
@@ -2015,5 +2029,57 @@ fn value_bearing_names_are_never_persisted_and_still_credit() {
         "{:?}",
         objects(&p.out)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R29 item 2 with the checkpoint: while an external-source binding's
+/// events are held, the checkpoint is the state before its attach (the
+/// held events are not persisted, the position held back there); a
+/// restart re-reads the attach and holds again, and the caller's code
+/// record then releases the read, once, not ambiguous.
+#[test]
+fn a_restart_during_an_external_source_hold_holds_again_and_sends_once() {
+    use crate::stream_tests::{HEAD, caller_commit, caller_open, ext_source, stmt};
+    let dir = temp("ext");
+    first_start(&dir);
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    append(&dir, &caller_open(c));
+    // The external attach's record starts after its `TRACE_INIT` record.
+    let init = format!("{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n");
+    let attach_at = std::fs::metadata(dir.join("audit.log")).unwrap().len() + init.len() as u64;
+    append(
+        &dir,
+        &format!("{start}{}", attach("24:0x7f0000000300", 5, APP)),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.spooled();
+    let held = p.commit();
+    assert!(!objects(&p.out).contains(&"CUSTOMERS".to_owned()), "held");
+    assert_eq!(held[0].1.start, attach_at, "held back at the attach");
+    assert_eq!(p.counts().1.written, 1);
+    drop(p);
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    assert_eq!(p.counts().1.restored, 1);
+    assert!(
+        !objects(&p.out).contains(&"CUSTOMERS".to_owned()),
+        "held again"
+    );
+    let call = stmt(c, 3, 5, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    append(
+        &dir,
+        &format!(
+            "{call}{}{end}{}",
+            caller_commit(c),
+            attach("24:0x7f0000000400", 6, APP)
+        ),
+    );
+    p.read();
+    let o = objects(&p.out);
+    assert_eq!(o.iter().filter(|x| *x == "CUSTOMERS").count(), 1, "{o:?}");
+    assert_eq!(p.m.counts.ambiguous, 0, "{:?}", p.m.why);
     let _ = std::fs::remove_dir_all(&dir);
 }

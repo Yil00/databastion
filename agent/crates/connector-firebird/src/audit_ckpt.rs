@@ -692,7 +692,7 @@ impl Checkpointer {
         let (file, pos, machine, step) = if m.checkpointable() {
             let (f, p) = live.filter(|(f, _)| Some(*f) == open)?;
             (f, p, m.export(now)?, m.step())
-        } else if m.blockless_pending() {
+        } else if m.holds_pending() {
             // A snapshot older than the last checkpoint would move it back.
             let s = m.snapshot().filter(|s| {
                 Some(s.file) == open && self.last.as_ref().is_none_or(|l| s.step >= l.step)

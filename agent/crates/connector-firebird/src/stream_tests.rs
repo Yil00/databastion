@@ -2575,3 +2575,642 @@ fn a_restore_ends_ddl_waits_and_invalidates() {
         assert!(m.views_invalid_for_tests(0), "wait {wait}");
     }
 }
+
+/// An `ERROR` record of the agent's attachment 3 (`token`) at `at`, one
+/// line per code.
+fn own_error(head: &str, token: &str, at: &str, codes: &[&str]) -> String {
+    let mut out = format!(
+        "{head} ({token}) ERROR AT {at}\n\t{APP} (ATT_3, DATABASTION_AGENT:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n"
+    );
+    for c in codes {
+        out.push_str(&format!("{c} : a message\n"));
+    }
+    out.push('\n');
+    out
+}
+
+/// R22 items 5 to 8 and R35: a credited own record leaves one error
+/// follow-up on its binding (the row-limit cut's request synchronization
+/// error, the server's statement timeout, the connector's answered
+/// cancel), consumed with no event by the next record of that binding if
+/// it is an `ERROR` record of exactly that shape; a second record of a
+/// follow-up shape once it is consumed is ambiguous (a forged copy is
+/// loud). An error record that is no expected follow-up is handled as any
+/// client's (no event, not ambiguous), and a follow-up not met at once is
+/// dropped.
+#[test]
+fn own_error_follow_ups_are_consumed_once_and_a_second_copy_is_loud() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let a = "24:0x7f0000000100";
+    let ledger = Arc::new(Ledger::default());
+    let (head, opened) = now_head(0);
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    let account = |end, cut| FetchAccount {
+        counted: 1,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end,
+        cut,
+        ..FetchAccount::default()
+    };
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let v = crate::sql::VERSION;
+    feed_h(&head, &mut m, &cats, &attach_as(a, 3, agent), 0);
+    let sync = own_error(&head, a, "JResultSet::fetchNext", &["335544364"]);
+    // A cut read reaching the end, then its request synchronization error.
+    ledger.credit_at(APP, 3, v, account(FetchEnd::End, true), opened);
+    let mut pos = 1000;
+    let mut step = |m: &mut Machine, rec: &str| {
+        pos += 1000;
+        feed_h(&head, m, &cats, rec, pos)
+    };
+    let own = stmt(a, 3, 5, agent, v, 1, &[("RDB$DATABASE", 1)]);
+    assert!(step(&mut m, &own).is_empty());
+    assert!(step(&mut m, &sync).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (1, 0));
+    // A second copy right after: loud.
+    let out = step(&mut m, &sync);
+    assert_eq!(m.counts.ambiguous, 1, "{:?}", m.why);
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
+    // A full read leaves no follow-up: the same shape is handled as any
+    // client's error record (no event, not ambiguous).
+    ledger.credit_at(APP, 3, v, account(FetchEnd::End, false), opened);
+    assert!(step(&mut m, &stmt(a, 3, 6, agent, v, 1, &[("RDB$DATABASE", 1)])).is_empty());
+    assert!(step(&mut m, &sync).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (1, 1));
+    assert_eq!(m.counts.own_errors_not_followed, 1);
+    // The server's statement timeout: a FAILED finish, then both codes.
+    ledger.credit_at(APP, 3, v, account(FetchEnd::Failed, false), opened);
+    let failed = stmt(a, 3, 7, agent, v, 0, &[("RDB$DATABASE", 1)]).replacen(
+        ") EXECUTE_STATEMENT_FINISH",
+        ") FAILED EXECUTE_STATEMENT_FINISH",
+        1,
+    );
+    assert!(step(&mut m, &failed).is_empty());
+    let timeout = own_error(
+        &head,
+        a,
+        "JResultSet::fetchNext",
+        &["335544794", "335545129"],
+    );
+    assert!(step(&mut m, &timeout).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (2, 1));
+    // An answered cancel whose error record has the wrong shape (another
+    // code, or a message continuation line): not consumed, no event, and
+    // the follow-up is gone (a later exact copy is no follow-up either).
+    ledger.credit_at(APP, 3, v, account(FetchEnd::Cancelled, false), opened);
+    let cancelled = stmt(a, 3, 8, agent, v, 0, &[("RDB$DATABASE", 1)]).replacen(
+        ") EXECUTE_STATEMENT_FINISH",
+        ") FAILED EXECUTE_STATEMENT_FINISH",
+        1,
+    );
+    assert!(step(&mut m, &cancelled).is_empty());
+    let cont = own_error(&head, a, "JStatement::openCursor", &["335544794"])
+        .replace(" : a message\n", " : a message\n-a continuation\n");
+    assert!(step(&mut m, &cont).is_empty());
+    let cancel = own_error(&head, a, "JStatement::openCursor", &["335544794"]);
+    assert!(step(&mut m, &cancel).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (2, 1));
+    // A cancel follow-up met at once is consumed.
+    ledger.credit_at(APP, 3, v, account(FetchEnd::Cancelled, false), opened);
+    assert!(step(&mut m, &cancelled.replace("TRA_8", "TRA_9")).is_empty());
+    assert!(step(&mut m, &cancel).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (3, 1));
+    // Another binding's record of the follow-up shape is no follow-up of
+    // the agent's binding: as any client's (no event).
+    let other = sync.replace("ATT_3, DATABASTION_AGENT", "ATT_9, APP");
+    assert!(step(&mut m, &other).is_empty());
+    assert_eq!(m.counts.ambiguous, 1);
+}
+
+/// R29: a local external data source's records on `token`, attachment
+/// `id`, transaction `tra`, for the user `SYSDBA` (`<internal>` lines with
+/// a user and a role, no client line): its attach, a read of `rel`, its
+/// transaction's end and detach.
+pub(crate) fn ext_source(token: &str, id: u64, tra: u64, rel: &str) -> (String, String, String) {
+    let line = format!("\t{APP} (ATT_{id}, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx =
+        format!("{line}\t\t(TRA_{tra}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n");
+    let start = format!(
+        "{HEAD} ({token}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({token}) ATTACH_DATABASE\n{line}\n{HEAD} ({token}) START_TRANSACTION\n{ctx}\n"
+    );
+    let read = format!(
+        "{HEAD} ({token}) EXECUTE_STATEMENT_FINISH\n{ctx}\nStatement 1:\n{}\nSELECT * FROM {rel}\n2 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{:>10}{:>70}\n\n",
+        "-".repeat(79),
+        "Table",
+        "*".repeat(115),
+        2,
+        ""
+    );
+    let end = format!(
+        "{HEAD} ({token}) COMMIT_TRANSACTION\n{ctx}      0 ms, 1 fetch(es)\n\n{HEAD} ({token}) DETACH_DATABASE\n{line}\n{HEAD} ({token}) TRACE_FINI\n\tSESSION_1 Firebird Audit\n\t\n\n"
+    );
+    (start + &read, String::new(), end)
+}
+
+/// A caller attachment (`APP`, attachment 3) with transaction 5 open.
+pub(crate) fn caller_open(token: &str) -> String {
+    format!(
+        "{}{HEAD} ({token}) START_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n",
+        attach(token, 3, APP)
+    )
+}
+
+/// The caller's commit of transaction 5.
+pub(crate) fn caller_commit(token: &str) -> String {
+    format!(
+        "{HEAD} ({token}) COMMIT_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms, 1 fetch(es)\n\n"
+    )
+}
+
+/// R29 items 1 and 2: a local external data source's attachment is an
+/// external-source binding under its line's principal; its events are
+/// held until its transaction's end and emitted as judged when a caller
+/// exists (another binding with a transaction open at the attach that
+/// wrote a finish record of code meanwhile). Before R29 every such record
+/// was ambiguous (R18 item 3).
+#[test]
+fn an_external_source_with_a_caller_is_reported_under_its_user() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    let call = stmt(
+        c,
+        3,
+        5,
+        "APP",
+        "EXECUTE BLOCK AS DECLARE N INTEGER; BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM CUSTOMERS' ON EXTERNAL '/var/lib/firebird/data/app.fdb' INTO :N; END",
+        0,
+        &[],
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut out = feed(&mut m, &cats, &format!("{}{start}", caller_open(c)), 0);
+    assert!(!names(&out).contains(&"CUSTOMERS".to_owned()), "held");
+    assert_eq!(m.ext_holds_for_tests(), 1);
+    assert!(
+        m.held_from().is_some(),
+        "the position is held back at the attach"
+    );
+    out.extend(feed(
+        &mut m,
+        &cats,
+        &format!("{call}{}{end}", caller_commit(c)),
+        100_000,
+    ));
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    let cust: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert_eq!(cust.len(), 1, "{:?}", names(&out));
+    assert!(!cust[0].1.always_report());
+    assert_eq!(cust[0].1.principal().account_name(), "SYSDBA");
+    assert_eq!(m.ext_holds_for_tests(), 0);
+    assert!(m.held_from().is_none());
+}
+
+/// R29 item 2 (security review M2): without a caller (no binding with a
+/// transaction open at the attach, or no finish record of code before the
+/// external transaction's end, or the binding gone first) every record of
+/// the external-source binding is ambiguous: always reported, `*`.
+#[test]
+fn an_external_source_without_a_caller_is_ambiguous() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    let plain = select(c, 3, 5, APP, "ORDERS", 1);
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let cases = [
+        // The caller's records are no code.
+        format!("{}{start}{plain}{}{end}", caller_open(c), caller_commit(c)),
+        // No transaction open anywhere at the attach.
+        format!("{}{start}{end}", attach(c, 3, APP)),
+        // Detached before its transaction's end.
+        format!(
+            "{}{start}{HEAD} ({e}) DETACH_DATABASE\n\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n\n",
+            caller_open(c)
+        ),
+    ];
+    for (i, log) in cases.iter().enumerate() {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        let out = feed(&mut m, &cats, log, 0);
+        let cust: Vec<_> = out
+            .iter()
+            .filter(|(_, ev)| {
+                ev.objects()
+                    .iter()
+                    .any(|o| o.object().as_str() == "CUSTOMERS")
+            })
+            .collect();
+        assert!(!cust.is_empty(), "case {i}: {:?}", names(&out));
+        assert!(cust.iter().all(|(_, ev)| ev.always_report()), "case {i}");
+        assert!(names(&out).contains(&"*".to_owned()), "case {i}");
+        assert!(m.counts.ambiguous >= 3, "case {i}: {:?}", m.counts);
+        assert_eq!(m.ext_holds_for_tests(), 0, "case {i}");
+    }
+    // An `<internal>` line with a client line is not the shape: ambiguous
+    // at once (R6 item 5).
+    let forged = start.replace(
+        "NONE, <internal>)\n\n",
+        "NONE, <internal>)\n\t/usr/bin/app:28\n\n",
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let _ = feed(&mut m, &cats, &format!("{}{forged}", caller_open(c)), 0);
+    assert!(m.counts.ambiguous >= 1);
+    assert_eq!(m.ext_holds_for_tests(), 0);
+}
+
+/// R1 rule 9: a new TCP binding whose client address and port another live
+/// binding holds is ambiguous (and tainted until it detaches); once the
+/// first detaches, the port may come back. With the runner's observation
+/// of a fresh read, a binding still live whose client end no connection of
+/// the server has is ambiguous; found, not evaluated (the table not read
+/// whole), detached later in the same read, or a record not fresh, it is
+/// not.
+#[test]
+fn tcp_lines_are_corroborated_by_the_servers_connections() {
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let (a, b, c) = (
+        "24:0x7f0000000100",
+        "24:0x7f0000000200",
+        "24:0x7f0000000300",
+    );
+    // Attachment 4's line printed with attachment 3's port.
+    let same_port = attach(b, 4, APP).replace("127.0.0.1/40004", "127.0.0.1/40003");
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let _ = feed(
+        &mut m,
+        &cats,
+        &format!("{}{same_port}", attach(a, 3, APP)),
+        0,
+    );
+    assert_eq!(
+        (m.counts.tcp_reused, m.counts.ambiguous),
+        (1, 1),
+        "{:?}",
+        m.why
+    );
+    // Review L2 of #402: both bindings are poisoned (as duplicate ids):
+    // the first binding's next record is ambiguous too.
+    let _ = feed(&mut m, &cats, &select(a, 3, 5, APP, "LEDGER", 1), 5_000);
+    assert!(m.counts.ambiguous >= 3, "{:?}", m.why);
+    let detach_a = format!(
+        "{HEAD} ({a}) DETACH_DATABASE\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\n"
+    );
+    // The tainted second binding holds the port too until it detaches.
+    let detach_b = detach_a.replace(a, b).replace("ATT_3", "ATT_4");
+    let again = attach(c, 5, APP).replace("127.0.0.1/40005", "127.0.0.1/40003");
+    let _ = feed(
+        &mut m,
+        &cats,
+        &format!("{detach_a}{detach_b}{again}"),
+        10_000,
+    );
+    assert_eq!(m.counts.tcp_reused, 1, "the port is free again");
+    let ep = |p: u16| std::net::SocketAddr::from(([127, 0, 0, 1], p));
+    let view = |clients: Option<Vec<u16>>, fresh: Option<u64>| TcpView {
+        file: (0, 0),
+        fresh_from: fresh,
+        clients: clients.map(|v| v.into_iter().map(ep).collect()),
+        detached: std::collections::HashMap::new(),
+    };
+    let cases: [(TcpView, u64, u64); 4] = [
+        // No socket for the printed port: ambiguous.
+        (view(Some(vec![40099]), Some(0)), 1, 0),
+        // Found.
+        (view(Some(vec![40007]), Some(0)), 0, 0),
+        // The table was not read whole: not evaluated.
+        (view(None, Some(0)), 0, 1),
+        // Not written within 10 s (the agent lags): not evaluated.
+        (view(Some(vec![]), None), 0, 0),
+    ];
+    for (i, (v, no_socket, not_evaluated)) in cases.into_iter().enumerate() {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.set_tcp_view(Some(v));
+        let _ = feed(&mut m, &cats, &attach(a, 7, APP), 0);
+        assert_eq!(m.counts.tcp_no_socket, no_socket, "case {i}");
+        assert_eq!(m.counts.tcp_not_evaluated, not_evaluated, "case {i}");
+        assert_eq!(m.counts.ambiguous, no_socket, "case {i}: {:?}", m.why);
+    }
+    // Detached later in the same read: no longer live when the table was
+    // read, not evaluated.
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let mut v = view(Some(vec![]), Some(0));
+    // Review M1 of #402: a later detach of another binding (another id)
+    // with the same token does not exempt it; one of this binding does.
+    v.detached.insert(
+        (24, 0x7f00_0000_0100),
+        vec![
+            (1_000_000, 8, db_hash(APP)),
+            (1_000_000, 7, db_hash("/other.fdb")),
+        ],
+    );
+    let mut m2 = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m2.set_tcp_view(Some(v.clone()));
+    let _ = feed(&mut m2, &cats, &attach(a, 7, APP), 0);
+    assert_eq!(
+        m2.counts.tcp_no_socket, 1,
+        "a forged detach of another binding"
+    );
+    v.detached
+        .insert((24, 0x7f00_0000_0100), vec![(1_000_000, 7, db_hash(APP))]);
+    m.set_tcp_view(Some(v));
+    let _ = feed(&mut m, &cats, &attach(a, 7, APP), 0);
+    assert_eq!((m.counts.tcp_no_socket, m.counts.ambiguous), (0, 0));
+    // A binding made ambiguous by rule 9 is tainted: its read is reported
+    // ambiguous too, and it is never the agent's own.
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.set_tcp_view(Some(view(Some(vec![]), Some(0))));
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{}",
+            attach(a, 7, APP),
+            select(a, 7, 9, APP, "PAYROLL", 1)
+        ),
+        0,
+    );
+    assert!(
+        out.iter()
+            .filter(|(_, e)| e.objects().iter().any(|o| o.object().as_str() == "PAYROLL"))
+            .all(|(_, e)| e.always_report())
+    );
+    assert!(m.counts.ambiguous >= 2);
+}
+
+/// Measured on 5.0.4 (`dev/firebird/it.sh`): on a target database with an
+/// `ON CONNECT` trigger, the external attachment runs the trigger in a
+/// first transaction of its own, committed before the caller's code record.
+/// The maintainer's decision of 2026-11-01: the events stay held across
+/// that transaction's end (no caller yet) and are released at the end of
+/// the next one, after the caller's code record; nothing is ambiguous.
+#[test]
+fn an_external_source_with_a_connect_trigger_transaction_is_held_across_it() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx = |t: u64| format!("{line}\t\t(TRA_{t}, CONCURRENCY | WAIT | READ_WRITE)\n");
+    let trigger = format!(
+        "{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({e}) ATTACH_DATABASE\n{line}\n{HEAD} ({e}) START_TRANSACTION\n{}\n{HEAD} ({e}) EXECUTE_TRIGGER_FINISH\n{}\nTrigger TRG_CONNECT (ON CONNECT):\n      0 ms\n\n{HEAD} ({e}) COMMIT_TRANSACTION\n{}      0 ms\n\n",
+        ctx(41),
+        ctx(41),
+        ctx(41)
+    );
+    let (start, _, end) = ext_source(e, 9, 42, "CUSTOMERS");
+    // The inner statement's transaction, after the trigger's.
+    let inner = start
+        .split_once(") START_TRANSACTION")
+        .map(|(_, r)| format!("{HEAD} ({e}) START_TRANSACTION{r}"))
+        .unwrap();
+    let call = stmt(c, 3, 5, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{trigger}{inner}{call}{end}{}",
+            caller_open(c),
+            caller_commit(c)
+        ),
+        0,
+    );
+    assert_eq!((m.counts.ext_released, m.counts.ext_failed), (1, 0));
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    let cust: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert_eq!(cust.len(), 1);
+    assert!(!cust[0].1.always_report());
+}
+
+/// Review H1 of #402: the external-source holds are O(1) each and
+/// charged to their bound: many user bindings with an open transaction and
+/// many external attaches keep the stream's state within its caps; past
+/// the holds' budget, a new external attach is ambiguous at once.
+#[test]
+fn external_source_holds_stay_within_their_bounds() {
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut log = String::new();
+    for i in 0..3000u64 {
+        let t = format!("24:0x7e{i:010x}");
+        log.push_str(&format!(
+            "{HEAD} ({t}) ATTACH_DATABASE\n\t{APP} (ATT_{}, APP:NONE, UTF8, TCPv4:127.0.0.1/{})\n\t/usr/bin/app:28\n\n{HEAD} ({t}) START_TRANSACTION\n\t{APP} (ATT_{}, APP:NONE, UTF8, TCPv4:127.0.0.1/{})\n\t/usr/bin/app:28\n\t\t(TRA_{i}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n",
+            100 + i,
+            10_000 + i,
+            100 + i,
+            10_000 + i
+        ));
+    }
+    let _ = feed(&mut m, &cats, &log, 0);
+    let mut ext = String::new();
+    for i in 0..20_000u64 {
+        let t = format!("24:0x7d{i:010x}");
+        ext.push_str(&format!(
+            "{HEAD} ({t}) ATTACH_DATABASE\n\t{APP} (ATT_{}, SYSDBA:NONE, NONE, <internal>)\n\n",
+            10_000 + i
+        ));
+    }
+    let _ = feed(&mut m, &cats, &ext, 10_000_000);
+    assert!(m.state_bytes() <= MAX_STREAM_BYTES, "{}", m.state_bytes());
+    assert!(
+        m.ext_holds_for_tests() <= (4 << 20) / 256,
+        "{}",
+        m.ext_holds_for_tests()
+    );
+    assert!(m.counts.ambiguous > 0, "past the budget: ambiguous");
+}
+
+/// The maintainer's decision of 2026-11-01 (pooled external connections):
+/// a caller seen releases the held events at the next transaction end of
+/// the external binding, then the test starts again; a later transaction
+/// with no caller stays held and fails at the detach (ambiguous). A
+/// binding whose transaction started after the external transaction's
+/// start is no caller (review L4).
+#[test]
+fn a_pooled_external_source_needs_a_caller_per_release() {
+    let c = "24:0x7f0000000100";
+    let late = "24:0x7f0000000600";
+    let e = "24:0x7f0000000500";
+    let (start, _, _) = ext_source(e, 9, 20, "CUSTOMERS");
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx = |t: u64| {
+        format!("{line}\t\t(TRA_{t}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n")
+    };
+    let commit = |t: u64| {
+        format!(
+            "{HEAD} ({e}) COMMIT_TRANSACTION\n{}      0 ms, 1 fetch(es)\n\n",
+            ctx(t)
+        )
+    };
+    let second = format!(
+        "{HEAD} ({e}) START_TRANSACTION\n{}\n{HEAD} ({e}) EXECUTE_STATEMENT_FINISH\n{}\nStatement 2:\n{}\nSELECT * FROM ORDERS\n1 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n\n",
+        ctx(21),
+        ctx(21),
+        "-".repeat(79),
+        "Table",
+        "*".repeat(115),
+        "ORDERS",
+        1,
+        ""
+    );
+    let detach = format!("{HEAD} ({e}) DETACH_DATABASE\n{line}\n");
+    let code =
+        |tok: &str, id: u64, tra: u64| stmt(tok, id, tra, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    // A binding whose transaction starts after the external one's.
+    let late_open = format!(
+        "{}{HEAD} ({late}) START_TRANSACTION\n\t{APP} (ATT_6, APP:NONE, UTF8, TCPv4:127.0.0.1/40006)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n",
+        attach(late, 6, APP)
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{start}{}{}{}{second}{late_open}{}{}{detach}",
+            caller_open(c),
+            code(c, 3, 5),
+            commit(20),
+            caller_commit(c),
+            code(late, 6, 7),
+            commit(21)
+        ),
+        0,
+    );
+    assert_eq!((m.counts.ext_released, m.counts.ext_failed), (1, 1));
+    let ev = |name: &str| -> Vec<bool> {
+        out.iter()
+            .filter(|(_, e)| e.objects().iter().any(|o| o.object().as_str() == name))
+            .map(|(_, e)| e.always_report())
+            .collect()
+    };
+    assert_eq!(ev("CUSTOMERS"), vec![false], "released with its caller");
+    assert!(
+        !ev("ORDERS").is_empty() && ev("ORDERS").iter().all(|a| *a),
+        "no caller: loud"
+    );
+}
+
+/// Review M2 of #402: an external-source hold that fails (a bound, here
+/// the 10 minutes of reading time) ends its pending fold groups in their
+/// ambiguous form: never a quiet event.
+#[test]
+fn a_failed_external_hold_ends_its_groups_loud() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx =
+        format!("{line}\t\t(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n");
+    let blk = format!(
+        "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n",
+        "Table",
+        "*".repeat(115),
+        "SECRETS",
+        5,
+        ""
+    );
+    let log = format!(
+        "{}{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({e}) ATTACH_DATABASE\n{line}\n{HEAD} ({e}) START_TRANSACTION\n{ctx}\n{HEAD} ({e}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n{blk}\n",
+        caller_open(c)
+    );
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut out = feed(&mut m, &cats, &log, 0);
+    assert!(!names(&out).contains(&"SECRETS".to_owned()), "pending");
+    m.expire(Instant::now() + Duration::from_secs(601), &cats, &mut out);
+    let secrets: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "SECRETS")
+        })
+        .collect();
+    assert!(!secrets.is_empty(), "{:?}", names(&out));
+    assert!(
+        secrets.iter().all(|(_, ev)| ev.always_report()),
+        "never quiet"
+    );
+    assert_eq!(m.counts.ext_failed, 1);
+}
+
+/// Review L5 of #402: a rotation (`end_all`, the end of a file) with an
+/// external-source binding whose hold is empty keeps the hold, so its
+/// later read is held again and, with no caller, ambiguous at its detach;
+/// and an external binding left with no hold at all is ambiguous.
+#[test]
+fn an_external_source_across_a_file_end_is_never_emitted_without_a_caller() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let attach_ext = format!(
+        "{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({e}) ATTACH_DATABASE\n{line}\n"
+    );
+    let call = stmt(c, 3, 5, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    let tx = start
+        .split_once(") START_TRANSACTION")
+        .map(|(_, r)| format!("{HEAD} ({e}) START_TRANSACTION{r}"))
+        .unwrap();
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    // The attach and a first released use (a caller, a transaction end).
+    let first = format!(
+        "{}{attach_ext}{}{call}{HEAD} ({e}) COMMIT_TRANSACTION\n{line}\t\t(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms\n\n",
+        caller_open(c),
+        tx.replace("SELECT * FROM CUSTOMERS", "SELECT * FROM ORDERS")
+            .replace("CUSTOMERS  ", "ORDERS     ")
+    );
+    let _ = feed(&mut m, &cats, &first, 0);
+    assert_eq!(m.counts.ext_released, 1);
+    let mut out = Vec::new();
+    m.end_all(Instant::now(), &cats, &mut out);
+    m.set_file((7, 7));
+    // A new file: the next use has no caller (the caller's transaction
+    // ended); it is held and ambiguous at the detach, never quiet.
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{}{end}",
+            caller_commit(c),
+            tx.replace("TRA_20", "TRA_21")
+        ),
+        100_000,
+    );
+    let cust: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert!(!cust.is_empty(), "{:?}", names(&out));
+    assert!(cust.iter().all(|(_, ev)| ev.always_report()), "never quiet");
+}

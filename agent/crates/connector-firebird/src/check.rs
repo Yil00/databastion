@@ -228,6 +228,9 @@ async fn run(
         .read()
         .map_err(|_| FbError::new(FailureCode::AuthenticationFailed, Stage::Secret))?;
     let endpoint = Endpoint::of(target)?;
+    // R1 rule 2: the server pid this check reads comes from attachments
+    // made after this time.
+    let started = std::time::SystemTime::now();
     let mut notes = Notes::default();
     let mut detail: Vec<String> = Vec::new();
     if settings.tunnel {
@@ -253,6 +256,9 @@ async fn run(
         None => None,
     };
     let mut excluded: Vec<(String, &'static str)> = Vec::new();
+    // R1 rule 1 (security review L3 of #402): the server pid read on this
+    // check's own sessions, not the ledger's last attachment.
+    let mut server_pid: Option<u32> = None;
     for db in &settings.databases {
         let mut s = conn::connect(
             &endpoint,
@@ -276,6 +282,9 @@ async fn run(
         .await;
         // Audit (lot 3): the view-dependency read (R12 item 5) and the
         // read-back probe (proof 7), on databases that are not excluded.
+        if server_pid.is_none() {
+            server_pid = s.server_pid();
+        }
         let mut deps = crate::views::ViewDeps::default();
         let mut db_state = DbState::default();
         if audit_cfg.is_some() && matches!(result, Ok(Attached::Checked { .. })) {
@@ -356,7 +365,6 @@ async fn run(
         Some(cfg) if !settings.tunnel => {
             let state_audit = std::sync::Arc::clone(&state.audit);
             let id = target.id.clone();
-            let server_pid = crate::own::ledger_for(endpoint.addr).server_pid();
             let peer_uid = settings.peer_uid();
             let (level, n, d) = tokio::task::spawn_blocking(move || {
                 let mut n = Notes::default();
@@ -369,6 +377,7 @@ async fn run(
                         dbs: audit_dbs,
                         server_pid,
                         peer_uid,
+                        started,
                     },
                     &mut n,
                     &mut d,
@@ -646,11 +655,19 @@ pub(crate) async fn prepare(
         )
         .await?;
     let row = rows.rows.first().cloned().unwrap_or_default();
-    // The agent's own attachment (decision 6, R1 rule 1).
-    if let (Some(Value::Int(id)), Some(Value::Int(pid))) = (row.first(), row.get(3))
-        && let (Ok(id), Ok(pid)) = (u64::try_from(*id), u32::try_from(*pid))
-    {
-        s.register_own(id, pid);
+    // The agent's own attachment (decision 6, R1 rule 1): its id and the
+    // server pid are required (security review L3 of #402: a row without
+    // them refuses the session, never an attachment left unregistered).
+    match (row.first(), row.get(3)) {
+        (Some(Value::Int(id)), Some(Value::Int(pid)))
+            if u64::try_from(*id).is_ok() && u32::try_from(*pid).is_ok() =>
+        {
+            s.register_own(
+                u64::try_from(*id).unwrap_or_default(),
+                u32::try_from(*pid).unwrap_or_default(),
+            );
+        }
+        _ => return Err(FbError::protocol(Stage::SessionSetup)),
     }
     if !tunnel {
         let same = match (s.local, text(&row, 1), text(&row, 2)) {

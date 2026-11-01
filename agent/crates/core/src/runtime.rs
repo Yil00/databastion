@@ -1347,6 +1347,22 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::connector::sqlite_reader_failures() as f64);
         }
+        // Firebird Audit streams stopped for a run confirmation, and the
+        // confirmations that failed (ADR-0060 R1 rule 2).
+        if let Ok(key) = MetricsMapKey::try_from("firebird_audit_stream_stopped_seconds_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(
+                key,
+                crate::connector::firebird_stream_stopped_ms() as f64 / 1000.0,
+            );
+        }
+        if let Ok(key) = MetricsMapKey::try_from("firebird_audit_run_confirmations_failed_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(
+                key,
+                crate::connector::firebird_run_confirmations_failed() as f64,
+            );
+        }
         if let Ok(key) = MetricsMapKey::try_from("audit_cursor_reset_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::cursor_resets() as f64);

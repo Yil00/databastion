@@ -246,6 +246,8 @@ impl Connector for FirebirdConnector {
             &target.account,
             series,
             sink,
+            // R1 rule 9: the server's connections are those to its port.
+            Some(endpoint.addr.port()),
         )
         .await
     }

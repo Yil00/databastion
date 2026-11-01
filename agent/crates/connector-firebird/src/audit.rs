@@ -298,6 +298,36 @@ pub(crate) struct StreamFacts {
     /// Where the last stream of this process saved its cursor: the file
     /// and the offset the next stream must resume at (review M4).
     pub(crate) saved: Option<((u64, u64), u64)>,
+    /// R1 rule 2: the time the stream stopped for run confirmations, summed
+    /// over stops each ending within an hour of the previous one, and when
+    /// the last one ended (`run_confirmation_stalled` past 60 s within the
+    /// hour; a chain of stops is summed whole, so the label errs on the
+    /// side of being shown).
+    pub(crate) stopped: Duration,
+    pub(crate) last_stop: Option<SystemTime>,
+}
+
+/// R1 rule 2: the label `run_confirmation_stalled` past this much stopped
+/// time within one hour.
+const STALLED: Duration = Duration::from_secs(60);
+
+impl StreamFacts {
+    /// One stop of `d` ended at `at` (R1 rule 2).
+    pub(crate) fn note_stop(&mut self, d: Duration, at: SystemTime) {
+        let fresh = self
+            .last_stop
+            .is_some_and(|l| at.duration_since(l).unwrap_or_default() < Duration::from_secs(3600));
+        self.stopped = if fresh { self.stopped + d } else { d };
+        self.last_stop = Some(at);
+    }
+
+    /// Whether the stream stopped more than 60 s within the last hour.
+    pub(crate) fn stalled(&self, now: SystemTime) -> bool {
+        self.stopped > STALLED
+            && self.last_stop.is_some_and(|l| {
+                now.duration_since(l).unwrap_or_default() < Duration::from_secs(3600)
+            })
+    }
 }
 
 /// Per target: what the last `check()` evaluated, and the stream's facts.
@@ -356,6 +386,9 @@ struct Target {
     superserver: bool,
     max_sql_length: u64,
     run: Option<Run>,
+    /// When the check that read `run` started (R1 rule 2: only a check
+    /// started after a stop confirms it).
+    run_read_at: Option<SystemTime>,
     stream: StreamFacts,
     probe_sent: Option<SystemTime>,
     generation: u64,
@@ -395,6 +428,9 @@ pub(crate) struct CheckInputs {
     /// `MON$SERVER_PID` on the agent's own attachment.
     pub(crate) server_pid: Option<u32>,
     pub(crate) peer_uid: Option<u32>,
+    /// When the check started (before its first attachment, so the pid is
+    /// read after it).
+    pub(crate) started: SystemTime,
 }
 
 /// R9 rule 3: the evaluated `databases.conf` (read under the file rules
@@ -636,9 +672,13 @@ pub(crate) fn evaluate(
             .last_ambiguous
             .is_some_and(|a| recent(Some(a), DAY))
         {
-            notes.add(
-                TargetNote::new(NoteCode::AuditLogRecordsAmbiguous).with_count(t.stream.ambiguous),
-            );
+            let mut n =
+                TargetNote::new(NoteCode::AuditLogRecordsAmbiguous).with_count(t.stream.ambiguous);
+            // R1 rule 2: stopped more than 60 s within one hour.
+            if t.stream.stalled(now) {
+                n = n.with_labels([NoteLabel::firebird("run_confirmation_stalled")]);
+            }
+            notes.add(n);
             proven = false;
         }
         if recent(t.stream.gap, DAY) {
@@ -660,6 +700,7 @@ pub(crate) fn evaluate(
                 pid,
                 start: start.map(|(ticks, _)| ticks),
             });
+            t.run_read_at = Some(input.started);
         }
         t.probe_sent = Some(now);
         t.generation += 1;
@@ -718,13 +759,13 @@ pub(crate) fn open_check(path: PathBuf) -> OpenCheck {
     })
 }
 
+/// What the last `check()` gives the stream: its settings, the classes of
+/// each declared database, the run it read, its generation, and when it
+/// started (the run's read time, R1 rule 2).
+type CheckResult = (Settings, Vec<Classes>, Option<Run>, u64, Option<SystemTime>);
+
 /// The stream's settings from the last `check()`.
-fn settings(
-    state: &AuditState,
-    id: &str,
-    account: &str,
-    series: Series,
-) -> (Settings, Vec<Classes>, Option<Run>, u64) {
+fn settings(state: &AuditState, id: &str, account: &str, series: Series) -> CheckResult {
     state.with(id, |t| {
         let databases = t
             .dbs
@@ -753,6 +794,7 @@ fn settings(
             t.dbs.iter().map(|d| d.catalog.clone()).collect(),
             t.run,
             t.generation,
+            t.run_read_at,
         )
     })
 }
@@ -782,9 +824,10 @@ pub(crate) async fn stream(
     account: &str,
     series: Series,
     sink: &EventSink,
+    server_port: Option<u16>,
 ) -> Result<(), ConnectorError> {
     let id = cfg.target_id().to_owned();
-    let (s, mut cats, run, mut generation) = settings(&state, &id, account, series);
+    let (s, mut cats, run, mut generation, _) = settings(&state, &id, account, series);
     if s.databases.is_empty() {
         // No check has read the databases yet.
         return Err(ConnectorError::Target {
@@ -828,10 +871,18 @@ pub(crate) async fn stream(
         last_end: None,
         lost_in: None,
         ended: None,
+        backlog: std::collections::VecDeque::new(),
+        batch: None,
+        stop: None,
+        sample: None,
+        server_port,
+        eofs: std::collections::VecDeque::new(),
+        last_eof: None,
     };
     loop {
         // A new check: new names, classes, run.
-        let (s, c, run, g) = settings(&state, &id, account, series);
+        let (s, c, run, g, read_at) = settings(&state, &id, account, series);
+        let mut verdict = None;
         if g != generation {
             generation = g;
             machine.reconfigure(s);
@@ -843,12 +894,37 @@ pub(crate) async fn stream(
                 runner.digests = cats.iter().map(|x| x.digest(&key)).collect();
             }
             if let Some(r) = run {
-                machine.confirm_run(r);
+                machine.check_run(r);
+            }
+            // R1 rule 2: a check started after the stop confirms it (the
+            // record's pid is the server's) or fails it.
+            if let (Some(st), Some(r), Some(at)) = (runner.stop.as_ref(), run, read_at)
+                && at >= st.wall
+            {
+                verdict = Some(r.pid == st.pid);
             }
         }
-        // R5 item 4: the run's start time before each read cycle; a pid
-        // that is gone or no longer a Firebird server is a change too.
-        if let Some(r) = run
+        if let Some(st) = runner.stop.as_mut() {
+            let waited = st.since.elapsed();
+            if verdict.is_none() && waited < crate::stream::STOP_LIMIT {
+                // R1 rule 2: an immediate check, not merged with the early
+                // checks; again until one starts (a check running since
+                // before the stop does not confirm it), and again when one
+                // ended with no new result (a failed check, review L3).
+                st.request(&*early);
+                tokio::time::sleep(STOP_POLL).await;
+                continue;
+            }
+            let pid = st.pid;
+            let confirmed = verdict == Some(true);
+            runner.stop = None;
+            end_stop(&state, &id, &mut machine, pid, waited, confirmed);
+        }
+        // R5 item 4: the run's start time before each read cycle (and after
+        // the read, `Runner::poll`); a pid that is gone or no longer a
+        // Firebird server is a change too.
+        runner.sample = run.filter(|r| r.start.is_some());
+        if let Some(r) = runner.sample
             && let Some(start) = r.start
             && crate::fsread::process_start(r.pid).is_none_or(|(t, _)| t != start)
         {
@@ -856,6 +932,14 @@ pub(crate) async fn stream(
         }
         let polled;
         (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, sink).await?;
+        // R1 rule 2: a stop asks for an immediate check at once; so does a
+        // start-time change (R5 item 4).
+        if let Some(st) = runner.stop.as_mut() {
+            st.request(&*early);
+        }
+        if std::mem::take(&mut machine.run_check_requested) && runner.stop.is_none() && !early() {
+            machine.check_requested = true;
+        }
         // R1 rule 5 (L3, L4): the ledger's evidence of a new database life
         // is used once the first poll has restored a checkpoint (or found
         // none), so a restore confirmed before this stream started is
@@ -974,6 +1058,36 @@ async fn poll_and_deliver(
     Ok((r, m, cats, polled))
 }
 
+/// R1 rule 2: how often a stopped stream looks for its confirmation.
+const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// R1 rule 2: a stop ended after `waited`, confirmed (the record's pid is
+/// the server's: the run changes at that record) or not (the pid is
+/// remembered and the cooldown starts). The stopped time is not reading
+/// time; the metrics and the stream's facts count it.
+fn end_stop(
+    state: &AuditState,
+    id: &str,
+    machine: &mut Machine,
+    pid: u32,
+    waited: Duration,
+    confirmed: bool,
+) {
+    machine.pause(waited);
+    databastion_core::connector::count_firebird_stream_stopped(waited);
+    if !confirmed {
+        machine.confirmation_failed(pid, Instant::now());
+        databastion_core::connector::count_firebird_run_confirmation_failed();
+    }
+    state.note_stream(id, |f| f.note_stop(waited, SystemTime::now()));
+    tracing::info!(
+        target_id = %id,
+        confirmed,
+        stopped_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        "Firebird Audit stream: a record of a new server pid, run confirmation ended (R1 rule 2)"
+    );
+}
+
 /// The merged early-check requests of one stream (R11 8d): a request is
 /// served by an early check at most once per [`EARLY_CHECK_EVERY`], never
 /// while a check runs, or by any newer check result (a new generation).
@@ -1086,6 +1200,75 @@ struct Runner {
     lost_in: Option<(u64, u64)>,
     /// The last file whose held records were ended ([`Self::end_file`]).
     ended: Option<(u64, u64)>,
+    /// The lines of the last poll not yet handed (R1 rule 2: the stream
+    /// stopped before one of them). Never more than one poll.
+    backlog: std::collections::VecDeque<Line>,
+    /// What the poll of the backlog's lines needs at its end.
+    batch: Option<Batch>,
+    /// R1 rule 2: the stream is stopped before the record at the head of
+    /// the backlog (`record_start`), not persisted: a restart reads that
+    /// record again and stops again if it must.
+    stop: Option<Stop>,
+    /// R5 item 4: the run whose start time is sampled after each read.
+    sample: Option<Run>,
+    /// R1 rule 9: the server's port (the table of its connections is read
+    /// for fresh attaches); `None` (tests): the socket condition is not
+    /// evaluated.
+    server_port: Option<u16>,
+    /// R1 rule 9 (security review L11): the end-of-file offsets the reads
+    /// that reached the end of the log saw, with their agent time, for 10 s.
+    eofs: std::collections::VecDeque<(Instant, (u64, u64), u64)>,
+    /// The file and end of the last line a read returned.
+    last_eof: Option<((u64, u64), u64)>,
+}
+
+/// R1 rule 9 (security review L11): a record written within this much
+/// agent time is "read within 10 s of being written".
+const FRESH: Duration = Duration::from_secs(10);
+
+/// One line of a poll, with the files of the lines the tailer skipped
+/// for their size just before it.
+struct Line {
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    pos: databastion_core::audit::tail::RecordPos,
+    skipped: Vec<(u64, u64)>,
+}
+
+/// The end of a poll, once its lines are all handed.
+#[derive(Debug, Clone)]
+struct Batch {
+    /// Lines skipped after the last line.
+    trailing: Vec<(u64, u64)>,
+    more: bool,
+    /// Its events carry no position (a log reset in that poll).
+    unkeyed: bool,
+    /// R1 rule 9: what this read observed.
+    tcp: Option<crate::stream::TcpView>,
+}
+
+/// R1 rule 2: a stop before a record of a new pid.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stop {
+    pub(crate) pid: u32,
+    /// When it started (agent time, and wall time for the checks).
+    since: Instant,
+    wall: SystemTime,
+    /// When the last immediate check was started.
+    requested: Option<Instant>,
+}
+
+/// R1 rule 2 (review L3 of #402): a stopped stream asks for a check
+/// again this long after the last one it started, when no result came.
+const STOP_RETRY: Duration = Duration::from_secs(5);
+
+impl Stop {
+    /// Starts an immediate check, unless one was started less than
+    /// [`STOP_RETRY`] ago (`early` refuses while a check runs).
+    fn request(&mut self, early: &dyn Fn() -> bool) {
+        if self.requested.is_none_or(|t| t.elapsed() >= STOP_RETRY) && early() {
+            self.requested = Some(Instant::now());
+        }
+    }
 }
 
 impl Runner {
@@ -1098,6 +1281,78 @@ impl Runner {
         if cats.is_empty() {
             return Ok(false);
         }
+        // R1 rule 2: stopped, nothing is read or judged until the run is
+        // confirmed or the confirmation fails.
+        if self.stop.is_some() {
+            return Ok(false);
+        }
+        if self.backlog.is_empty() {
+            self.read(m, out, cats)?;
+        }
+        let now = Instant::now();
+        let Some(batch) = self.batch.clone() else {
+            return Ok(false);
+        };
+        m.unkeyed = batch.unkeyed;
+        m.set_tcp_view(batch.tcp.clone());
+        if self.hand_lines(m, now, cats, out) {
+            // Stopped before a record (R1 rule 2): the rest waits.
+            m.unkeyed = false;
+            return Ok(false);
+        }
+        self.batch = None;
+        m.set_tcp_view(None);
+        for f in batch.trailing {
+            if Some(f) == self.file {
+                self.asm.lose_line();
+            } else {
+                self.lost_in = Some(f);
+            }
+        }
+        // The file being read was ended by a rotation whose new file has
+        // given no line yet (or cannot be opened): what it holds ends now
+        // (security review M1 of #392).
+        if let Some(f) = self.tailer.take_ended() {
+            self.end_file(f, m, now, cats, out);
+        }
+        // A stable end of file: the record in progress is complete.
+        if !batch.more && now.duration_since(self.last_growth) >= STABLE_EOF {
+            let done = self.asm.flush();
+            let rs = self.record_start.unwrap_or(0);
+            self.hand(m, done, rs, now, cats, out);
+            self.record_start = None;
+        }
+        // R25 item 9: the checkpoint would pass its cap: the oldest pending
+        // groups end (their outputs sent before a checkpoint without them).
+        if let Some(budget) = self.ckpt.as_mut().and_then(Checkpointer::take_shed_target) {
+            self.shed += m.shed_groups(budget, now, cats, out);
+        }
+        m.expire(now, cats, out);
+        m.unkeyed = false;
+        // The suppressed positions the read has passed (review M1).
+        if let Some(f) = self.file {
+            let at = self
+                .record_start
+                .or(self.last_end.filter(|(lf, _)| *lf == f).map(|(_, e)| e));
+            if let Some(at) = at {
+                m.prune_suppress(f, at);
+            }
+        }
+        if std::mem::take(&mut m.suppress_cleared)
+            && let Some(c) = self.ckpt.as_mut()
+        {
+            c.forget_restored();
+        }
+        Ok(batch.more)
+    }
+
+    /// One read of the tailer: its lines become the backlog.
+    fn read(
+        &mut self,
+        m: &mut Machine,
+        out: &mut Vec<crate::stream::Emitted>,
+        cats: &[&dyn Catalog],
+    ) -> Result<(), TailError> {
         let rotations = self.tailer.rotations;
         let polled = match self.tailer.poll() {
             Ok(p) => p,
@@ -1111,6 +1366,15 @@ impl Runner {
                 return Err(e);
             }
         };
+        // R5 item 4: the start time after the read too. A restart during
+        // the read puts every record of this poll in the interval:
+        // ambiguous until the next confirmation.
+        if let Some(r) = self.sample
+            && let Some(start) = r.start
+            && crate::fsread::process_start(r.pid).is_none_or(|(t, _)| t != start)
+        {
+            m.start_time_changed();
+        }
         // R39 (a): the re-read region (known once the file is open); its end
         // is kept for the count.
         if let Some(r) = self.tailer.take_replay() {
@@ -1141,7 +1405,6 @@ impl Runner {
             m.reset_positions();
             c.reset();
         }
-        m.unkeyed = reset;
         if !polled.records.is_empty() {
             self.last_growth = now;
         }
@@ -1154,12 +1417,122 @@ impl Runner {
                 .iter()
                 .filter(move |(i, _)| *i == k)
                 .map(|(_, f)| *f)
+                .collect::<Vec<_>>()
         };
-        for (k, (line, pos)) in polled.records.iter().zip(&polled.positions).enumerate() {
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let n = polled.records.len();
+        let trailing = skipped_at(n);
+        let skips: Vec<Vec<(u64, u64)>> = (0..n).map(skipped_at).collect();
+        for ((bytes, pos), skipped) in polled.records.into_iter().zip(polled.positions).zip(skips) {
+            self.backlog.push_back(Line {
+                bytes,
+                pos,
+                skipped,
+            });
+        }
+        let tcp = self.tcp_view(polled.more);
+        self.batch = Some(Batch {
+            trailing,
+            more: polled.more,
+            unkeyed: reset,
+            tcp,
+        });
+        Ok(())
+    }
+
+    /// R1 rule 9: the freshness of this read's records (past the end of
+    /// file a read less than 10 s ago saw), the tokens it detaches, and,
+    /// when one of its attaches is fresh, the server's connections read
+    /// now (after the read: every attach of it was written before).
+    fn tcp_view(&mut self, more: bool) -> Option<crate::stream::TcpView> {
+        let now = Instant::now();
+        self.eofs.retain(|(t, _, _)| now.duration_since(*t) < FRESH);
+        let file = self
+            .backlog
+            .front()
+            .map(|l| l.pos.file)
+            .or_else(|| self.tailer.open_file());
+        let fresh_from = self
+            .eofs
+            .iter()
+            .filter(|(_, f, _)| Some(*f) == file)
+            .map(|(_, _, o)| *o)
+            .min();
+        let mut view = crate::stream::TcpView {
+            file: file.unwrap_or_default(),
+            fresh_from,
+            ..Default::default()
+        };
+        let mut need = false;
+        let lines: Vec<&Line> = self.backlog.iter().collect();
+        for (i, l) in lines.iter().enumerate() {
+            let line = l.bytes.strip_suffix(b"\n").unwrap_or(&l.bytes);
+            let Some(h) = header(line) else {
+                continue;
+            };
+            match h.event {
+                crate::trace_log::Event::DetachDatabase => {
+                    // Review M1 of #402: with the binding it ends (its
+                    // attachment line: the database name and the id, as the
+                    // record parser reads them).
+                    let next = lines.get(i + 1).map(|n| {
+                        String::from_utf8_lossy(n.bytes.strip_suffix(b"\n").unwrap_or(&n.bytes))
+                            .into_owned()
+                    });
+                    if let Some(a) = next.as_deref().and_then(crate::trace_log::att_line) {
+                        view.detached.entry(h.token()).or_default().push((
+                            l.pos.start,
+                            a.id,
+                            crate::stream::db_hash(a.database),
+                        ));
+                    }
+                }
+                crate::trace_log::Event::AttachDatabase => {
+                    need |=
+                        Some(l.pos.file) == file && fresh_from.is_some_and(|f| l.pos.start >= f);
+                }
+                _ => {}
+            }
+        }
+        if let Some(last) = self.backlog.back() {
+            self.last_eof = Some((last.pos.file, last.pos.end));
+        }
+        // A read that reached the end of the log: its end is an
+        // observation of the file's end now.
+        if !more && let Some((f, o)) = self.last_eof {
+            self.eofs.push_back((now, f, o));
+        }
+        let port = self.server_port?;
+        if need {
+            // Review L1 of #402: only for a server process visible here, in
+            // this network namespace, with its uid (the tables are then its
+            // own); otherwise not evaluated.
+            view.clients = self
+                .sample
+                .filter(|r| crate::peer::same_netns(r.pid))
+                .and_then(|r| crate::fsread::server_ids(r.pid))
+                .and_then(|(uid, _)| crate::peer::server_clients(port, uid));
+        }
+        Some(view)
+    }
+
+    /// Hands the backlog's lines to the assembler and the machine; `true`
+    /// when the stream stopped before a record (R1 rule 2: a new pid), the
+    /// record in progress before it handed, its line kept at the backlog's
+    /// head and the position held back to it.
+    fn hand_lines(
+        &mut self,
+        m: &mut Machine,
+        now: Instant,
+        cats: &[&dyn Catalog],
+        out: &mut Vec<crate::stream::Emitted>,
+    ) -> bool {
+        while let Some(mut l) = self.backlog.pop_front() {
+            let line = l.bytes.strip_suffix(b"\n").unwrap_or(&l.bytes);
+            let pos = l.pos;
             let start = pos.start;
             let before = self.file;
-            if skipped_at(k).any(|f| Some(f) == before) {
+            let skipped = std::mem::take(&mut l.skipped);
+            if skipped.iter().any(|f| Some(*f) == before) {
                 self.asm.lose_line();
             }
             if let Some(e) = self.expect.take()
@@ -1167,6 +1540,7 @@ impl Runner {
             {
                 self.reset = true;
             }
+            let last_end = self.last_end;
             self.last_end = Some((pos.file, pos.end));
             if self.file != Some(pos.file) {
                 if let Some(old) = self.file {
@@ -1183,10 +1557,32 @@ impl Runner {
                     None => {}
                 }
             }
-            if skipped_at(k).any(|f| Some(f) != before) {
+            if skipped.iter().any(|f| Some(*f) != before) {
                 self.asm.lose_line();
             }
-            if header(line).is_some() {
+            if let Some(h) = header(line) {
+                // R1 rule 2: a record of a new pid stops the stream before
+                // it. The record in progress is complete (this header ends
+                // it).
+                if m.stop_wanted(&h, now) {
+                    let done = self.asm.flush();
+                    let rs = self.record_start.unwrap_or(start);
+                    self.hand(m, done, rs, now, cats, out);
+                    self.record_start = Some(start);
+                    self.last_end = last_end;
+                    self.backlog.push_front(l);
+                    self.stop = Some(Stop {
+                        pid: h.pid,
+                        since: Instant::now(),
+                        wall: SystemTime::now(),
+                        requested: None,
+                    });
+                    tracing::info!(
+                        "Firebird Audit stream stopped before a record of a new server pid; \
+                         confirming the run (R1 rule 2)"
+                    );
+                    return true;
+                }
                 // The record in progress ends here.
                 let done = self.asm.push_line(line);
                 let rs = self.record_start.unwrap_or(start);
@@ -1200,48 +1596,13 @@ impl Runner {
                 self.hand(m, done, start, now, cats, out);
             }
         }
-        for f in skipped_at(polled.records.len()) {
-            if Some(f) == self.file {
-                self.asm.lose_line();
-            } else {
-                self.lost_in = Some(f);
-            }
-        }
-        // The file being read was ended by a rotation whose new file has
-        // given no line yet (or cannot be opened): what it holds ends now
-        // (security review M1 of #392).
-        if let Some(f) = self.tailer.take_ended() {
-            self.end_file(f, m, now, cats, out);
-        }
-        // A stable end of file: the record in progress is complete.
-        if !polled.more && now.duration_since(self.last_growth) >= STABLE_EOF {
-            let done = self.asm.flush();
-            let rs = self.record_start.unwrap_or(0);
-            self.hand(m, done, rs, now, cats, out);
-            self.record_start = None;
-        }
-        // R25 item 9: the checkpoint would pass its cap: the oldest pending
-        // groups end (their outputs sent before a checkpoint without them).
-        if let Some(budget) = self.ckpt.as_mut().and_then(Checkpointer::take_shed_target) {
-            self.shed += m.shed_groups(budget, now, cats, out);
-        }
-        m.expire(now, cats, out);
-        m.unkeyed = false;
-        // The suppressed positions the read has passed (review M1).
-        if let Some(f) = self.file {
-            let at = self
-                .record_start
-                .or(self.last_end.filter(|(lf, _)| *lf == f).map(|(_, e)| e));
-            if let Some(at) = at {
-                m.prune_suppress(f, at);
-            }
-        }
-        if std::mem::take(&mut m.suppress_cleared)
-            && let Some(c) = self.ckpt.as_mut()
-        {
-            c.forget_restored();
-        }
-        Ok(polled.more)
+        false
+    }
+
+    /// R1 rule 2: the stop in force, if any.
+    #[cfg(test)]
+    pub(crate) fn stop_for_tests(&self) -> Option<Stop> {
+        self.stop
     }
 
     /// Writes the checkpoint (when the stream has one) and gives the
@@ -1419,6 +1780,13 @@ mod tests {
             last_end: None,
             lost_in: None,
             ended: None,
+            backlog: std::collections::VecDeque::new(),
+            batch: None,
+            stop: None,
+            sample: None,
+            server_port: None,
+            eofs: std::collections::VecDeque::new(),
+            last_eof: None,
         }
     }
 
@@ -1454,6 +1822,650 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// R1 rule 2: a stream of a confirmed run of pid 24 that has read an
+    /// attachment and a read, then meets a record of pid 99: the polls up
+    /// to it, with what they emitted.
+    fn stopped_at_a_new_pid(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        Runner,
+        Machine,
+        Classes,
+        Vec<crate::stream::Emitted>,
+        u64,
+    ) {
+        use crate::stream_tests::{APP, attach, select};
+        let dir = temp(name);
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1000),
+        });
+        let classes = Classes::default();
+        let mut out = Vec::new();
+        {
+            let cats: Vec<&dyn Catalog> = vec![&classes];
+            while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        }
+        let old = format!(
+            "{}{}",
+            attach("24:0x7f0000000100", 3, APP),
+            select("24:0x7f0000000100", 3, 5, APP, "CUSTOMERS", 2)
+        );
+        let new_run = format!(
+            "{}{}",
+            attach("99:0x7f0000000900", 9, APP),
+            select("99:0x7f0000000900", 9, 11, APP, "PAYROLL", 3)
+        );
+        // A last record, so the new run's read is complete.
+        let tail = attach("99:0x7f0000000990", 10, APP);
+        append(&log, &format!("{old}{new_run}{tail}"));
+        {
+            let cats: Vec<&dyn Catalog> = vec![&classes];
+            while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        }
+        (dir, r, m, classes, out, old.len() as u64)
+    }
+
+    fn poll_all(r: &mut Runner, m: &mut Machine, classes: &Classes) -> Vec<crate::stream::Emitted> {
+        let cats: Vec<&dyn Catalog> = vec![classes];
+        let mut out = Vec::new();
+        while r.poll(m, &cats, &mut out).unwrap() {}
+        out
+    }
+
+    /// R1 rule 2 (review L3 of #402): a stopped stream starts its
+    /// immediate check, and starts another when the first ended with no
+    /// result (a failed check gives no new generation), never while one
+    /// runs.
+    #[test]
+    fn a_stop_asks_again_for_a_check_that_gave_no_result() {
+        let mut st = Stop {
+            pid: 99,
+            since: Instant::now(),
+            wall: SystemTime::now(),
+            requested: None,
+        };
+        let started = std::cell::Cell::new(0u32);
+        let running = std::cell::Cell::new(true);
+        let early = || {
+            if running.get() {
+                return false;
+            }
+            started.set(started.get() + 1);
+            true
+        };
+        st.request(&early);
+        assert_eq!(started.get(), 0, "a check runs: not started");
+        running.set(false);
+        st.request(&early);
+        assert_eq!(started.get(), 1);
+        st.request(&early);
+        assert_eq!(started.get(), 1, "not again at once");
+        st.requested = Some(Instant::now() - STOP_RETRY);
+        st.request(&early);
+        assert_eq!(started.get(), 2, "again: the first gave no result");
+    }
+
+    /// R1 rule 2, the stop: the record of a new pid stops the stream
+    /// before it, without advancing its position (the cursor is held at
+    /// its start) and nothing of the new pid is judged; the records before
+    /// it are. While stopped, nothing more is read.
+    #[test]
+    fn a_new_pid_stops_the_stream_before_its_record() {
+        let (dir, mut r, mut m, classes, out, old_len) = stopped_at_a_new_pid("stop");
+        assert!(objects(&out).contains(&"CUSTOMERS".to_owned()));
+        assert!(!objects(&out).contains(&"PAYROLL".to_owned()));
+        assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+        let st = r.stop_for_tests().expect("stopped");
+        assert_eq!(st.pid, 99);
+        // The position is held at the new pid's first record (its
+        // `TRACE_INIT`), the end of the old run's records.
+        let held = r.held(&m);
+        assert_eq!(held.first().map(|(_, p)| p.start), Some(old_len));
+        append(
+            &r.log.clone(),
+            &crate::stream_tests::select(
+                "24:0x7f0000000100",
+                3,
+                6,
+                crate::stream_tests::APP,
+                "LEDGER",
+                1,
+            ),
+        );
+        assert!(
+            poll_all(&mut r, &mut m, &classes).is_empty(),
+            "nothing read while stopped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 rule 2, a confirmed change: a check started after the stop reads
+    /// pid 99; the run changes at that record, the old run's bindings end,
+    /// and the new run's records are judged normally (no ambiguous
+    /// record). Before the stop existed they were all ambiguous.
+    #[test]
+    fn a_confirmed_new_pid_starts_a_run_at_its_record() {
+        let (dir, mut r, mut m, classes, _, _) = stopped_at_a_new_pid("confirmed");
+        let state = AuditState::default();
+        m.check_run(Run {
+            pid: 99,
+            start: Some(2000),
+        });
+        r.stop = None;
+        end_stop(&state, "t", &mut m, 99, Duration::from_millis(300), true);
+        let out = poll_all(&mut r, &mut m, &classes);
+        assert!(
+            objects(&out).contains(&"PAYROLL".to_owned()),
+            "{:?}",
+            objects(&out)
+        );
+        assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+        assert_eq!(m.run_for_tests().map(|x| x.pid), Some(99));
+        assert!(m.failed_pids_for_tests().is_empty());
+        // A record of the ended run is a new pid like any other: a stop.
+        append(
+            &r.log.clone(),
+            &crate::stream_tests::select(
+                "24:0x7f0000000100",
+                3,
+                6,
+                crate::stream_tests::APP,
+                "LEDGER",
+                1,
+            ),
+        );
+        let _ = poll_all(&mut r, &mut m, &classes);
+        assert_eq!(r.stop_for_tests().map(|s| s.pid), Some(24));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 rule 2, a failed confirmation (the check read the old run, or
+    /// none answered within 60 s): the new pid's records are ambiguous
+    /// (always reported, `*`), the pid is remembered and its next records
+    /// are ambiguous with no stop; in the 10-minute cooldown any other new
+    /// pid is ambiguous with no stop too.
+    #[test]
+    fn a_failed_confirmation_makes_the_pid_ambiguous_and_starts_the_cooldown() {
+        use crate::stream_tests::{APP, select};
+        let (dir, mut r, mut m, classes, _, _) = stopped_at_a_new_pid("failed");
+        let state = AuditState::default();
+        r.stop = None;
+        end_stop(&state, "t", &mut m, 99, Duration::from_secs(60), false);
+        let out = poll_all(&mut r, &mut m, &classes);
+        assert!(m.counts.ambiguous >= 2, "{:?}", m.why);
+        let payroll: Vec<_> = out
+            .iter()
+            .filter(|(_, e)| e.objects().iter().any(|o| o.object().as_str() == "PAYROLL"))
+            .collect();
+        assert!(!payroll.is_empty() && payroll.iter().all(|(_, e)| e.always_report()));
+        assert_eq!(m.failed_pids_for_tests(), &[99]);
+        assert_eq!(m.run_for_tests().map(|x| x.pid), Some(24));
+        append(
+            &r.log.clone(),
+            &format!(
+                "{}{}",
+                select("99:0x7f0000000900", 9, 12, APP, "PAYROLL", 1),
+                select("98:0x7f0000000980", 8, 13, APP, "LEDGER", 1)
+            ),
+        );
+        let before = m.counts.ambiguous;
+        let _ = poll_all(&mut r, &mut m, &classes);
+        assert!(
+            r.stop_for_tests().is_none(),
+            "no stop: remembered, then cooldown"
+        );
+        assert!(m.counts.ambiguous >= before + 2);
+        // The stalled label's facts: 60 s within the hour is not past it.
+        state.with("t", |t| assert!(!t.stream.stalled(SystemTime::now())));
+        end_stop(&state, "t", &mut m, 97, Duration::from_secs(5), false);
+        state.with("t", |t| assert!(t.stream.stalled(SystemTime::now())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 rule 2: a run a check read before the stream reaches its records
+    /// is pending; the old run's remaining records are judged as the old
+    /// run's, and the run changes at the first record of the new pid with
+    /// no stop. Before the first check (a provisional run, R40 item 4) a
+    /// new pid never stops the stream.
+    #[test]
+    fn a_pending_run_changes_at_its_first_record_without_a_stop() {
+        use crate::stream_tests::{APP, attach, select};
+        let dir = temp("pending");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1000),
+        });
+        let classes = Classes::default();
+        let _ = poll_all(&mut r, &mut m, &classes);
+        m.check_run(Run {
+            pid: 99,
+            start: Some(2000),
+        });
+        append(
+            &log,
+            &format!(
+                "{}{}{}{}{}",
+                attach("24:0x7f0000000100", 3, APP),
+                select("24:0x7f0000000100", 3, 5, APP, "CUSTOMERS", 2),
+                attach("99:0x7f0000000900", 9, APP),
+                select("99:0x7f0000000900", 9, 11, APP, "PAYROLL", 3),
+                attach("99:0x7f0000000990", 10, APP)
+            ),
+        );
+        let out = poll_all(&mut r, &mut m, &classes);
+        assert!(r.stop_for_tests().is_none());
+        assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+        assert!(objects(&out).contains(&"CUSTOMERS".to_owned()));
+        assert!(objects(&out).contains(&"PAYROLL".to_owned()));
+        assert_eq!(m.run_for_tests().map(|x| x.pid), Some(99));
+        // Provisional: never a stop.
+        let mut p = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let mut r2 = runner(&log, None);
+        let _ = poll_all(&mut r2, &mut p, &classes);
+        append(
+            &log,
+            &format!(
+                "{}{}",
+                attach("24:0x7f0000000110", 4, APP),
+                attach("77:0x7f0000000770", 5, APP)
+            ),
+        );
+        let _ = poll_all(&mut r2, &mut p, &classes);
+        assert!(r2.stop_for_tests().is_none());
+        assert!(p.counts.ambiguous >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 rule 2 (security review L-b): past 64 remembered pids, every new
+    /// pid is ambiguous with no stop for the rest of the run; stopped time
+    /// is not reading time (a split window outlives the stop).
+    #[test]
+    fn remembered_pids_are_bounded_and_stops_are_not_reading_time() {
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1000),
+        });
+        let h = |pid: u32| crate::trace_log::Header {
+            time: crate::trace_log::LogTime {
+                year: 2026,
+                month: 10,
+                day: 30,
+                hour: 15,
+                minute: 22,
+                second: 38,
+                frac: 0,
+            },
+            pid,
+            address: 1,
+            event: crate::trace_log::Event::AttachDatabase,
+            outcome: crate::trace_log::Outcome::Ok,
+            at: None,
+        };
+        let t0 = Instant::now();
+        let later = t0 + crate::stream::STOP_COOLDOWN + Duration::from_secs(1);
+        assert!(!m.stop_wanted(&h(24), t0));
+        assert!(m.stop_wanted(&h(100), t0));
+        for pid in 100..164 {
+            m.confirmation_failed(pid, t0);
+        }
+        assert!(!m.stop_wanted(&h(100), later), "remembered");
+        assert!(!m.stop_wanted(&h(500), later), "past 64 remembered pids");
+        let mut q = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        q.confirm_run(Run {
+            pid: 24,
+            start: Some(1000),
+        });
+        q.confirmation_failed(100, t0);
+        assert!(
+            !q.stop_wanted(&h(101), t0 + Duration::from_secs(10)),
+            "cooldown"
+        );
+        assert!(q.stop_wanted(&h(101), later), "after the cooldown");
+        assert!(q.window_for_tests(t0).is_none());
+        q.open_window_for_tests(t0);
+        q.pause(Duration::from_secs(50));
+        assert!(
+            q.window_for_tests(t0 + Duration::from_secs(100)).is_some(),
+            "paused"
+        );
+        assert!(q.window_for_tests(t0 + Duration::from_secs(111)).is_none());
+    }
+
+    /// R1 rule 9 against a real server (`dev/firebird/it.sh`): an isql
+    /// session held attached while its records (`FIREBIRD_IT_TCP_LOG`) are
+    /// read as a live stream reads them (fresh: past an end of file seen
+    /// less than 10 s before) is corroborated by the server's connection
+    /// table; a forged attach naming a port with no connection is
+    /// ambiguous. Then the measurement of security review N7: the client
+    /// end of a `service_mgr` backup's own TCP attachment (its
+    /// `ATTACH_DATABASE` records in `FIREBIRD_IT_SVC_LOG`)
+    /// in the connection tables sampled during and 1 s after the backup
+    /// (`FIREBIRD_IT_SVC_SAMPLES`, raw `/proc/net/tcp*` copies separated by
+    /// `==` lines; no secret).
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn it_tcp_corroboration() {
+        let (Ok(tail), Ok(port)) = (
+            std::env::var("FIREBIRD_IT_TCP_LOG"),
+            std::env::var("FIREBIRD_PORT"),
+        ) else {
+            return;
+        };
+        let port: u16 = port.parse().unwrap();
+        let bytes = std::fs::read(&tail).unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let pid: u32 = text
+            .lines()
+            .find_map(|l| crate::trace_log::header(l.as_bytes()))
+            .map(|h| h.pid)
+            .unwrap();
+        let mut s = test_settings();
+        s.databases.push(DeclaredNames {
+            label: "crm".to_owned(),
+            resolved: Some("/var/lib/firebird/data/crm.fdb".to_owned()),
+            alias: None,
+            excluded: false,
+            attach: "/var/lib/firebird/data/crm.fdb".to_owned(),
+            read_at: None,
+        });
+        let dir = temp("it-tcp");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        r.server_port = Some(port);
+        // The server process as this namespace sees it (its host pid,
+        // `FIREBIRD_IT_SERVER_HOST_PID`): rule 9 reads the tables only for a
+        // visible server in the same network namespace (review L1).
+        let uid: u32 = std::env::var("FIREBIRD_IT_PEER_UID")
+            .ok()
+            .and_then(|u| u.parse().ok())
+            .unwrap_or(84);
+        let host_pid = std::env::var("FIREBIRD_IT_SERVER_HOST_PID")
+            .ok()
+            .and_then(|p| p.trim().parse::<u32>().ok());
+        r.sample = host_pid.and_then(|p| {
+            crate::fsread::process_start(p).map(|(t, _)| Run {
+                pid: p,
+                start: Some(t),
+            })
+        });
+        let gate = r.sample.is_some_and(|s| crate::peer::same_netns(s.pid))
+            && host_pid.and_then(crate::fsread::server_ids).is_some();
+        eprintln!("[measure] rule 9 gate (server visible, same network namespace): {gate}");
+        let mut m = Machine::new(s, Arc::new(crate::own::Ledger::default()));
+        m.confirm_run(Run {
+            pid,
+            start: Some(1),
+        });
+        let classes = Classes::default();
+        let _ = poll_all(&mut r, &mut m, &classes);
+        // An end of file observed: what comes next is fresh.
+        append(
+            &log,
+            &format!("2026-10-30T15:22:38.4210 ({pid}:0x1) TRACE_INIT\n\tSESSION_1 x\n\n"),
+        );
+        let _ = poll_all(&mut r, &mut m, &classes);
+        append(&log, &text);
+        let _ = poll_all(&mut r, &mut m, &classes);
+        let c = m.counts;
+        eprintln!(
+            "[measure] rule 9 (held session): corroborated {}, no socket {}, reused {}, not \
+             evaluated {}",
+            c.tcp_corroborated, c.tcp_no_socket, c.tcp_reused, c.tcp_not_evaluated
+        );
+        assert_eq!((c.tcp_no_socket, c.tcp_reused), (0, 0), "{:?}", m.why);
+        if !gate {
+            assert_eq!(c.tcp_corroborated, 0, "not evaluated without the gate");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(c.tcp_corroborated >= 1, "{c:?}");
+        // Review M1: the held session's client port, for the measurement
+        // of the rows left after its detach.
+        if let Ok(f) = std::env::var("FIREBIRD_IT_HELD_PORT_FILE") {
+            let port_of = text
+                .lines()
+                .rev()
+                .filter(|l| l.contains("SYSDBA:NONE") && l.contains("TCPv4:127.0.0.1/"))
+                .find_map(|l| {
+                    l.rsplit_once("TCPv4:127.0.0.1/")
+                        .and_then(|(_, p)| p.trim_end_matches(')').parse::<u16>().ok())
+                });
+            if let Some(p) = port_of {
+                std::fs::write(f, format!("{p}\n")).unwrap();
+            }
+        }
+        append(
+            &log,
+            &format!(
+                "2026-10-30T15:22:38.4210 ({pid}:0x7f0000000f01) ATTACH_DATABASE\n\t\
+                 /var/lib/firebird/data/app.fdb (ATT_999999, APP:NONE, UTF8, TCPv4:127.0.0.1/1)\n\t\
+                 /usr/bin/app:28\n\n2026-10-30T15:22:38.4210 ({pid}:0x2) TRACE_INIT\n\tSESSION_1 x\n\n"
+            ),
+        );
+        let _ = poll_all(&mut r, &mut m, &classes);
+        assert_eq!(
+            m.counts.tcp_no_socket, 1,
+            "a forged port with no connection"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // N7: the services backup's own attachment.
+        let (Ok(svc), Ok(samples)) = (
+            std::env::var("FIREBIRD_IT_SVC_LOG"),
+            std::env::var("FIREBIRD_IT_SVC_SAMPLES"),
+        ) else {
+            return;
+        };
+        let svc = std::fs::read_to_string(svc).unwrap();
+        let samples = std::fs::read_to_string(samples).unwrap();
+        let lines: Vec<&str> = svc.lines().collect();
+        let mut ports = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.ends_with(") ATTACH_DATABASE") {
+                continue;
+            }
+            let att = lines.get(i + 1).copied().unwrap_or("");
+            let client = lines
+                .get(i + 2)
+                .is_some_and(|n| n.starts_with('\t') && !n.is_empty());
+            eprintln!(
+                "[measure] N7 attach in the backup's records: protocol {}, client line {client}",
+                att.rsplit_once(", ")
+                    .map_or("?", |(_, p)| p.split('/').next().unwrap_or("?"))
+            );
+            if let Some(p) = att
+                .rsplit_once("TCPv4:127.0.0.1/")
+                .and_then(|(_, p)| p.trim_end_matches(')').parse::<u16>().ok())
+            {
+                ports.push(p);
+            }
+        }
+        eprintln!(
+            "[measure] N7 backup's records: {} lines, {} headers",
+            lines.len(),
+            lines
+                .iter()
+                .filter(|l| crate::trace_log::header(l.as_bytes()).is_some())
+                .count()
+        );
+        let chunks: Vec<&str> = samples.split("==\n").collect();
+        let found = |p: u16, chunk: &str| {
+            let mut out = std::collections::HashSet::new();
+            let mut rows = crate::peer::ServerRows::default();
+            crate::peer::server_rows(chunk.lines().map(str::to_owned), port, uid, None, &mut rows);
+            out.extend(rows.clients().unwrap_or_default());
+            out.contains(&std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+        };
+        for p in &ports {
+            let during = chunks[..chunks.len().saturating_sub(1)]
+                .iter()
+                .filter(|c| found(*p, c))
+                .count();
+            let after = chunks.last().is_some_and(|c| found(*p, c));
+            eprintln!(
+                "[measure] N7 service_mgr backup attachment: in {during} of {} samples during \
+                 the backup, in the sample 1 s after: {after}",
+                chunks.len().saturating_sub(1)
+            );
+        }
+        eprintln!(
+            "[measure] N7 service_mgr backup attachments (TCP): {}",
+            ports.len()
+        );
+    }
+
+    /// R1 rule 2 against a real server (`dev/firebird/it.sh`): the main
+    /// server restarted under another pid, then an isql workload. The log
+    /// written from just before the restart (`FIREBIRD_IT_RUN_CHANGE_LOG`)
+    /// is read by a stream confirmed on the old pid
+    /// (`FIREBIRD_IT_RUN_OLD_PID`): it stops at the first record of the
+    /// new pid; the server pid the agent's own attachment reads (as
+    /// `check()` does) is that record's; with it the run changes there and
+    /// no record of the new run is ambiguous. Without the confirmation
+    /// (the failed path), they are.
+    #[tokio::test]
+    #[allow(clippy::print_stderr)]
+    async fn it_run_change() {
+        let (Ok(tail), Ok(old)) = (
+            std::env::var("FIREBIRD_IT_RUN_CHANGE_LOG"),
+            std::env::var("FIREBIRD_IT_RUN_OLD_PID"),
+        ) else {
+            return;
+        };
+        let old: u32 = old.trim().parse().unwrap();
+        let bytes = std::fs::read(&tail).unwrap();
+        let names = |label: &str, path: &str| DeclaredNames {
+            label: label.to_owned(),
+            resolved: Some(path.to_owned()),
+            alias: None,
+            excluded: false,
+            attach: path.to_owned(),
+            read_at: None,
+        };
+        let settings = || Settings {
+            databases: vec![
+                names("app", "/var/lib/firebird/data/app.fdb"),
+                names("crm", "/var/lib/firebird/data/crm.fdb"),
+            ],
+            aliases: Some(AliasMap::default()),
+            proof11: true,
+            account: "DATABASTION_AGENT".to_owned(),
+            parse: ParseOptions {
+                max_sql_length: Some(65_000),
+                series: if std::env::var("FIREBIRD_IT_MAJOR").as_deref() == Ok("4") {
+                    Series::V4
+                } else {
+                    Series::V5
+                },
+            },
+            superserver: true,
+        };
+        // The pid the server gives the agent's own attachment.
+        let t = databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /tmp, targets: [{{id: fb-it, \
+             engine: firebird, host: 127.0.0.1, port: {}, account: DATABASTION_AGENT, \
+             secret: {{file: \"{}\"}}, firebird: {{peer_uid: 84, \
+             databases: [{{name: app, attach: \"/var/lib/firebird/data/app.fdb\"}}]}}}}]}}",
+            std::env::var("FIREBIRD_PORT").unwrap(),
+            std::env::var("FIREBIRD_IT_AGENT_PASSWORD_FILE").unwrap(),
+        ))
+        .unwrap()
+        .targets
+        .remove(0);
+        let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+        let password = t.secret.read().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut s = crate::conn::connect(
+            &endpoint,
+            password.as_bytes(),
+            "/var/lib/firebird/data/app.fdb",
+            deadline,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        crate::check::prepare(&mut s, false, deadline)
+            .await
+            .unwrap();
+        s.close().await;
+        let server_pid = crate::own::ledger_for(endpoint.addr).server_pid().unwrap();
+        eprintln!("[measure] run change: old pid {old}, server pid now {server_pid}");
+        assert_ne!(server_pid, old, "the restart gave the server another pid");
+        for confirm in [true, false] {
+            let dir = temp(if confirm {
+                "it-run-ok"
+            } else {
+                "it-run-failed"
+            });
+            let log = dir.join("audit.log");
+            std::fs::write(&log, b"").unwrap();
+            let mut r = runner(&log, None);
+            let mut m = Machine::new(settings(), Arc::new(crate::own::Ledger::default()));
+            m.confirm_run(Run {
+                pid: old,
+                start: Some(1),
+            });
+            let classes = Classes::default();
+            let _ = poll_all(&mut r, &mut m, &classes);
+            append(&log, &String::from_utf8_lossy(&bytes));
+            let mut out = poll_all(&mut r, &mut m, &classes);
+            let st = r.stop_for_tests().expect("stopped at the new pid");
+            assert_eq!(st.pid, server_pid, "the record's pid is the server's");
+            let before = m.counts.ambiguous;
+            let state = AuditState::default();
+            if confirm {
+                m.check_run(Run {
+                    pid: server_pid,
+                    start: Some(2),
+                });
+            }
+            r.stop = None;
+            end_stop(
+                &state,
+                "t",
+                &mut m,
+                st.pid,
+                Duration::from_millis(10),
+                confirm,
+            );
+            out.extend(poll_all(&mut r, &mut m, &classes));
+            std::thread::sleep(STABLE_EOF + Duration::from_millis(200));
+            out.extend(poll_all(&mut r, &mut m, &classes));
+            let after = m.counts.ambiguous - before;
+            eprintln!(
+                "[measure] run change (confirmed {confirm}): old-run records ambiguous {before}, \
+                 new-run records ambiguous {after}, events {}, run {:?}",
+                out.len(),
+                m.run_for_tests().map(|x| x.pid)
+            );
+            assert!(
+                objects(&out).contains(&"CUSTOMERS".to_owned()),
+                "{:?}",
+                objects(&out)
+            );
+            if confirm {
+                assert_eq!(after, 0, "{:?}", m.why);
+                assert_eq!(m.run_for_tests().map(|x| x.pid), Some(server_pid));
+                assert_eq!(m.counts.own_not_matched, 0);
+            } else {
+                assert!(after > 0);
+                assert_eq!(m.failed_pids_for_tests(), &[server_pid]);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// R39 (a) test 1, review M1 (1): the record in progress when the agent stops
@@ -2060,6 +3072,13 @@ mod tests {
             last_end: None,
             lost_in: None,
             ended: None,
+            backlog: std::collections::VecDeque::new(),
+            batch: None,
+            stop: None,
+            sample: None,
+            server_port: None,
+            eofs: std::collections::VecDeque::new(),
+            last_eof: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());
@@ -2446,12 +3465,13 @@ mod tests {
                 dbs: vec![db],
                 server_pid: None,
                 peer_uid: None,
+                started: SystemTime::now(),
             },
             &mut notes,
             &mut detail,
         );
         assert_eq!(state.excluded_attach("t"), ["/data/app.fdb"]);
-        let (s, _, _, _) = settings(&state, "t", "AGENT", Series::V5);
+        let (s, _, _, _, _) = settings(&state, "t", "AGENT", Series::V5);
         assert!(s.databases.iter().all(|d| d.excluded));
     }
 

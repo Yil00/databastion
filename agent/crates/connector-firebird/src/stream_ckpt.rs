@@ -239,6 +239,10 @@ impl Machine {
             && self.hold_since.is_none()
             && self.pending_end.is_empty()
             && !self.groups.iter().any(Group::blockless)
+            // R29 item 2: an external-source binding's held events are not
+            // persisted; the position is held back at the first of them.
+            && self.ext.values().all(|h| h.events.is_empty())
+            && self.ext_fail.is_empty()
     }
 
     /// The parser state as a checkpoint body, `None` when it cannot be
@@ -272,6 +276,7 @@ impl Machine {
                 Kind::User => 0,
                 Kind::Internal => 1,
                 Kind::Sweep => 2,
+                Kind::External => 3,
             });
             w.opt_u64(b.first_tra);
             w.len(b.open_tras.len());
@@ -280,6 +285,7 @@ impl Machine {
             }
             w.u8(b.sweep_step);
             w.bool(b.own);
+            w.opt_u64(b.addr);
             match b.trigger_wait {
                 None => w.u8(0),
                 Some(TriggerWait::Disconnect(t)) => {
@@ -294,6 +300,19 @@ impl Machine {
             }
         }
         w.u64(self.next_seq);
+        // R29: where each open transaction of a user binding started.
+        let mut tp: Vec<(&Key, &(u64, u64))> = self
+            .tra_pos
+            .iter()
+            .flat_map(|(k, v)| v.iter().map(move |x| (k, x)))
+            .collect();
+        tp.sort();
+        w.len(tp.len());
+        for (k, (t, pos)) in tp {
+            w_key(&mut w, *k);
+            w.u64(*t);
+            w.u64(*pos);
+        }
         let mut live: Vec<(&(u32, u64), &Key)> = self.token_live.iter().collect();
         live.sort_by_key(|(t, _)| **t);
         w.len(live.len());
@@ -512,6 +531,36 @@ impl Machine {
         self.failed_pids = m.failed_pids;
         self.bindings = m.bindings;
         self.next_seq = m.next_seq;
+        self.tra_pos = m.tra_pos;
+        self.tra_pos_entries = self.tra_pos.values().map(Vec::len).sum();
+        self.by_addr = HashMap::new();
+        for (k, b) in &self.bindings {
+            if let Some(a) = b.addr {
+                let e = self.by_addr.entry(a).or_default();
+                if !b.poisoned {
+                    e.0.push(*k);
+                }
+                e.1 += 1;
+            }
+        }
+        // R29: an external-source binding's hold starts again empty (its
+        // caller is looked for again; held events are never in a
+        // checkpoint).
+        self.ext.clear();
+        self.ext_events = 0;
+        self.ext_bytes = 0;
+        let ext: Vec<Key> = self
+            .bindings
+            .iter()
+            .filter(|(_, b)| b.kind == Kind::External)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in ext {
+            if !self.new_ext_hold(k) {
+                self.reset_parser_state();
+                return Err(Refused::State);
+            }
+        }
         self.token_live = m.token_live;
         self.token_ended = m.token_ended.iter().map(|t| (*t, ())).collect();
         self.token_ended_order = m.token_ended;
@@ -572,6 +621,12 @@ impl Machine {
     fn reset_parser_state(&mut self) {
         self.failed_pids.clear();
         self.bindings.clear();
+        self.tra_pos.clear();
+        self.tra_pos_entries = 0;
+        self.by_addr.clear();
+        self.ext.clear();
+        self.ext_events = 0;
+        self.ext_bytes = 0;
         self.next_seq = 0;
         self.token_live.clear();
         self.token_ended.clear();
@@ -612,6 +667,7 @@ impl Machine {
 #[derive(Default)]
 struct Decoded {
     failed_pids: Vec<u32>,
+    tra_pos: Vec<(Key, u64, u64)>,
     bindings: Vec<(Key, Binding)>,
     next_seq: u64,
     token_live: Vec<((u32, u64), Key)>,
@@ -658,6 +714,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
             0 => Kind::User,
             1 => Kind::Internal,
             2 => Kind::Sweep,
+            3 => Kind::External,
             _ => return Err(Bad),
         };
         let first_tra = d.r.opt_u64()?;
@@ -668,6 +725,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
         }
         let sweep_step = d.r.u8()?;
         let own = d.r.bool()?;
+        let addr = d.r.opt_u64()?;
         let trigger_wait = match d.r.u8()? {
             0 => None,
             1 => Some(TriggerWait::Disconnect(d.r.u64()?)),
@@ -689,10 +747,16 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
                 sweep_step,
                 own,
                 trigger_wait,
+                addr,
             },
         ));
     }
     st.next_seq = d.r.u64()?;
+    let n = d.r.len(MAX_ALL_BINDINGS * 64, 12 + 9 + 16)?;
+    for _ in 0..n {
+        let k = d.key()?;
+        st.tra_pos.push((k, d.r.u64()?, d.r.u64()?));
+    }
     let n = d.r.len(MAX_ALL_BINDINGS, 12 + 9 + 8)?;
     for _ in 0..n {
         st.token_live.push((d.token()?, d.key()?));
@@ -831,6 +895,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
 #[derive(Default)]
 struct Restored {
     failed_pids: Vec<u32>,
+    tra_pos: HashMap<Key, Vec<(u64, u64)>>,
     bindings: HashMap<Key, Binding>,
     next_seq: u64,
     token_live: HashMap<(u32, u64), Key>,
@@ -895,6 +960,19 @@ impl Restored {
         let seqs = unique_set(self.bindings.values().map(|b| b.seq))?;
         if seqs.iter().any(|s| *s >= self.next_seq) {
             return Err(());
+        }
+        // R29: each position is of an open transaction of a user binding,
+        // once.
+        for (k, t, pos) in st.tra_pos {
+            let open = self
+                .bindings
+                .get(&k)
+                .is_some_and(|b| b.kind == Kind::User && b.open_tras.contains(&t));
+            let v = self.tra_pos.entry(k).or_default();
+            if !open || v.iter().any(|(x, _)| *x == t) {
+                return Err(());
+            }
+            v.push((t, pos));
         }
         // Every live token is its binding's (R1 rule 4: one live binding
         // per token).

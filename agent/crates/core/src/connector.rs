@@ -45,6 +45,39 @@ pub(crate) fn sqlite_reader_failures() -> u64 {
     SQLITE_READER_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Time the Firebird Audit streams spent stopped before a record of a new
+/// server pid, waiting for `check()` to confirm the run (ADR-0060 R1 rule
+/// 2), in milliseconds: heartbeat metric
+/// `firebird_audit_stream_stopped_seconds_total`.
+static FIREBIRD_STREAM_STOPPED_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Firebird run confirmations that failed (ADR-0060 R1 rule 2): heartbeat
+/// metric `firebird_audit_run_confirmations_failed_total`.
+static FIREBIRD_RUN_CONFIRMATIONS_FAILED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counts the time one Firebird Audit stream stop lasted.
+pub fn count_firebird_stream_stopped(d: std::time::Duration) {
+    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    FIREBIRD_STREAM_STOPPED_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts one failed Firebird run confirmation.
+pub fn count_firebird_run_confirmation_failed() {
+    FIREBIRD_RUN_CONFIRMATIONS_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`count_firebird_stream_stopped`], in milliseconds.
+pub(crate) fn firebird_stream_stopped_ms() -> u64 {
+    FIREBIRD_STREAM_STOPPED_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Total of [`count_firebird_run_confirmation_failed`].
+pub(crate) fn firebird_run_confirmations_failed() -> u64 {
+    FIREBIRD_RUN_CONFIRMATIONS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Errors returned by connectors.
 ///
 /// Messages must never contain a sampled value or a credential.

@@ -356,7 +356,7 @@ impl Ledger {
         for c in s.credits.iter().chain(s.consumed.iter().map(|(_, c)| c)) {
             let a = &c.account;
             out.push_str(&format!(
-                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\n",
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}{}\t{}\n",
                 ms(c.at),
                 c.attach,
                 c.id,
@@ -366,6 +366,7 @@ impl Ledger {
                 a.last,
                 a.largest,
                 a.end,
+                if a.cut { "+cut" } else { "" },
                 match &c.text {
                     Text::Clear(t) => t.as_str(),
                     Text::Tag(_) => "<tag>",
@@ -406,7 +407,11 @@ impl Ledger {
                 }
                 Some(&"C") => {
                     let at = time(f[1]);
-                    let end = match f[9] {
+                    let (end9, cut) = match f[9].strip_suffix("+cut") {
+                        Some(e) => (e, true),
+                        None => (f[9], false),
+                    };
+                    let end = match end9 {
                         "End" => FetchEnd::End,
                         "Early" => FetchEnd::Early,
                         "Lost" => FetchEnd::Lost,
@@ -421,6 +426,7 @@ impl Ledger {
                         last: f[7].parse().unwrap(),
                         largest: f[8].parse().unwrap(),
                         end,
+                        cut,
                         ..FetchAccount::default()
                     };
                     let table = (f[4] != "-").then_some(f[4]);
@@ -501,6 +507,27 @@ impl Ledger {
         }
     }
 
+    /// R1 rule 2: a confirmed run change from server pid `pid`: the own
+    /// attachments of that run still open in the ledger close now (their
+    /// connections went with the server process).
+    pub(crate) fn end_run(&self, pid: u32) {
+        let now = SystemTime::now();
+        let mut s = self.state();
+        let mut changed = false;
+        for a in s
+            .attachments
+            .iter_mut()
+            .filter(|a| a.pid == pid && a.closed.is_none())
+        {
+            a.closed = Some(now);
+            changed = true;
+        }
+        drop(s);
+        if changed {
+            self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// The stream read the attachment's `DETACH_DATABASE`.
     pub(crate) fn note_detach(&self, attach: &str, id: u64) {
         let mut s = self.state();
@@ -544,6 +571,17 @@ impl Ledger {
             .rev()
             .find(|(p, _)| *p == at)
             .map(|(_, c)| c.at)
+    }
+
+    /// The fetch account of the credit the record at `at` consumed (its
+    /// error follow-up, R22 items 5 and 6, R35).
+    pub(crate) fn consumed_account(&self, at: RecordAt) -> Option<FetchAccount> {
+        self.state()
+            .consumed
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == at)
+            .map(|(_, c)| c.account)
     }
 
     /// When the attachment opened (the clock offset).
@@ -783,6 +821,7 @@ impl Saved {
                 end: end_of(r.u8()?)?,
                 stale_cancel_follow_up: r.bool()?,
                 session_retired: r.bool()?,
+                cut: r.bool()?,
             };
             let at = from_ms(r.u64()?);
             let consumed = if r.bool()? {
@@ -877,6 +916,7 @@ impl Ledger {
             e.u8(end_code(a.end));
             e.bool(a.stale_cancel_follow_up);
             e.bool(a.session_retired);
+            e.bool(a.cut);
             e.u64(ms(c.at));
             match consumed {
                 Some(((dev, ino), off)) => {

@@ -228,6 +228,8 @@ struct Own {
     ledger: Option<std::sync::Arc<crate::own::Ledger>>,
     attach: String,
     id: Option<u64>,
+    /// `MON$SERVER_PID` read on this session (R1 rule 1).
+    pid: Option<u32>,
     early: Vec<(String, Option<String>, FetchAccount)>,
     closed: bool,
     /// The table of the built statement being run (its credit names it).
@@ -276,6 +278,11 @@ pub(crate) struct FetchAccount {
     /// The session was ended cleanly after a stale cancel whose
     /// `DSQL_drop` succeeded (R22 item 3, review L7).
     pub(crate) session_retired: bool,
+    /// The row limit cut the fetch (the connector asks for one row beyond
+    /// it, R22 item 6): when that request reaches the end of the result,
+    /// the server writes a request synchronization error after the finish
+    /// record (R35), the credit's follow-up.
+    pub(crate) cut: bool,
 }
 
 /// What the server answered to the client's `op_cancel` (decision 4).
@@ -700,6 +707,7 @@ impl Session {
     /// (decision 6, R1 rule 1): the session's attachment enters the
     /// ledger, with the credits of the executions before it.
     pub(crate) fn register_own(&mut self, id: u64, pid: u32) {
+        self.own.pid = Some(pid);
         let (Some(l), Some(local)) = (self.own.ledger.clone(), self.local) else {
             return;
         };
@@ -717,6 +725,12 @@ impl Session {
     /// `CURRENT_CONNECTION`), `None` before or without one.
     pub(crate) fn own_id(&self) -> Option<u64> {
         self.own.id
+    }
+
+    /// The server pid this session read (`MON$SERVER_PID` of its own
+    /// attachment, R1 rule 1), `None` before [`crate::check::prepare`].
+    pub(crate) fn server_pid(&self) -> Option<u32> {
+        self.own.pid
     }
 
     /// `DSQL_drop` of a statement handle (R22 item 3). After a stale
@@ -952,6 +966,7 @@ impl Session {
                             }
                         } else {
                             out.cut = true;
+                            self.last_fetch.cut = true;
                         }
                     }
                     Ok(Next::End { more }) => {

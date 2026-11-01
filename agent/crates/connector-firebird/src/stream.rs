@@ -10,11 +10,16 @@
 //!
 //! Implemented, fail closed:
 //! - **Runs** (R1 rules 1 and 2, R5): the run is the pid and start time
-//!   `check()` and `/proc` confirm; a record of another pid is ambiguous
-//!   (the stream is not stopped: such records are loud until a check
-//!   confirms a new run, which ends every binding of the old one); a start
-//!   time change of the same pid makes the records read until the next
-//!   confirmation ambiguous (R5 item 4).
+//!   `check()` and `/proc` confirm. A record of a new pid stops the
+//!   stream before it ([`Machine::stop_wanted`], the stop itself is the
+//!   runner's, `crate::audit`) until a check started after the stop
+//!   confirms that pid, and the run changes at that record, or the
+//!   confirmation fails (another pid read, or 60 s): the pid is remembered
+//!   and its records are ambiguous, a 10-minute cooldown starts. A run a
+//!   check read before the stream reaches its records is pending until the
+//!   first record of its pid. A start-time change of the same pid makes the
+//!   records read until the next confirmation ambiguous, and asks for an
+//!   immediate check (R5 item 4).
 //! - **Bindings** (R1 rules 3 to 6, R7): per database identity and
 //!   attachment id, anchored at `ATTACH_DATABASE` (or learned from the
 //!   first record after a gap); every record of an attachment carries its
@@ -63,11 +68,28 @@
 //!   events were durably spooled before the restart (deduplication by
 //!   position).
 //!
-//! Not implemented here (each fail closed or left to the stream's caller,
-//! listed in the lot 3 report): the stop of R1 rule 2 (records of an
-//! unconfirmed pid are ambiguous instead), R1 rule 9, local external data
-//! sources (R29: their `<internal>` attachments are ambiguous, as R18 item
-//! 3 accepted).
+//! - **Local external data sources** (R29, with the maintainer's decision
+//!   of 2026-11-01 on the review of #402): an `<internal>` attach with a
+//!   user and a role, no client line, on the run's pid, anchors an
+//!   external-source binding (never own, never internal) whose events are
+//!   held across its transactions and released, as judged, at a
+//!   transaction end once a caller was seen (a user binding's finish
+//!   record of code in a transaction that started before the external
+//!   binding's open transaction); the caller test then starts again (a
+//!   pooled connection serves several callers). With none, they stay held
+//!   and are ambiguous at its detach or at a bound (10 minutes of reading
+//!   time, 16 384 events and 4 MiB per stream with each hold charged, not
+//!   persisted: the position is held back at the first held record). A
+//!   failed hold ends its pending fold groups ambiguous too.
+//! - **The remote 4-tuple** (R1 rule 9, with security review L11 of
+//!   2026-10-26): a new TCP binding whose client address and port another
+//!   live binding holds is ambiguous (tainted until it detaches); so is
+//!   one whose `ATTACH_DATABASE` was written within 10 s of being read (past
+//!   an end of file the runner saw less than 10 s earlier), still live
+//!   when the runner read the server's connections after that read (no
+//!   `DETACH_DATABASE` of its token later in the read), with no connection
+//!   of the server's port that has its client end ([`TcpView`]). Not
+//!   evaluated when the agent lags or the table was not read whole.
 
 #[path = "stream_ckpt.rs"]
 mod stream_ckpt;
@@ -94,6 +116,13 @@ const ORDER_IDS: u64 = 256;
 const ORDER_TIME: Duration = Duration::from_secs(10);
 /// R1 rule 5: the margin above the agent's latest own id.
 const ID_MARGIN: u64 = 4096;
+/// R1 rule 2 (security review L-b): pids remembered as failed per run.
+pub(crate) const MAX_FAILED_PIDS: usize = 64;
+/// R1 rule 2: a stop lasts at most this long (agent time).
+pub(crate) const STOP_LIMIT: Duration = Duration::from_secs(60);
+/// R1 rule 2 (security review M-3): the cooldown after a failed
+/// confirmation.
+pub(crate) const STOP_COOLDOWN: Duration = Duration::from_secs(600);
 /// R1 rule 11.
 const MAX_BINDINGS_DECLARED: usize = 16_384;
 const MAX_BINDINGS_UNDECLARED: usize = 4096;
@@ -190,7 +219,52 @@ enum Kind {
     Internal,
     /// The automatic sweep (R17).
     Sweep,
+    /// A local external data source's attachment (R29): an `<internal>`
+    /// line with a user and a role.
+    External,
 }
+
+/// R29 item 2 (with the maintainer's decision of 2026-11-01 on the
+/// review of #402): the events of an external-source binding, held across
+/// its transactions until one of them ends after a caller was seen. O(1)
+/// per binding (review H1): no candidate set is kept; a caller is a
+/// binding whose code finish record's transaction started before the
+/// external binding's open transaction (positions, `Machine::tra_pos`).
+#[derive(Debug)]
+struct ExtHold {
+    /// Reading time of the first event held since the last release (the
+    /// 10-minute bound).
+    started: Option<Instant>,
+    /// Its position (the persisted position is held back to it).
+    first_pos: Option<u64>,
+    events: Vec<ExtHeld>,
+    bytes: usize,
+    /// The position of the `START_TRANSACTION` of the external binding's
+    /// open transaction (candidates are taken there, review L4).
+    tx_start: Option<u64>,
+    /// A caller was seen since the last release (reset at each release:
+    /// a pooled external connection serves several callers).
+    caller: bool,
+}
+
+/// The bytes one external-source hold is charged, held events apart.
+const EXT_HOLD_BYTES: usize = 256;
+
+/// One record of an external-source binding: its event as judged, if
+/// any, and its ambiguous form (`*`, always reported).
+#[derive(Debug)]
+struct ExtHeld {
+    db: usize,
+    normal: Option<MaskedEvent>,
+    loud: MaskedEvent,
+    key: Option<DKey>,
+}
+
+/// R29 item 2: a binding's events are held at most this long.
+const EXT_TIME: Duration = Duration::from_secs(600);
+/// R29 item 2 (security review L9): held events per stream.
+const EXT_EVENTS: usize = 16_384;
+const EXT_BYTES: usize = 4 << 20;
 
 #[derive(Debug, Clone)]
 struct Binding {
@@ -210,6 +284,8 @@ struct Binding {
     own: bool,
     /// A database trigger waiting for its sequence (R15 item 2, R34).
     trigger_wait: Option<TriggerWait>,
+    /// R1 rule 9: a keyed hash of its TCP line's client address and port.
+    addr: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +539,24 @@ pub(crate) struct Counts {
     pub(crate) own_not_matched: u64,
     /// Restores confirmed by `check()` and applied (R1 rule 5).
     pub(crate) restores: u64,
+    /// R1 rule 9: new TCP bindings ambiguous for a client address and port
+    /// another live binding holds, for no matching socket, and attaches
+    /// read within 10 s whose socket condition could not be evaluated (the
+    /// table not read whole).
+    pub(crate) tcp_reused: u64,
+    pub(crate) tcp_no_socket: u64,
+    pub(crate) tcp_not_evaluated: u64,
+    /// R1 rule 9: fresh TCP attaches whose socket was found.
+    pub(crate) tcp_corroborated: u64,
+    /// R29: external-source bindings emitted with a caller, and those whose
+    /// records were made ambiguous.
+    pub(crate) ext_released: u64,
+    pub(crate) ext_failed: u64,
+    /// Error follow-ups of the agent's own records consumed (R22, R35).
+    pub(crate) follow_ups: u64,
+    /// `ERROR` records of the agent's own anchored bindings that were no
+    /// expected follow-up (handled as any client's: no event).
+    pub(crate) own_errors_not_followed: u64,
 }
 
 /// The stream's settings.
@@ -484,7 +578,20 @@ pub(crate) struct Machine {
     run: Option<Run>,
     /// Records are ambiguous until the next confirmation (R5 item 4).
     unconfirmed: bool,
+    /// The run was taken from the first pid seen, before any check (R40
+    /// item 4): records of another pid are ambiguous, with no stop.
+    provisional: bool,
+    /// Pids that failed a confirmation (R1 rule 2): ambiguous at once,
+    /// with no stop; at most [`MAX_FAILED_PIDS`].
     failed_pids: Vec<u32>,
+    /// A run a check read that differs by its pid from the current run
+    /// (R1 rule 2): the run changes at the first record that carries its
+    /// pid, never before (the stream may still be reading the old run).
+    pending_run: Option<Run>,
+    /// R1 rule 2 (security review M-3): after a failed confirmation,
+    /// records of any new pid are ambiguous without a stop until then
+    /// (reading time).
+    cooldown_until: Option<Instant>,
     bindings: HashMap<Key, Binding>,
     token_live: HashMap<(u32, u64), Key>,
     /// Tokens whose binding ended at the last record that carried them
@@ -567,6 +674,9 @@ pub(crate) struct Machine {
     pub(crate) counts: Counts,
     /// A view DDL record asks for an early check (R28 item 4).
     pub(crate) check_requested: bool,
+    /// A start-time change asks for an immediate check (R5 item 4), not
+    /// merged with the early checks of R11 8d.
+    pub(crate) run_check_requested: bool,
     /// The record being judged is of the agent's own anchored binding
     /// inside a split window: it ends the window only if it is the agent's
     /// own (R1 rule 7, re-review L-C).
@@ -610,6 +720,34 @@ pub(crate) struct Machine {
     /// `attach` the confirmed-restore count already applied.
     restore_facts: Vec<RestoreFacts>,
     restores_seen: HashMap<String, u64>,
+    /// R22 items 5 to 8, R35: the error follow-up per own binding, not
+    /// persisted (a restart loses an expected follow-up, so its record is
+    /// handled as any client's error record: no event, nothing hidden; and
+    /// a consumed one, so a forged second copy right after a restart is not
+    /// loud, which hides nothing either).
+    follow_ups: HashMap<Key, FollowUp>,
+    /// R1 rule 9: the runner's observation of the current read.
+    tcp: Option<TcpView>,
+    /// R1 rule 9: the live bindings by their client end's hash.
+    /// Per hash: the live bindings not yet poisoned for it, and how many
+    /// live bindings hold it (a reuse poisons the first ones once; the
+    /// count keeps the end held while any of them lives).
+    by_addr: HashMap<u64, (Vec<Key>, usize)>,
+    /// R29: the external-source bindings (each holds its events until a
+    /// transaction of it ends after a caller was seen).
+    ext: HashMap<Key, ExtHold>,
+    /// R29 (review H1 and L4 of #402): the position of the
+    /// `START_TRANSACTION` of each open transaction of a user binding, for
+    /// the caller test; bounded with the bindings' open transactions.
+    tra_pos: HashMap<Key, Vec<(u64, u64)>>,
+    /// The positions kept in `tra_pos` (the state's size).
+    tra_pos_entries: usize,
+    /// Their held events and bytes (the stream's bounds).
+    ext_events: usize,
+    ext_bytes: usize,
+    /// Holds that ended with no verdict (the binding gone, a bound): their
+    /// records are ambiguous, emitted at the next record or expiry.
+    ext_fail: Vec<ExtHold>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -621,7 +759,10 @@ impl Machine {
             s,
             run: None,
             unconfirmed: false,
+            provisional: false,
             failed_pids: Vec::new(),
+            pending_run: None,
+            cooldown_until: None,
             bindings: HashMap::new(),
             token_live: HashMap::new(),
             token_ended: HashMap::new(),
@@ -661,6 +802,7 @@ impl Machine {
             pending_end: Vec::new(),
             counts: Counts::default(),
             check_requested: false,
+            run_check_requested: false,
             window_ender: false,
             probe_seen: None,
             why: std::collections::BTreeMap::new(),
@@ -677,6 +819,15 @@ impl Machine {
             reread_invalid: Vec::new(),
             restore_facts: Vec::new(),
             restores_seen: HashMap::new(),
+            follow_ups: HashMap::new(),
+            tcp: None,
+            by_addr: HashMap::new(),
+            ext: HashMap::new(),
+            tra_pos: HashMap::new(),
+            tra_pos_entries: 0,
+            ext_events: 0,
+            ext_bytes: 0,
+            ext_fail: Vec::new(),
         }
     }
 
@@ -991,6 +1142,21 @@ impl Machine {
 
     /// The log file the next records come from.
     pub(crate) fn set_file(&mut self, file: (u64, u64)) {
+        if file != self.file {
+            // Transactions started in an earlier file started before
+            // anything of this one (R29's caller test compares positions).
+            for v in self.tra_pos.values_mut() {
+                for (_, p) in v.iter_mut() {
+                    *p = 0;
+                }
+            }
+            // An external transaction opened in an earlier file: its start
+            // position means nothing here, so no caller is taken for it
+            // (review L5 of #402: held until a later transaction).
+            for h in self.ext.values_mut() {
+                h.tx_start = None;
+            }
+        }
         self.file = file;
     }
 
@@ -1050,21 +1216,135 @@ impl Machine {
     pub(crate) fn confirm_run(&mut self, run: Run) {
         // Review N1: a provisional run (no start time, the first pid seen)
         // is compared by its pid only.
-        let other = self.run.is_some_and(|r| match r.start {
+        let old = self.run;
+        let other = old.is_some_and(|r| match r.start {
             None => r.pid != run.pid,
             Some(_) => r != run,
         });
         if other {
             self.end_run();
+            // R1 rule 2: the own-attachment lifetimes of the old run close
+            // (a new pid; a restart with the same pid is closed by the
+            // connector's lost-connection rule, decision 3).
+            if let Some(o) = old
+                && o.pid != run.pid
+            {
+                self.ledger.end_run(o.pid);
+            }
         }
         self.run = Some(run);
         self.unconfirmed = false;
+        self.provisional = false;
+        if self.pending_run.is_some_and(|p| p.pid == run.pid) {
+            self.pending_run = None;
+        }
+    }
+
+    /// The run a new check read (R1 rules 1 and 2). The same run, or a run
+    /// of the same pid with a new start time (R5 item 4: placed by the
+    /// start-time samples), or any run while the current one is
+    /// provisional (R40 item 4), is confirmed at once. A run of another pid
+    /// is kept pending: the run changes at the first record that carries
+    /// that pid (the stream may still be reading records of the old run,
+    /// which stay judged as the old run's).
+    pub(crate) fn check_run(&mut self, run: Run) {
+        match self.run {
+            Some(r) if r.pid != run.pid && !self.provisional => {
+                self.pending_run = Some(run);
+            }
+            _ => self.confirm_run(run),
+        }
     }
 
     /// A `/proc` sample that shows another start time than the current
     /// run's: records are ambiguous until `check()` confirms (R5 item 4).
+    /// The stream asks for an immediate check (`run_check_requested`).
     pub(crate) fn start_time_changed(&mut self) {
+        if !self.unconfirmed {
+            self.run_check_requested = true;
+        }
         self.unconfirmed = true;
+    }
+
+    /// R1 rule 2: whether the record whose header is `h` stops the stream
+    /// before it: a pid other than the current run's, of a confirmed run
+    /// (never before the first check, R40 item 4), that no check has shown
+    /// to be the server's (a pending run), that did not fail a
+    /// confirmation, outside the cooldown, with fewer than
+    /// [`MAX_FAILED_PIDS`] pids remembered. `TRACE_INIT` / `TRACE_FINI`
+    /// carry no run boundary (R5 item 1): only the pid decides.
+    pub(crate) fn stop_wanted(&self, h: &crate::trace_log::Header, now: Instant) -> bool {
+        let Some(r) = self.run else {
+            return false;
+        };
+        !self.provisional
+            && h.pid != r.pid
+            && !self.pending_run.is_some_and(|p| p.pid == h.pid)
+            && !self.failed_pids.contains(&h.pid)
+            && self.failed_pids.len() < MAX_FAILED_PIDS
+            && self.cooldown_until.is_none_or(|u| now >= u)
+    }
+
+    /// R1 rule 2: the confirmation of a stop on `pid` failed (the check read
+    /// another run, or none answered within [`STOP_LIMIT`]): the pid is
+    /// remembered for the run, and the cooldown starts. Its records are
+    /// ambiguous (they carry a pid other than the run's).
+    pub(crate) fn confirmation_failed(&mut self, pid: u32, now: Instant) {
+        if !self.failed_pids.contains(&pid) && self.failed_pids.len() < MAX_FAILED_PIDS {
+            self.failed_pids.push(pid);
+        }
+        self.cooldown_until = Some(now + STOP_COOLDOWN);
+    }
+
+    /// R1 rule 7 and R25: time while the stream is stopped (R1 rule 2) is
+    /// not reading time: every reading-time instant moves by `d` (split
+    /// windows, fold groups, holds, the order rule's times, the Garbage
+    /// Collector's expected end, the cooldown is agent time and stays).
+    pub(crate) fn pause(&mut self, d: Duration) {
+        if let Some(u) = self.window_until.as_mut() {
+            *u += d;
+        }
+        for g in &mut self.groups {
+            g.started += d;
+        }
+        if let Some(h) = self.hold_since.as_mut() {
+            *h += d;
+        }
+        for (_, t) in self.highest.values_mut() {
+            *t += d;
+        }
+        for t in self.gc_alone_since.values_mut() {
+            *t += d;
+        }
+        for h in self.ext.values_mut() {
+            if let Some(t) = h.started.as_mut() {
+                *t += d;
+            }
+        }
+    }
+
+    /// Test support: the pids remembered as failed.
+    #[cfg(test)]
+    pub(crate) fn failed_pids_for_tests(&self) -> &[u32] {
+        &self.failed_pids
+    }
+
+    /// Test support: the split window's end, if one is open at `now`.
+    #[cfg(test)]
+    pub(crate) fn window_for_tests(&self, now: Instant) -> Option<Instant> {
+        self.window_until.filter(|u| now < *u)
+    }
+
+    /// Test support: a split window opened at `now`.
+    #[cfg(test)]
+    pub(crate) fn open_window_for_tests(&mut self, now: Instant) {
+        self.window_until = Some(now + WINDOW);
+    }
+
+    /// Test support: the current run.
+    #[cfg(test)]
+    pub(crate) fn run_for_tests(&self) -> Option<Run> {
+        self.run
     }
 
     fn end_run(&mut self) {
@@ -1095,6 +1375,9 @@ impl Machine {
         let groups: Vec<Group> = self.groups.drain(..).collect();
         self.pending_end.extend(groups);
         self.bindings.clear();
+        self.tra_pos.clear();
+        self.tra_pos_entries = 0;
+        self.by_addr.clear();
         self.token_live.clear();
         self.token_ended.clear();
         self.token_ended_order.clear();
@@ -1109,6 +1392,13 @@ impl Machine {
         self.internal.clear();
         self.gc_alone_since.clear();
         self.failed_pids.clear();
+        self.cooldown_until = None;
+        self.follow_ups.clear();
+        // R29: the run's external-source holds end with no verdict.
+        let keys: Vec<Key> = self.ext.keys().copied().collect();
+        for k in keys {
+            self.fail_ext(k);
+        }
     }
 
     /// The stream's state in bytes, estimated (R1 rule 11's global cap).
@@ -1122,6 +1412,10 @@ impl Machine {
             + self.evictable.len() * 32
             + self.groups.iter().map(Group::bytes).sum::<usize>()
             + self.held_bytes
+            + self.tra_pos.len() * 48
+            + self.tra_pos_entries * 24
+            + self.by_addr.len() * 48
+            + self.ext_bytes
     }
 
     /// Whether `id` was seen for the database identity: kept, or at or
@@ -1239,6 +1533,13 @@ impl Machine {
             self.evictable.push_back((b.seq, key));
         }
         *self.binding_count.entry(key.0).or_insert(0) += 1;
+        if let Some(a) = b.addr {
+            let e = self.by_addr.entry(a).or_default();
+            if !b.poisoned {
+                e.0.push(key);
+            }
+            e.1 += 1;
+        }
         if let Some(old) = self.bindings.insert(key, b) {
             // Replaced (not expected): the count stays one.
             let _ = old;
@@ -1249,7 +1550,19 @@ impl Machine {
     }
 
     fn remove_binding(&mut self, key: Key) -> Option<Binding> {
+        if let Some(v) = self.tra_pos.remove(&key) {
+            self.tra_pos_entries = self.tra_pos_entries.saturating_sub(v.len());
+        }
         let b = self.bindings.remove(&key)?;
+        if let Some(a) = b.addr
+            && let Some(v) = self.by_addr.get_mut(&a)
+        {
+            v.0.retain(|k| *k != key);
+            v.1 = v.1.saturating_sub(1);
+            if v.1 == 0 {
+                self.by_addr.remove(&a);
+            }
+        }
         if let Some(n) = self.binding_count.get_mut(&key.0) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -1276,9 +1589,266 @@ impl Machine {
     }
 
     /// The position the persisted cursor may advance to: the first record
-    /// of the oldest pending group (R25 item 7), `None` when nothing pends.
+    /// of the oldest pending group (R25 item 7), or the first held record
+    /// of an external-source binding (R29 item 2), `None` when nothing
+    /// pends.
     pub(crate) fn held_from(&self) -> Option<u64> {
-        self.groups.iter().map(|g| g.first).min()
+        self.groups
+            .iter()
+            .map(|g| g.first)
+            .chain(self.ext.values().filter_map(|h| h.first_pos))
+            .min()
+    }
+
+    /// A hold the checkpoint cannot be taken in (a block-less group, or an
+    /// external-source binding's held events): the snapshot of its start
+    /// is used.
+    pub(crate) fn holds_pending(&self) -> bool {
+        self.blockless_pending()
+            || self.ext.values().any(|h| !h.events.is_empty())
+            || !self.ext_fail.is_empty()
+    }
+
+    /// R29: a new external-source binding's hold, charged to the stream's
+    /// bounds; `false` past them (its records are then ambiguous).
+    fn new_ext_hold(&mut self, key: Key) -> bool {
+        if self.ext_bytes + EXT_HOLD_BYTES > EXT_BYTES {
+            return false;
+        }
+        self.ext_bytes += EXT_HOLD_BYTES;
+        self.ext.insert(
+            key,
+            ExtHold {
+                started: None,
+                first_pos: None,
+                events: Vec::new(),
+                bytes: 0,
+                tx_start: None,
+                caller: false,
+            },
+        );
+        true
+    }
+
+    /// R29: the hold of `key` ends. Its held events, and its fold groups
+    /// still pending (review M2 of #402: never a quiet event), become
+    /// ambiguous; the binding, if live, is poisoned (`poison`: a failure;
+    /// otherwise its end with nothing held).
+    fn fail_ext(&mut self, key: Key) {
+        let Some(mut h) = self.ext.remove(&key) else {
+            return;
+        };
+        self.ext_events = self.ext_events.saturating_sub(h.events.len());
+        self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes + EXT_HOLD_BYTES);
+        // Its pending groups end loud, wherever they wait.
+        let mut gs: Vec<Group> = self
+            .groups
+            .iter()
+            .filter(|g| g.key == key)
+            .cloned()
+            .collect();
+        self.groups.retain(|g| g.key != key);
+        gs.extend(self.pending_end.iter().filter(|g| g.key == key).cloned());
+        self.pending_end.retain(|g| g.key != key);
+        for g in gs {
+            let DbId::Declared(db) = g.key.0 else {
+                continue;
+            };
+            let mut d = g.full.draft();
+            for o in g.bare.draft().objects {
+                if !d.objects.contains(&o) {
+                    d.objects.push(o);
+                }
+            }
+            d.star = true;
+            d.always = true;
+            let loud = self.draft_event(&d, None, db);
+            h.events.push(ExtHeld {
+                db,
+                normal: None,
+                loud,
+                key: Some(self.group_key(&g)),
+            });
+        }
+        if h.events.is_empty() {
+            return;
+        }
+        self.counts.ext_failed += 1;
+        if let Some(b) = self.bindings.get_mut(&key)
+            && b.kind == Kind::External
+        {
+            b.poisoned = true;
+        }
+        self.ext_fail.push(h);
+    }
+
+    /// Emits the records of the holds that ended with no caller, each
+    /// ambiguous (R29 item 2, as R18 item 3: always reported, `*`).
+    fn flush_ext_fail(&mut self, out: &mut Vec<Emitted>) {
+        for h in std::mem::take(&mut self.ext_fail) {
+            for e in h.events {
+                self.counts.ambiguous += 1;
+                *self.why.entry(2).or_default() += 1;
+                self.emit_keyed(e.db, e.loud, e.key, out);
+            }
+        }
+    }
+
+    /// R29 item 2 (decision of 2026-11-01): a transaction of the
+    /// external-source binding `key` ended. Once a caller was seen, its
+    /// held events are emitted as judged and the caller test starts again;
+    /// with none, they stay held (the binding's detach or a bound decides).
+    fn ext_tx_end(&mut self, key: Key, out: &mut Vec<Emitted>) {
+        let Some(h) = self.ext.get_mut(&key) else {
+            return;
+        };
+        h.tx_start = None;
+        if !h.caller {
+            return;
+        }
+        h.caller = false;
+        h.started = None;
+        h.first_pos = None;
+        let events = std::mem::take(&mut h.events);
+        let bytes = std::mem::take(&mut h.bytes);
+        self.counts.ext_released += 1;
+        self.ext_events = self.ext_events.saturating_sub(events.len());
+        self.ext_bytes = self.ext_bytes.saturating_sub(bytes);
+        for e in events {
+            if let Some(ev) = e.normal {
+                self.emit_keyed(e.db, ev, e.key, out);
+            }
+        }
+    }
+
+    /// R29 item 2: one record's outputs of the external-source binding
+    /// `key`, held; past a bound, the hold fails.
+    fn hold_ext(&mut self, key: Key, db: usize, normal: Option<MaskedEvent>, loud: MaskedEvent) {
+        let b = held_bytes(&loud) + normal.as_ref().map_or(0, held_bytes);
+        let now = Instant::now();
+        let pos = self.cur.map(|k| k.off);
+        let Some(h) = self.ext.get_mut(&key) else {
+            return;
+        };
+        h.started.get_or_insert(now);
+        if h.first_pos.is_none() {
+            h.first_pos = pos;
+        }
+        h.events.push(ExtHeld {
+            db,
+            normal,
+            loud,
+            key: self.cur,
+        });
+        h.bytes += b;
+        self.ext_events += 1;
+        self.ext_bytes += b;
+        if self.ext_events > EXT_EVENTS || self.ext_bytes > EXT_BYTES {
+            self.fail_ext(key);
+        }
+    }
+
+    /// R29 item 2: a finish record of code of the user binding `key` in
+    /// transaction `tra` is the caller of every external-source binding
+    /// whose open transaction started after `tra` did (so `tra` was open
+    /// at it, and is still open: it writes this record).
+    fn note_caller(&mut self, key: Key, tra: Option<u64>) {
+        let Some(p) = tra.and_then(|t| {
+            self.tra_pos
+                .get(&key)
+                .and_then(|v| v.iter().find(|(x, _)| *x == t).map(|(_, p)| *p))
+        }) else {
+            return;
+        };
+        for h in self.ext.values_mut() {
+            if h.tx_start.is_some_and(|s| p < s) {
+                h.caller = true;
+            }
+        }
+    }
+
+    /// The key of the external-source binding a record belongs to, when its
+    /// events are held.
+    fn ext_key(&self, rec: &Record<'_>) -> Option<Key> {
+        if self.ext.is_empty() {
+            return None;
+        }
+        let att = rec.att?;
+        let Resolved::Db(d) = self.resolve(att.database) else {
+            return None;
+        };
+        let k = (d, att.id);
+        self.ext.contains_key(&k).then_some(k)
+    }
+
+    /// R1 rule 9: the runner's observation for the records handed next.
+    pub(crate) fn set_tcp_view(&mut self, v: Option<TcpView>) {
+        self.tcp = v;
+    }
+
+    /// R1 rule 9 for a new TCP binding at `pos` with `token`: ambiguous
+    /// when another live binding holds the same client address and port,
+    /// or, for a record written within 10 s and a binding still live when
+    /// the table was read, when no server connection has that client end.
+    fn tcp_breach(
+        &mut self,
+        addr: u64,
+        ep: std::net::SocketAddr,
+        token: (u32, u64),
+        pos: u64,
+        att: (&str, u64),
+    ) -> bool {
+        // Review L2 of #402: a reused client end poisons every binding that
+        // holds it, as a duplicate id does (R1 rule 3).
+        let mut reused = false;
+        if let Some(e) = self.by_addr.get_mut(&addr) {
+            reused = e.1 > 0;
+            for k in std::mem::take(&mut e.0) {
+                if let Some(b) = self.bindings.get_mut(&k) {
+                    b.poisoned = true;
+                    b.own = false;
+                }
+            }
+        }
+        if reused {
+            self.counts.tcp_reused += 1;
+            self.check_offset_binding();
+            return true;
+        }
+        let Some(v) = self.tcp.as_ref() else {
+            return false;
+        };
+        let fresh = v.file == self.file && v.fresh_from.is_some_and(|f| pos >= f);
+        // Review M1 of #402: only a later `DETACH_DATABASE` of this same
+        // binding (its token, its database name and its attachment id).
+        let db = db_hash(att.0);
+        let detached = v.detached.get(&token).is_some_and(|ps| {
+            ps.iter()
+                .any(|(p, id, d)| *p > pos && *id == att.1 && *d == db)
+        });
+        if !fresh || detached {
+            return false;
+        }
+        match &v.clients {
+            None => {
+                self.counts.tcp_not_evaluated += 1;
+                false
+            }
+            Some(c) if c.contains(&ep) => {
+                self.counts.tcp_corroborated += 1;
+                false
+            }
+            Some(_) => {
+                self.counts.tcp_no_socket += 1;
+                true
+            }
+        }
+    }
+
+    /// Test support: external-source holds pending.
+    #[cfg(test)]
+    pub(crate) fn ext_holds_for_tests(&self) -> usize {
+        self.ext.len()
     }
 
     /// R28 item 4, R41 item 8: what invalidates the dependent and
@@ -1761,10 +2331,17 @@ impl Machine {
         // R25 item 7: a block-less routine record may start a hold, and
         // the position is then held back to it: the state before it is the
         // checkpoint while the hold lasts.
+        // R29 item 2: so may an external-source attach (its events are held
+        // until its transaction's end).
+        let ext_attach = (rec.header.event == Event::AttachDatabase
+            && rec.att.is_some_and(|a| a.protocol == Protocol::Internal))
+            || self
+                .ext_key(&rec)
+                .is_some_and(|k| self.ext.get(&k).is_some_and(|h| h.events.is_empty()));
         if self.snapshots
-            && matches!(rec.body, Body::Routine { .. })
-            && rec.trailer.block.is_none()
-            && !self.blockless_pending()
+            && ((matches!(rec.body, Body::Routine { .. }) && rec.trailer.block.is_none())
+                || ext_attach)
+            && !self.holds_pending()
             && self.snapshot.as_ref().is_none_or(|s| {
                 s.file != self.file || now.duration_since(s.taken) >= SNAPSHOT_EVERY
             })
@@ -1876,6 +2453,19 @@ impl Machine {
         while let Some(g) = self.groups.pop_front() {
             self.end_group(g, now, cat, out);
         }
+        // R29: held external-source bindings shed, ambiguous; a hold with
+        // nothing held stays (review L5 of #402: its binding's next records
+        // are held again, never emitted with no caller).
+        let keys: Vec<Key> = self
+            .ext
+            .iter()
+            .filter(|(_, h)| !h.events.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            self.fail_ext(k);
+        }
+        self.flush_ext_fail(out);
         if self.hold_since.is_some() {
             self.release(false, out);
         }
@@ -1905,6 +2495,17 @@ impl Machine {
         if self.hold_since.is_some() && !self.groups.iter().any(Group::blockless) {
             self.release(false, out);
         }
+        // R29 item 2: 10 minutes of reading time per external-source hold.
+        let old: Vec<Key> = self
+            .ext
+            .iter()
+            .filter(|(_, h)| h.started.is_some_and(|t| now.duration_since(t) >= EXT_TIME))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in old {
+            self.fail_ext(k);
+        }
+        self.flush_ext_fail(out);
         let linger = |d: &DbId| match d {
             DbId::Declared(i) => cat.get(*i).and_then(|c| c.linger()),
             DbId::Undeclared(_) => None,
@@ -1998,6 +2599,125 @@ impl Catalog for Invalidated<'_> {
     }
 }
 
+/// The error follow-up a credited own record leaves on its binding (R22
+/// items 5 to 8, R35): the exact `ERROR` record the server writes next on
+/// that binding after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowKind {
+    /// The server's statement timeout (`FAILED` finish of a credit ended
+    /// `failed`): `335544794` and `335545129` at `JResultSet::fetchNext`.
+    Timeout,
+    /// The connector's answered cancel (`FAILED` finish of a credit ended
+    /// `cancelled`): `335544794` alone, at `JStatement::openCursor` or
+    /// `JResultSet::fetchNext`.
+    Cancel,
+    /// A stale cancel met by the `DSQL_drop` (R22 item 3): `335544794`
+    /// alone (its location was not measured: the two of the cancel).
+    StaleCancel,
+    /// The row-limit cut whose last request reached the end of the result
+    /// (R35): `335544364` alone at `JResultSet::fetchNext`.
+    ReqSync,
+}
+
+impl FollowKind {
+    fn of(a: &crate::conn::FetchAccount) -> Option<Self> {
+        use crate::conn::FetchEnd;
+        match a.end {
+            FetchEnd::Failed => Some(Self::Timeout),
+            FetchEnd::Cancelled => Some(Self::Cancel),
+            _ if a.stale_cancel_follow_up => Some(Self::StaleCancel),
+            FetchEnd::End | FetchEnd::Early if a.cut => Some(Self::ReqSync),
+            _ => None,
+        }
+    }
+
+    /// Whether an `ERROR` record's location and codes are this follow-up's
+    /// (the codes exactly, in any order, each once).
+    fn matches(self, at: Option<crate::trace_log::ErrorAt>, codes: &[u32]) -> bool {
+        use crate::error::gds;
+        use crate::trace_log::ErrorAt;
+        let mut c = codes.to_vec();
+        c.sort_unstable();
+        match self {
+            Self::Timeout => {
+                at == Some(ErrorAt::FetchNext) && c == [gds::CANCELLED, gds::REQ_STMT_TIMEOUT]
+            }
+            Self::Cancel | Self::StaleCancel => {
+                matches!(at, Some(ErrorAt::FetchNext | ErrorAt::OpenCursor))
+                    && c == [gds::CANCELLED]
+            }
+            Self::ReqSync => at == Some(ErrorAt::FetchNext) && c == [gds::REQ_SYNC],
+        }
+    }
+
+    const ALL: [Self; 4] = [
+        Self::Timeout,
+        Self::Cancel,
+        Self::StaleCancel,
+        Self::ReqSync,
+    ];
+}
+
+/// One binding's follow-up: expected, or consumed (a second record of the
+/// follow-up shape is then ambiguous, R22 item 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FollowUp {
+    kind: FollowKind,
+    consumed: bool,
+}
+
+/// R22 item 7: an `ERROR` record of the exact follow-up shape (the
+/// header, the attachment line, the client line, the transaction line
+/// where present, the location line, one line per code, no trailer) whose
+/// location and codes are one of the follow-ups'.
+fn follow_up_shape<'r>(rec: &'r Record<'_>) -> Option<&'r [u32]> {
+    let Body::Error { codes, other_lines } = &rec.body else {
+        return None;
+    };
+    (rec.att.is_some()
+        && rec.client.is_some()
+        && *other_lines == 0
+        // A trailer under an `ERROR` record is a defect (ambiguous) at
+        // parse, before this.
+        && FollowKind::ALL
+            .iter()
+            .any(|k| k.matches(rec.header.at, codes)))
+    .then_some(codes.as_slice())
+}
+
+/// R1 rule 9: what the runner observed for the records of one read, for
+/// the remote 4-tuple corroboration.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TcpView {
+    /// The log file the read was of.
+    pub(crate) file: (u64, u64),
+    /// Records at or after this offset were written within the last 10 s
+    /// of agent time (past an end-of-file offset the tailer recorded less
+    /// than 10 s before the read, security review L11): `None` when no
+    /// such observation exists (the agent lags, or just started), and the
+    /// socket condition is then not evaluated.
+    pub(crate) fresh_from: Option<u64>,
+    /// The client endpoints of the server's connections, read after the
+    /// read (`None`: not read, a bound reached, or no table).
+    pub(crate) clients: Option<std::collections::HashSet<std::net::SocketAddr>>,
+    /// Tokens with a `DETACH_DATABASE` in the read: its offset, its
+    /// attachment id and its printed database name's [`db_hash`]. Such a
+    /// binding was no longer live when the table was read.
+    pub(crate) detached: Detaches,
+}
+
+/// [`TcpView::detached`]: per token, `(offset, attachment id, db_hash)`.
+pub(crate) type Detaches = HashMap<(u32, u64), Vec<(u64, u64, u64)>>;
+
+/// An in-memory hash of a printed database name (R1 rule 9's detach
+/// match; never persisted or sent).
+pub(crate) fn db_hash(name: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    h.finish()
+}
+
 /// The verdict on one record before its event is built.
 enum Decision {
     /// No event (well formed, nothing read, or the agent's own).
@@ -2026,7 +2746,15 @@ impl Machine {
     ) -> Decision {
         let h = &rec.header;
         let token = h.token();
-        // Runs (R1 rules 1 and 2, R5).
+        // Runs (R1 rules 1 and 2, R5). A run a check read, of this record's
+        // pid, starts here (R1 rule 2: the first record that carries the
+        // new pid is the run boundary).
+        if let (Some(r), Some(p)) = (self.run, self.pending_run)
+            && r.pid != h.pid
+            && p.pid == h.pid
+        {
+            self.confirm_run(p);
+        }
         let pid_ok = match self.run {
             Some(r) => r.pid == h.pid && !self.unconfirmed,
             // Before the first confirmation, a history walk: the first pid
@@ -2036,13 +2764,15 @@ impl Machine {
                     pid: h.pid,
                     start: None,
                 });
+                self.provisional = true;
                 true
             }
         };
         if !pid_ok {
-            if !self.failed_pids.contains(&h.pid) && self.failed_pids.len() < 64 {
-                self.failed_pids.push(h.pid);
-            }
+            // Ambiguous: a pid that failed its confirmation (remembered by
+            // `confirmation_failed`), one met in the cooldown or past the
+            // remembered pids, a provisional run's other pid, or records
+            // after a start-time change until the next confirmation.
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
@@ -2148,6 +2878,52 @@ impl Machine {
                 };
             }
             Event::Error => {
+                // R22 items 5 to 8, R35: the error follow-up of the credited
+                // own record before it on its binding, of the exact shape,
+                // consumed with no event; a second record of a follow-up
+                // shape once it is consumed is ambiguous (a forged copy is
+                // loud); any other error record of the binding is handled
+                // as any client's, never as the agent's own.
+                if let Some(att) = rec.att
+                    && let Resolved::Db(d) = self.resolve(att.database)
+                {
+                    let key = (d, att.id);
+                    let live_own = self.bindings.get(&key).is_some_and(|b| {
+                        b.own && b.anchored && !b.poisoned && !b.tainted && b.token == token
+                    });
+                    let shape = follow_up_shape(rec);
+                    match self.follow_ups.get(&key).copied() {
+                        Some(f)
+                            if !f.consumed
+                                && live_own
+                                && shape.is_some_and(|c| f.kind.matches(h.at, c)) =>
+                        {
+                            self.follow_ups.insert(
+                                key,
+                                FollowUp {
+                                    consumed: true,
+                                    ..f
+                                },
+                            );
+                            self.counts.follow_ups += 1;
+                            return Decision::Nothing;
+                        }
+                        Some(f) if f.consumed && shape.is_some() => {
+                            return Decision::Ambiguous {
+                                window: false,
+                                at: line!(),
+                            };
+                        }
+                        Some(f) if !f.consumed => {
+                            // Not its follow-up: the next record was another.
+                            self.follow_ups.remove(&key);
+                        }
+                        _ => {}
+                    }
+                    if live_own {
+                        self.counts.own_errors_not_followed += 1;
+                    }
+                }
                 // Their codes are kept, nothing else; follow-ups carry no
                 // object (R22 item 7). A permission refusal on a binding
                 // that is not the agent's own is an attempt to read
@@ -2189,23 +2965,63 @@ impl Machine {
             let _ = i;
         }
         let key = (db, att.id);
+        // R22: a follow-up is the next record of its binding, an `ERROR`
+        // record; any other record ends it.
+        self.follow_ups.remove(&key);
         let internal_line = att.protocol == Protocol::Internal;
         // The Garbage Collector (R6, R16, R30).
         if internal_line && att.user == "Garbage Collector" && att.role.is_none() {
             return self.internal_record(rec, key, token, now);
         }
-        if internal_line
-            && !(att.user == "SWEEPER" && att.role == Some("NONE") && att.charset == "NONE")
-        {
-            // R6 item 5, R29: other internal attachments.
+        let sweeper = att.user == "SWEEPER" && att.role == Some("NONE") && att.charset == "NONE";
+        // R29 item 1: a local external data source's attach, exactly
+        // `<name> (ATT_<n>, <user>:<role>, NONE, <internal>)` with no client
+        // line, on the current run's pid (checked above).
+        let ext_attach = internal_line
+            && !sweeper
+            && h.event == Event::AttachDatabase
+            && h.outcome == Outcome::Ok
+            && att.role.is_some()
+            && att.charset == "NONE"
+            && rec.client.is_none();
+        let ext_record = internal_line
+            && self
+                .bindings
+                .get(&key)
+                .is_some_and(|b| b.kind == Kind::External);
+        if internal_line && !sweeper && !ext_attach && !ext_record {
+            // R6 item 5: other internal attachments.
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
             };
         }
+        let kind = if ext_attach {
+            Kind::External
+        } else if internal_line {
+            Kind::Sweep
+        } else {
+            Kind::User
+        };
         match h.event {
             Event::AttachDatabase | Event::CreateDatabase if h.outcome == Outcome::Ok => {
-                self.attach(rec, key, token, now, in_window, internal_line)
+                let d = self.attach(rec, key, token, now, in_window, kind, pos);
+                // R29 item 2: its events are held across its transactions
+                // until one ends after a caller was seen; past the stream's
+                // bound for holds, it is ambiguous at once.
+                if kind == Kind::External
+                    && matches!(d, Decision::Normal { .. })
+                    && !self.new_ext_hold(key)
+                {
+                    if let Some(b) = self.bindings.get_mut(&key) {
+                        b.poisoned = true;
+                    }
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
+                }
+                d
             }
             Event::AttachDatabase => {
                 // FAILED / UNAUTHORIZED (R10): one live token is a breach.
@@ -2302,6 +3118,7 @@ impl Machine {
                         sweep_step: 0,
                         own: false,
                         trigger_wait: None,
+                        addr: None,
                     },
                 );
                 if !self.live_others(db, key) {
@@ -2362,6 +3179,7 @@ impl Machine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         &mut self,
         rec: &Record<'_>,
@@ -2369,11 +3187,11 @@ impl Machine {
         token: (u32, u64),
         now: Instant,
         in_window: bool,
-        internal_line: bool,
+        kind: Kind,
+        pos: u64,
     ) -> Decision {
         let (db, id) = key;
-        let sweep = internal_line;
-        if sweep && rec.client.is_some() {
+        if kind != Kind::User && rec.client.is_some() {
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
@@ -2418,6 +3236,23 @@ impl Machine {
                 }
                 _ => raise = true,
             }
+        }
+        // R1 rule 9: the remote 4-tuple of a TCP line (not the server's
+        // internal attachments, which have none).
+        let mut addr = None;
+        let mut poison_new = false;
+        if kind == Kind::User
+            && let Some(att) = rec.att
+            && let Protocol::Tcp(ip, port) = att.protocol
+        {
+            let ep = crate::peer::canonical_endpoint(ip, port);
+            let tag = self.hash(&ep.to_string());
+            let before = self.counts.tcp_reused;
+            if self.tcp_breach(tag, ep, token, pos, (att.database, att.id)) {
+                ambiguous = true;
+                poison_new = self.counts.tcp_reused > before;
+            }
+            addr = Some(tag);
         }
         // R1 rule 11: caps before anything is kept (review H-A).
         if !self.admit(db) {
@@ -2484,14 +3319,15 @@ impl Machine {
                 seq: 0,
                 token,
                 anchored: true,
-                poisoned: false,
+                poisoned: poison_new,
                 tainted: in_window || ambiguous,
-                kind: if sweep { Kind::Sweep } else { Kind::User },
+                kind,
                 first_tra: None,
                 open_tras: Vec::new(),
                 sweep_step: 0,
                 own: own && !in_window && !ambiguous,
                 trigger_wait: None,
+                addr,
             },
         );
         if ambiguous {
@@ -2505,6 +3341,9 @@ impl Machine {
 
     fn end_binding(&mut self, key: Key) {
         self.probe_records.remove(&key);
+        self.follow_ups.remove(&key);
+        // R29: a binding gone before its transaction's end has no caller.
+        self.fail_ext(key);
         if let Some(b) = self.remove_binding(key) {
             self.token_live.remove(&b.token);
             self.end_token(b.token);
@@ -2574,6 +3413,7 @@ impl Machine {
                     sweep_step: 0,
                     own: false,
                     trigger_wait: None,
+                    addr: None,
                 },
             );
         }
@@ -2586,6 +3426,16 @@ impl Machine {
         if b.token != token || b.poisoned {
             if let Some(b) = self.bindings.get_mut(&key) {
                 b.poisoned |= !b.anchored;
+            }
+            // A poisoned binding (a failed external-source binding, R29; a
+            // reused client end, review L2 of #402) ends at its own detach,
+            // which is ambiguous too; its id stays seen, so a later record
+            // of it is ambiguous as well.
+            if b.token == token
+                && b.poisoned
+                && matches!(h.event, Event::DetachDatabase | Event::DropDatabase)
+            {
+                self.end_binding(key);
             }
             return Decision::Ambiguous {
                 window: false,
@@ -2610,6 +3460,46 @@ impl Machine {
                 window: false,
                 at: line!(),
             };
+        }
+        // R29 item 2: an external-source binding detached with events still
+        // held saw no caller for them: they, and the detach, are ambiguous.
+        if b.kind == Kind::External {
+            // Review L5 of #402: an external-source binding with no hold
+            // (dropped by any path) is never emitted as judged: ambiguous.
+            if !self.ext.contains_key(&key) {
+                if matches!(h.event, Event::DetachDatabase | Event::DropDatabase) {
+                    self.end_binding(key);
+                }
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+            let held = self.ext.get(&key).is_some_and(|h| !h.events.is_empty());
+            if matches!(h.event, Event::DetachDatabase | Event::DropDatabase) && held {
+                self.fail_ext(key);
+                self.end_binding(key);
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+            if h.event == Event::StartTransaction
+                && let Some(x) = self.ext.get_mut(&key)
+            {
+                x.tx_start = Some(pos);
+            }
+        }
+        // R29 item 2: a finish record of code on a user binding.
+        if b.kind == Kind::User && !self.ext.is_empty() {
+            let code = match &rec.body {
+                Body::Routine { .. } => true,
+                Body::Statement { text, .. } => analyze_firebird(text).calls_code(),
+                _ => false,
+            };
+            if code {
+                self.note_caller(key, rec.tra.map(|t| t.id));
+            }
         }
         // A database trigger waiting for its sequence (R15, R34).
         if let Some(wait) = b.trigger_wait {
@@ -2688,6 +3578,14 @@ impl Machine {
                     bm.first_tra.get_or_insert(t);
                     if bm.open_tras.len() < MAX_GROUPS_PER_BINDING * 4 {
                         bm.open_tras.push(t);
+                        // R29: where it started (the caller test).
+                        if bm.kind == Kind::User {
+                            let v = self.tra_pos.entry(key).or_default();
+                            if !v.iter().any(|(x, _)| *x == t) {
+                                v.push((t, pos));
+                                self.tra_pos_entries += 1;
+                            }
+                        }
                     }
                 }
                 return self.normal(db, Some(key));
@@ -2696,6 +3594,14 @@ impl Machine {
                 if let Some(t) = tra {
                     if let Some(bm) = self.bindings.get_mut(&key) {
                         bm.open_tras.retain(|x| *x != t);
+                    }
+                    if let Some(v) = self.tra_pos.get_mut(&key) {
+                        let n = v.len();
+                        v.retain(|(x, _)| *x != t);
+                        self.tra_pos_entries -= n - v.len();
+                        if v.is_empty() {
+                            self.tra_pos.remove(&key);
+                        }
                     }
                     let gs: Vec<Group> = self
                         .groups
@@ -2875,6 +3781,39 @@ impl Machine {
             return;
         };
         let key = Some(self.group_key(&g));
+        // R29 item 2: a group of a held external-source binding is held
+        // with it.
+        if self.ext.contains_key(&g.key) {
+            let mut d = g.full.draft();
+            if g.blockless() {
+                for o in g.bare.draft().objects {
+                    if !d.objects.contains(&o) {
+                        d.objects.push(o);
+                    }
+                }
+                d.star = true;
+                d.always = true;
+            }
+            let normal = finish(d.clone()).map(|d| self.draft_event(&d, None, db));
+            let mut l = d;
+            l.star = true;
+            l.always = true;
+            let loud = self.draft_event(&l, None, db);
+            let cur = std::mem::replace(&mut self.cur, key);
+            self.hold_ext(g.key, db, normal, loud);
+            self.cur = cur;
+            if g.blockless() {
+                // R25 item 3: its block-less part is ambiguous, with a window
+                // and the records held behind it.
+                *self.why.entry(1).or_default() += g.bare.count;
+                self.counts.ambiguous += g.bare.count;
+                self.window_until = Some(Instant::now() + WINDOW);
+                if self.hold_since.is_some() {
+                    self.release(true, out);
+                }
+            }
+            return;
+        }
         if g.full.count > 0
             && let Some(d) = finish(g.full.draft())
         {
@@ -3040,6 +3979,34 @@ impl Machine {
         for g in std::mem::take(&mut self.pending_end) {
             self.end_group(g, now, cat, out);
         }
+        self.flush_ext_fail(out);
+        // R29 item 2: a record of an external-source binding whose events
+        // are held.
+        let ext = self.ext_key(rec);
+        let tra_end = matches!(
+            rec.header.event,
+            Event::CommitTransaction | Event::RollbackTransaction
+        );
+        self.apply_in(decision, ext, rec, pos, now, cat, out);
+        if let Some(k) = ext
+            && tra_end
+        {
+            self.ext_tx_end(k, out);
+        }
+        self.flush_ext_fail(out);
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn apply_in(
+        &mut self,
+        decision: Decision,
+        ext: Option<Key>,
+        rec: &Record<'_>,
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) {
         match decision {
             Decision::Nothing => {}
             Decision::Trigger { db } => {
@@ -3063,8 +4030,11 @@ impl Machine {
                     d.always = true;
                 }
                 d.rows = None;
-                if let Some(d) = finish(d) {
-                    let ev = self.draft_event(&d, Some(rec), db);
+                let normal = finish(d.clone()).map(|d| self.draft_event(&d, Some(rec), db));
+                if let Some(k) = ext {
+                    let loud = self.loud_form(Some(d), rec, db);
+                    self.hold_ext(k, db, normal, loud);
+                } else if let Some(ev) = normal {
                     self.emit(db, ev, out);
                 }
             }
@@ -3227,6 +4197,12 @@ impl Machine {
                     d.star = true;
                     d.always = true;
                 }
+                if let Some(k) = ext {
+                    let normal = draft.as_ref().map(|d| self.draft_event(d, Some(rec), db));
+                    let loud = self.loud_form(draft, rec, db);
+                    self.hold_ext(k, db, normal, loud);
+                    return;
+                }
                 let Some(d) = draft else {
                     return;
                 };
@@ -3234,6 +4210,32 @@ impl Machine {
                 self.emit(db, ev, out);
             }
         }
+    }
+
+    /// A record's ambiguous form (H1 fix 3): its draft, or a read, with `*`
+    /// and the always-reported mark.
+    fn loud_form(&self, d: Option<Draft>, rec: &Record<'_>, db: usize) -> MaskedEvent {
+        let mut d = d.unwrap_or_else(|| Draft {
+            action: Some(databastion_classifiers::masking::EventAction::Read),
+            rows: rec.trailer.fetched,
+            ..Draft::default()
+        });
+        d.star = true;
+        d.always = true;
+        self.draft_event(&d, Some(rec), db)
+    }
+
+    /// [`Self::emit`] for an event attributed to `key` (a held one).
+    fn emit_keyed(
+        &mut self,
+        db: usize,
+        ev: MaskedEvent,
+        key: Option<DKey>,
+        out: &mut Vec<Emitted>,
+    ) {
+        let cur = std::mem::replace(&mut self.cur, key);
+        self.emit(db, ev, out);
+        self.cur = cur;
     }
 
     fn emit(&mut self, db: usize, ev: MaskedEvent, out: &mut Vec<Emitted>) {
@@ -3371,6 +4373,27 @@ impl Machine {
                     .and_then(|d| i64::try_from(d.as_secs()).ok())
                     .map(|c| c - measured_base);
                 self.confirm_offset(key, probe, measured);
+                // R22 items 5 and 6, R35: the credit's error follow-up, for
+                // the next record of this binding.
+                match self
+                    .ledger
+                    .consumed_account((self.file, pos))
+                    .as_ref()
+                    .and_then(FollowKind::of)
+                {
+                    Some(kind) => {
+                        self.follow_ups.insert(
+                            key,
+                            FollowUp {
+                                kind,
+                                consumed: false,
+                            },
+                        );
+                    }
+                    None => {
+                        self.follow_ups.remove(&key);
+                    }
+                }
                 Some(true)
             }
             Verdict::NotOwn => {

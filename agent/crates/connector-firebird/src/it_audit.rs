@@ -300,6 +300,23 @@ fn the_server_trace_log_through_the_stream() {
     assert_eq!(m.counts.panics, 0);
     assert_eq!(m.counts.ambiguous, bare, "{:?}", m.why);
     assert!(!out.is_empty());
+    // R29: the local external data source's attachment (an `<internal>`
+    // attachment on app.fdb, called from crm.fdb), decided with its caller
+    // and reported under its user, nothing of it ambiguous.
+    eprintln!(
+        "[measure] R29 external-source bindings released {}, failed {}",
+        m.counts.ext_released, m.counts.ext_failed
+    );
+    assert_eq!(
+        m.ext_holds_for_tests(),
+        0,
+        "every external-source hold decided"
+    );
+    assert!(
+        m.counts.ext_released >= 1 && m.counts.ext_failed == 0,
+        "{:?}",
+        m.counts
+    );
     // #82: no marker of the workload reaches an event through the stream.
     for (_, ev) in &out {
         let all = format!("{ev:?}");
@@ -490,6 +507,20 @@ fn the_agent_records_match_the_own_statement_table() {
     eprintln!(
         "[it] own records {} not matched {} why {:?}",
         m.counts.own, m.counts.own_not_matched, m.why
+    );
+    // R22 items 5 to 8, R35: the error follow-ups of the agent's own
+    // records (the row-limit cut reaching the end of the result writes
+    // one), and the own error records that were no expected follow-up.
+    eprintln!(
+        "[measure] own error follow-ups consumed {}, own error records not followed {}",
+        m.counts.follow_ups, m.counts.own_errors_not_followed
+    );
+    // Measured, not asserted: whether the server wrote the request
+    // synchronization error depends on the cut (3i: a multi-round cut whose
+    // last request reached the end; a cut inside one request writes none).
+    eprintln!(
+        "[measure] row-limit cuts in the ledger: {}",
+        ledger.dump().matches("+cut").count()
     );
     assert!(m.counts.own > 50, "{:?}", m.counts);
     assert_eq!(m.counts.own_not_matched, 0, "{:?}", m.counts);
@@ -842,4 +873,92 @@ fn header_times_ignore_the_session_time_zone() {
         prev = Some(t);
     }
     assert!(found, "the session marker is in the log");
+}
+
+/// ADR-0060 R29 with the maintainer's decision of 2026-11-01 (review of
+/// #402), on the restarted server with pooled external connections
+/// (`dev/firebird/it.sh`: `ExtConnPoolSize = 4`): a target with an `ON
+/// CONNECT` trigger (its own first transaction), two caller sessions in
+/// turn on one pooled target, two calls in one caller transaction
+/// (`FIREBIRD_IT_EXT_LOG`). A measurement: the first use is released with
+/// its caller; a pooled connection is then returned to the pool with an
+/// `ALTER SESSION RESET` record outside any transaction (after the
+/// target's `ON CONNECT` trigger in a transaction of its own) and reused
+/// with no `ATTACH_DATABASE` or `DETACH_DATABASE`, shapes no accepted rule
+/// covers yet: those records are ambiguous (fail closed), for a
+/// refinement.
+#[test]
+fn external_sources() {
+    let Some(log) = file("FIREBIRD_IT_EXT_LOG") else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&log).into_owned();
+    let pid = text
+        .lines()
+        .find_map(|l| crate::trace_log::header(l.as_bytes()))
+        .map(|h| h.pid)
+        .unwrap();
+    let names = |label: &str, path: &str| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+        read_at: None,
+    };
+    let settings = crate::stream::Settings {
+        databases: vec![names("app", APP), names("crm", CRM)],
+        aliases: Some(Default::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        },
+        superserver: true,
+    };
+    let mut m =
+        crate::stream::Machine::new(settings, std::sync::Arc::new(crate::own::Ledger::default()));
+    m.confirm_run(crate::stream::Run {
+        pid,
+        start: Some(1),
+    });
+    let cats: [&dyn Catalog; 2] = [&Cat, &Cat];
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let mut out = Vec::new();
+    let now = std::time::Instant::now();
+    let mut pos = 0u64;
+    for r in &recs {
+        let Assembled::Record(raw) = r else { continue };
+        m.push(raw, pos, now, &cats, &mut out);
+        pos += raw.len() as u64 + 1;
+    }
+    let attaches = text
+        .lines()
+        .filter(|l| l.ends_with("NONE, <internal>)"))
+        .filter(|l| !l.contains("Garbage Collector"))
+        .count();
+    let detaches = text
+        .lines()
+        .zip(text.lines().skip(1))
+        .filter(|(h, l)| h.ends_with(") DETACH_DATABASE") && l.ends_with("NONE, <internal>)"))
+        .count();
+    eprintln!(
+        "[measure] R29 pooled: external-source lines {attaches}, detaches {detaches}, released {}, \
+         failed {}, holds left {}, ambiguous {} {:?}",
+        m.counts.ext_released,
+        m.counts.ext_failed,
+        m.ext_holds_for_tests(),
+        m.counts.ambiguous,
+        m.why
+    );
+    let resets = text.lines().filter(|l| *l == "ALTER SESSION RESET").count();
+    eprintln!("[measure] R29 pooled: ALTER SESSION RESET records {resets}");
+    assert_eq!(m.counts.panics, 0);
+    assert!(m.counts.ext_released >= 1, "{:?}", m.counts);
 }

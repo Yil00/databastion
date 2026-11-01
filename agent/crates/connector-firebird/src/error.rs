@@ -220,6 +220,7 @@ pub(crate) mod gds {
     pub(crate) const IO_ERROR: u32 = 335_544_344;
     pub(crate) const LOCK_CONFLICT: u32 = 335_544_345;
     pub(crate) const NO_PRIV: u32 = 335_544_352;
+    pub(crate) const REQ_SYNC: u32 = 335_544_364;
     pub(crate) const UNAVAILABLE: u32 = 335_544_375;
     pub(crate) const CONNECT_REJECT: u32 = 335_544_421;
     pub(crate) const UPDATE_CONFLICT: u32 = 335_544_451;
