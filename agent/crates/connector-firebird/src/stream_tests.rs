@@ -322,7 +322,7 @@ fn runs_and_held_positions() {
 
 /// A statement finish of `user` on attachment `id` (port `40000 + id`).
 #[allow(clippy::too_many_arguments)]
-fn stmt(
+pub(crate) fn stmt(
     token: &str,
     id: u64,
     tra: u64,
@@ -349,7 +349,7 @@ fn stmt(
     out
 }
 
-fn attach_as(token: &str, id: u64, user: &str) -> String {
+pub(crate) fn attach_as(token: &str, id: u64, user: &str) -> String {
     format!(
         "{HEAD} ({token}) ATTACH_DATABASE\n\t{APP} (ATT_{id}, {user}:NONE, UTF8, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\n"
     )
@@ -1345,7 +1345,7 @@ fn a_dependent_routine_in_a_group_ended_early_keeps_the_mark() {
 /// time when the agent's clock minus it is `offset`), and the agent time
 /// it stands for, whole seconds (R42 tests: credits live 15 minutes on the
 /// agent's clock).
-fn now_head(offset: i64) -> (String, std::time::SystemTime) {
+pub(crate) fn now_head(offset: i64) -> (String, std::time::SystemTime) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
