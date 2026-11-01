@@ -666,13 +666,7 @@ impl Checkpointer {
     /// Writes `p` with the positions recorded as sent that can come again
     /// from its state: emitted after it (by step), and restored ones it has
     /// not passed.
-    fn write(
-        &mut self,
-        p: Pending,
-        m: &Machine,
-        facts: Facts<'_>,
-        now: Instant,
-    ) {
+    fn write(&mut self, p: Pending, m: &Machine, facts: Facts<'_>, now: Instant) {
         let (digests, read) = facts;
         self.durable.retain(|_, s| *s >= p.step);
         self.restored.retain(|k| {

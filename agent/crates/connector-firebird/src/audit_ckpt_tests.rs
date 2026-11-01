@@ -401,7 +401,15 @@ fn a_restart_with_a_pending_group_restores_the_group() {
     // nothing is sent until the group ends.
     assert!(p.out.is_empty());
     p.expire(Duration::from_secs(11));
-    assert!(objects(&p.out).contains(&"SECRETS".to_owned()));
+    // Its names are not persisted (I2): restored, it is `*` of its
+    // database and always reported, never lost.
+    let loud = |out: &[Emitted]| {
+        out.iter().any(|(_, e)| {
+            e.always_report() && e.objects().iter().any(|o| o.object().as_str() == "*")
+        })
+    };
+    assert!(loud(&p.out), "{:?}", objects(&p.out));
+    assert!(!objects(&p.out).contains(&"SECRETS".to_owned()));
     // Not spooled when the process stops: the next one ends the group again
     // (sent again: a duplicate, never a loss).
     p.commit();
@@ -409,7 +417,7 @@ fn a_restart_with_a_pending_group_restores_the_group() {
     let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
     p.read();
     p.expire(Duration::from_secs(11));
-    assert!(objects(&p.out).contains(&"SECRETS".to_owned()));
+    assert!(loud(&p.out), "{:?}", objects(&p.out));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1563,12 +1571,22 @@ fn groups_ended_on_the_per_binding_cap_are_not_lost() {
     p.read();
     p.expire(Duration::from_secs(11));
     seen.extend(objects(&p.out));
-    for t in 0..17 {
-        assert!(
-            seen.contains(&format!("REL{t:04}")),
-            "REL{t:04} lost: {seen:?}"
-        );
-    }
+    // A group restored is `*` of its database, always reported (its names
+    // are not persisted): every relation is named or under such a `*`.
+    let stars = p
+        .out
+        .iter()
+        .filter(|(_, e)| {
+            e.always_report() && e.objects().iter().any(|o| o.object().as_str() == "*")
+        })
+        .count();
+    let missing = (0..17)
+        .filter(|t| !seen.contains(&format!("REL{t:04}")))
+        .count();
+    assert!(
+        missing <= stars,
+        "{missing} names lost, {stars} `*` events: {seen:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1683,5 +1701,79 @@ async fn a_session_end_writes_the_ledger_on_a_blocking_thread() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(file.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I2 (found by the local `e2e-firebird` run of round 2): a relation name
+/// can embed a value. Neither a sampling credit's table nor a pending
+/// group's relation is persisted in clear; the restored credit still
+/// matches its record through the tag of the record's block relation.
+#[test]
+fn value_bearing_names_are_never_persisted_and_still_credit() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    const NAME: &str = "jane.doe@example.com";
+    let dir = temp("i2-names");
+    first_start(&dir);
+    let (head, opened) = now_head(3600);
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    let a = "24:0x7f0000000100";
+    let text = format!("SELECT FIRST 3 \"X\" FROM \"{NAME}\"");
+    ledger.credit(
+        APP,
+        3,
+        &text,
+        Some(NAME),
+        FetchAccount {
+            counted: 3,
+            requested: 3,
+            last: 3,
+            largest: 3,
+            end: FetchEnd::End,
+            ..FetchAccount::default()
+        },
+    );
+    let sampling = stmt(a, 3, 6, AGENT, &text, 3, &[(NAME, 3)]).replace(HEAD, &head);
+    let cut = sampling.len() / 2;
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            attach_as(a, 3, AGENT).replace(HEAD, &head),
+            routine_in(9, "M.CURIE").replace(HEAD, &head),
+            &sampling[..cut]
+        ),
+    );
+    let mut p = Proc::start(&dir, Arc::clone(&ledger));
+    p.read();
+    p.spooled();
+    p.commit();
+    ledger.persist();
+    drop(p);
+    for f in ["t.fbck.checkpoint", "t.fblg.counters"] {
+        let bytes = std::fs::read(dir.join(f)).unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        for needle in [NAME, "jane.doe", "M.CURIE"] {
+            assert!(!s.contains(needle), "{needle} in {f}");
+        }
+    }
+    append(
+        &dir,
+        &format!(
+            "{}{}",
+            &sampling[cut..],
+            attach("24:0x7f0000000300", 5, APP).replace(HEAD, &head)
+        ),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    let (c, k) = p.counts();
+    assert_eq!(k.restored, 1);
+    assert_eq!(c.own, 1, "the restored sampling credit matched its record");
+    assert!(
+        !objects(&p.out).contains(&NAME.to_owned()),
+        "{:?}",
+        objects(&p.out)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

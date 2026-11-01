@@ -21,8 +21,8 @@
 //! unique id, the tag of the `attach`, the attachment id, a **keyed tag of
 //! the text**, never the text, the table a sampling text reads, the fetch
 //! account, the time, and the record position that consumed it). The
-//! table is a catalog name in clear (a name can embed a value: what the
-//! ADR keeps of relation names). A
+//! table is a keyed tag too (a relation name can embed a value), matched
+//! against the record's block when the credit is consumed. A
 //! restore ([`Ledger::restore`]) keeps only what holds for the checkpoint
 //! it goes with: a credit consumed at or after the checkpoint's position is
 //! a credit again (the re-read consumes it again), one consumed before it
@@ -99,6 +99,56 @@ enum Text {
 /// The tag purpose of persisted texts and `attach` names.
 const TEXT_PURPOSE: &[u8] = b"databastion.firebird.ledger.text.v1";
 const ATTACH_PURPOSE: &[u8] = b"databastion.firebird.ledger.attach.v1";
+const TABLE_PURPOSE: &[u8] = b"databastion.firebird.ledger.table.v1";
+/// A restored credit's table: its tag in this form, never a relation name
+/// (no relation name holds a NUL).
+const TAGGED: &str = "\0tag:";
+
+fn table_tag(key: &LocalTagKey, table: &str) -> [u8; 32] {
+    crate::ckpt::tag(key, TABLE_PURPOSE, &[table.as_bytes()])
+}
+
+fn tagged(t: &[u8; 32]) -> String {
+    let mut s = String::from(TAGGED);
+    for b in t {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn parse_tagged(s: &str) -> Option<[u8; 32]> {
+    let hex = s.strip_prefix(TAGGED)?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The table of a credit for the own-statement table's row: as issued, or
+/// for a restored credit (its table kept as a tag) the record's block
+/// relation whose tag it is. With no such relation, a name no block holds
+/// (so a block naming another table never matches), or the empty name for
+/// an empty block (whose test needs no name).
+pub(crate) fn credit_table(
+    table: Option<&str>,
+    block: &[&str],
+    key: Option<&LocalTagKey>,
+) -> Option<String> {
+    let t = table?;
+    let Some(g) = parse_tagged(t) else {
+        return Some(t.to_owned());
+    };
+    let found = key.and_then(|k| block.iter().find(|b| table_tag(k, b) == g));
+    Some(match (found, block.is_empty()) {
+        (Some(b), _) => (*b).to_owned(),
+        (None, true) => String::new(),
+        (None, false) => TAGGED.to_owned(),
+    })
+}
 /// The persisted ledger's magic.
 pub(crate) const MAGIC: &[u8; 4] = b"FBLG";
 
@@ -651,7 +701,11 @@ impl Saved {
             let attach = r.bytes32()?;
             let id = r.u64()?;
             let text = r.bytes32()?;
-            let table = if r.bool()? { Some(r.str()?) } else { None };
+            let table = if r.bool()? {
+                Some(tagged(&r.bytes32()?))
+            } else {
+                None
+            };
             let account = FetchAccount {
                 counted: r.u64()?,
                 requested: r.u64()?,
@@ -737,14 +791,12 @@ impl Ledger {
                 Text::Clear(t) => crate::ckpt::tag(key, TEXT_PURPOSE, &[t.as_bytes()]),
                 Text::Tag(g) => *g,
             });
-            match c
-                .table
-                .as_deref()
-                .filter(|t| t.len() <= crate::ckpt::MAX_NAME)
-            {
+            // The table a sampling text reads, as a keyed tag (a relation
+            // name can embed a value: never persisted in clear, I2).
+            match c.table.as_deref() {
                 Some(t) => {
                     e.bool(true);
-                    e.str(t);
+                    e.bytes32(&parse_tagged(t).unwrap_or_else(|| table_tag(key, t)));
                 }
                 None => e.bool(false),
             }

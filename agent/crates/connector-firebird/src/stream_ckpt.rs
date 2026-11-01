@@ -14,19 +14,21 @@
 //!   eviction order, the learned floors, the watermarks, the Garbage
 //!   Collector's binding and linger;
 //! - the open split window (its remaining reading time);
-//! - the block-ful pending fold groups (binding, transaction, counts,
-//!   relation and routine names, row counts, signals, the always-reported
-//!   and `*` marks, which carry R41 item 7's "dependent seen" bit, their
-//!   age in reading time and first position);
+//! - the block-ful pending fold groups (binding, transaction, counts, row
+//!   counts, signals, the always-reported and `*` marks, which carry R41
+//!   item 7's "dependent seen" bit, their age in reading time, first and
+//!   last positions); not their relation and routine names (a name can
+//!   embed a value, I2): a restored group that had names is past its bound,
+//!   `*` and always reported;
 //! - the clock offset (confirmed, pending, its bindings) and the probe
 //!   records per binding;
 //! - the invalidation state of R28 item 4 and R41 item 8 (invalidated
 //!   databases, open DDL transactions, waits, the run-long marks, times).
 //!
 //! Undeclared databases are their keyed hash (R1 rule 11), never a name.
-//! Relation and routine names are in clear (as in events: a name can embed
-//! a value its owner put in it).
-//! **Not written**: any statement text or parameter; the names a
+//! **Not written**: any statement text, parameter, relation or routine
+//! name (a name can embed a value; undeclared databases and the identity
+//! are keyed tags); the names a
 //! DDL text named in the interval (R41 item 8): a database that had such
 //! names is restored with every relation dependent instead (fail closed);
 //! held records (the checkpoint is only taken where none is held: they lie
@@ -48,9 +50,8 @@ use databastion_classifiers::masking::{LocalTagKey, Signal};
 
 use super::{
     Binding, DbId, Group, Key, Kind, MAX_BINDINGS_DECLARED, MAX_BINDINGS_UNDECLARED, MAX_DDL_OPEN,
-    MAX_GROUP_NAMES, MAX_GROUPS, MAX_GROUPS_PER_BINDING, MAX_SERVICES, MAX_STATE_BYTES,
-    MAX_STREAM_BYTES, MAX_TOKENS_ENDED, MAX_UNDECLARED, Machine, Part, Pend, Run, SeenIds,
-    TriggerWait, WINDOW,
+    MAX_GROUPS, MAX_GROUPS_PER_BINDING, MAX_SERVICES, MAX_STATE_BYTES, MAX_STREAM_BYTES,
+    MAX_TOKENS_ENDED, MAX_UNDECLARED, Machine, Part, Pend, Run, SeenIds, TriggerWait, WINDOW,
 };
 use crate::ckpt::{Bad, Reader, Refused, Writer};
 
@@ -113,17 +114,12 @@ fn w_token(w: &mut Writer, t: (u32, u64)) {
     w.u64(t.1);
 }
 
+/// A part without its names: a relation or routine name can embed a
+/// value, so none is persisted (I2). A part that had names is restored as
+/// past its bound: `*` and always reported (loud, never a lost read).
 fn w_part(w: &mut Writer, p: &Part) {
     w.u64(p.count);
-    w.len(p.names.len());
-    for n in &p.names {
-        w.str(n);
-    }
-    w.len(p.rels.len());
-    for n in &p.rels {
-        w.str(n);
-    }
-    w.bool(p.overflow);
+    w.bool(p.overflow || !p.names.is_empty() || !p.rels.is_empty());
     w.opt_u64(p.rows);
     w.len(p.signals.len());
     for s in &p.signals {
@@ -172,17 +168,6 @@ impl Dec<'_, '_> {
             count: self.r.u64()?,
             ..Part::default()
         };
-        for v in [&mut p.names, &mut p.rels] {
-            let n = self.r.len(MAX_GROUP_NAMES, 4)?;
-            for _ in 0..n {
-                let s = self.r.str()?;
-                if v.contains(&s) {
-                    return Err(Bad);
-                }
-                p.bytes += s.len() + 24;
-                v.push(s);
-            }
-        }
         p.overflow = self.r.bool()?;
         p.rows = self.r.opt_u64()?;
         let n = self.r.len(Signal::ALL.len(), 4)?;

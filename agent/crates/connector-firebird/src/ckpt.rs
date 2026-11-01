@@ -16,10 +16,9 @@
 //!
 //! What the bodies hold is in [`crate::stream`] (the parser state) and
 //! [`crate::own`] (the ledger): ids, tokens, positions, counters, times,
-//! relation and routine names in clear, keyed tags of the other names and
-//! of texts; never a statement text or a parameter (I2). Relation and
-//! routine names are kept as the ADR keeps them in events; a name can
-//! embed a value its owner put in it.
+//! keyed tags of names and texts; never a statement text, a parameter or a
+//! relation, routine or database name in clear (I2: a name can embed a
+//! value).
 
 use databastion_classifiers::masking::LocalTagKey;
 

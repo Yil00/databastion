@@ -3183,8 +3183,11 @@ impl Machine {
         // The own-statement table's row (R13, R20, R23), the credit's
         // R22 / R35 bounds and its life on both sides (R42 item 5),
         // checked before the credit is consumed.
+        let tag_key = self.tag_key.as_deref();
         let accept = |a: &crate::conn::FetchAccount, table: Option<&str>, at: SystemTime| {
-            crate::own_table::matches(text, table, &block, fetched, a)
+            // A restored credit's table is a tag: the block's relation it is.
+            let table = crate::own::credit_table(table, &block, tag_key);
+            crate::own_table::matches(text, table.as_deref(), &block, fetched, a)
                 && crate::own::within(a, fetched, failed)
                 && t <= at + crate::own::LIFETIME_SLACK
                 && t + crate::own::CREDIT_LIFE >= at
