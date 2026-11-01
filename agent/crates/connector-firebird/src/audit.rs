@@ -18,13 +18,19 @@
 //!   ([`crate::trace_log`]), the last one held until a following header or
 //!   a stable end of file (2 s); [`crate::stream::Machine`] applies the
 //!   rules; the persisted position is held back to the first record of a
-//!   pending fold group or of the record in progress. The records read
-//!   again after a restart (from that held-back position) are judged and
-//!   emitted as on their first reading (R39 (a)): with no checkpoint of
-//!   the parser's state, a re-read record can be judged differently, so
-//!   none is suppressed; the events of the re-read region the previous
-//!   reading had handed over are sent twice (accepted over-reporting,
-//!   never a loss).
+//!   pending fold group or of the record in progress.
+//! - **The parser checkpoint** ([`crate::audit_ckpt`], R25 items 7 and 9,
+//!   R39 (a)): with a state directory, each commit writes the ledger, then
+//!   the parser state as it was at the position the cursor is saved at
+//!   (the record in progress, or the first block-less record of a hold),
+//!   then the cursor. A restart that resumes from exactly that position
+//!   restores the state and the agent's credits, re-reads from there, and
+//!   emits nothing again for a position whose events were durably spooled;
+//!   other events of the re-read region are sent again (over-reporting,
+//!   never a loss). Without a usable checkpoint (none written, refused,
+//!   another server run, another position), the stream starts with no
+//!   state and the records re-read are judged and emitted as on their
+//!   first reading, as before.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,6 +44,7 @@ use databastion_core::{
     TargetNote,
 };
 
+use crate::audit_ckpt::{Checkpointer, Commit};
 use crate::catalog;
 use crate::stream::{DeclaredNames, Machine, Run, Settings};
 use crate::trace_conf::{self, AliasMap, DeclaredDb, ServerMode};
@@ -656,13 +663,23 @@ pub(crate) async fn stream(
             engine_code: None,
         });
     }
+    let ckpt = Checkpointer::open(
+        cfg.checkpoint(crate::audit_ckpt::CHECKPOINT),
+        cfg.counters(crate::audit_ckpt::LEDGER),
+        &ledger,
+    );
     let mut machine = Machine::new(s, ledger);
+    if let Some(c) = &ckpt {
+        machine.enable_checkpoint(c.key());
+    }
     let mut requests = EarlyRequests::default();
     let mut seen = Seen::default();
     if let Some(r) = run {
         machine.confirm_run(r);
     }
     let mut runner = Runner {
+        ckpt,
+        shed: 0,
         tailer: Tailer::new(audit.log.clone(), FRAMING, cfg.cursor(CURSOR))
             .with_open_check(open_check(audit.log.clone())),
         asm: Assembler::new(),
@@ -722,18 +739,15 @@ pub(crate) async fn stream(
                 continue;
             }
         };
-        let held = runner.held(&machine);
-        // Where the next stream must resume (review M4).
-        let resume = held
-            .first()
-            .map(|(_, p)| (p.file, p.start))
-            .or(runner.last_end);
-        if resume.is_some() {
-            state.note_stream(&id, |f| f.saved = resume);
+        if let Some(c) = runner.ckpt.as_mut() {
+            c.settle(sink.durable());
         }
-        runner = tokio::task::spawn_blocking(move || {
+        let held;
+        let counts = (sink.submitted(), sink.durable());
+        (runner, machine, held) = tokio::task::spawn_blocking(move || {
+            let held = runner.commit(&machine, counts);
             runner.tailer.commit_from(&held);
-            runner
+            (runner, machine, held)
         })
         .await
         .map_err(|e| {
@@ -745,6 +759,14 @@ pub(crate) async fn stream(
                 engine_code: None,
             }
         })?;
+        // Where the next stream must resume (review M4).
+        let resume = held
+            .first()
+            .map(|(_, p)| (p.file, p.start))
+            .or(runner.last_end);
+        if resume.is_some() {
+            state.note_stream(&id, |f| f.saved = resume);
+        }
         if !more {
             tokio::time::sleep(cfg.poll_interval()).await;
         }
@@ -764,13 +786,14 @@ async fn poll_and_deliver(
     cats: Vec<Classes>,
     sink: &EventSink,
 ) -> Result<(Runner, Machine, Vec<Classes>, Result<bool, TailError>), ConnectorError> {
-    let (r, m, cats, out, polled) = tokio::task::spawn_blocking(move || {
+    let (mut r, mut m, cats, out, keys, polled) = tokio::task::spawn_blocking(move || {
         let mut m = machine;
         let mut r = runner;
         let mut out = Vec::new();
         let cats_ref: Vec<&dyn Catalog> = cats.iter().map(|c| c as &dyn Catalog).collect();
         let polled = r.poll(&mut m, &cats_ref, &mut out);
-        (r, m, cats, out, polled)
+        let keys = m.take_keys();
+        (r, m, cats, out, keys, polled)
     })
     .await
     .map_err(|e| {
@@ -782,8 +805,24 @@ async fn poll_and_deliver(
             engine_code: None,
         }
     })?;
-    for (_db, ev) in out {
+    // Each event's position and the sink's count after it (R25 item 7:
+    // a position is recorded as sent once the core has all its events
+    // durably). Keys out of step with the events: none recorded.
+    let aligned = keys.len() == out.len();
+    let mut sent = Vec::with_capacity(out.len());
+    for (i, (_db, ev)) in out.into_iter().enumerate() {
         sink.submit(ev).await?;
+        let (k, step) = if aligned { keys[i] } else { (None, 0) };
+        sent.push((k, sink.submitted(), step));
+    }
+    if let Some(c) = r.ckpt.as_mut() {
+        c.sent(&sent, &m.held_keys(), m.take_suppressed());
+        let shed = std::mem::take(&mut r.shed);
+        if shed > 0 {
+            c.shed(sink.submitted(), shed);
+        }
+    } else {
+        let _ = m.take_suppressed();
     }
     Ok((r, m, cats, polled))
 }
@@ -869,6 +908,10 @@ struct Seen {
 }
 
 struct Runner {
+    /// The parser checkpoint (`None` without a state directory or key).
+    ckpt: Option<Checkpointer>,
+    /// Pending groups ended for the checkpoint's cap in this poll.
+    shed: usize,
     tailer: Tailer,
     asm: Assembler,
     /// The log offset of the record in progress (held back).
@@ -915,12 +958,17 @@ impl Runner {
                 return Err(e);
             }
         };
-        // R39 (a): the re-read region (known once the file is open) is
-        // emitted again, not suppressed; its end is kept for the count.
+        // R39 (a): the re-read region (known once the file is open); its end
+        // is kept for the count.
         if let Some(r) = self.tailer.take_replay() {
             self.reread_end = Some((r.file, r.replay.end));
         }
         let now = Instant::now();
+        // The checkpoint, restored only when bound to exactly the position
+        // the tailer resumed from (before any record is handed).
+        if let Some(c) = self.ckpt.as_mut() {
+            c.on_open(self.tailer.take_resumed(), m, now);
+        }
         if !polled.records.is_empty() {
             self.last_growth = now;
         }
@@ -999,8 +1047,60 @@ impl Runner {
             self.hand(m, done, rs, now, cats, out);
             self.record_start = None;
         }
+        // R25 item 9: the checkpoint would pass its cap: the oldest pending
+        // groups end (their outputs sent before a checkpoint without them).
+        if let Some(budget) = self.ckpt.as_mut().and_then(Checkpointer::take_shed_target) {
+            self.shed += m.shed_groups(budget, now, cats, out);
+        }
         m.expire(now, cats, out);
         Ok(polled.more)
+    }
+
+    /// Writes the checkpoint (when the stream has one) and gives the
+    /// position the cursor is saved at: the checkpoint's, or without one
+    /// the held-back position ([`Self::held`]).
+    fn commit(
+        &mut self,
+        m: &Machine,
+        sink: (u64, Option<u64>),
+    ) -> Vec<(u64, databastion_core::audit::tail::RecordPos)> {
+        let open = self.tailer.open_file();
+        // The state is that of the read position: the record in progress,
+        // or the end of the last line read; after a rotation that ended the
+        // old file, the start of the new one (nothing of it read yet).
+        let live = match (self.file, self.record_start) {
+            (Some(f), _) if open != Some(f) && self.ended == Some(f) => open.map(|o| (o, 0)),
+            (Some(f), Some(start)) => Some((f, start)),
+            (Some(f), None) => self.last_end.filter(|(lf, _)| *lf == f),
+            (None, _) => None,
+        };
+        let Some(c) = self.ckpt.as_mut() else {
+            return self.held(m);
+        };
+        match c.commit(m, live, open, sink, Instant::now()) {
+            Commit::At(file, start) => vec![(
+                0,
+                databastion_core::audit::tail::RecordPos {
+                    file,
+                    start,
+                    end: start,
+                },
+            )],
+            Commit::Fallback(hold) => {
+                let mut held = self.held(m);
+                if let (Some(start), Some(file)) = (hold, open) {
+                    held.push((
+                        0,
+                        databastion_core::audit::tail::RecordPos {
+                            file,
+                            start,
+                            end: start,
+                        },
+                    ));
+                }
+                held
+            }
+        }
     }
 
     /// The file `f` ended (rotated away, read to its end): if it is the
@@ -1063,7 +1163,7 @@ impl Runner {
             }
             Some(Assembled::Oversized(_) | Assembled::Orphan) => {
                 self.count_reread(m, start);
-                m.unreadable(now, cats, out);
+                m.unreadable_at(start, now, cats, out);
             }
             None => {}
         }
@@ -1078,6 +1178,10 @@ impl Runner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "audit_ckpt_tests.rs"]
+mod ckpt_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1110,6 +1214,8 @@ mod tests {
         store: Option<databastion_core::audit::CursorStore>,
     ) -> Runner {
         Runner {
+            ckpt: None,
+            shed: 0,
             tailer: Tailer::new(log.to_path_buf(), FRAMING, store)
                 .with_open_check(open_check(log.to_path_buf())),
             asm: Assembler::new(),
@@ -1747,6 +1853,8 @@ mod tests {
         let classes = Classes::default();
         let cats: Vec<&dyn Catalog> = vec![&classes];
         let mut r = Runner {
+            ckpt: None,
+            shed: 0,
             tailer: Tailer::new(log.clone(), FRAMING, None)
                 .with_open_check(open_check(log.clone())),
             asm: Assembler::new(),
