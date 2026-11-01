@@ -5,7 +5,7 @@
 //! declared `attach`: its attachment (the id from `CURRENT_CONNECTION`, the
 //! local port, the server pid, when it opened and closed) and one credit
 //! per execution (the exact text, a constant of the closed set or a
-//! sampling text built from catalog names, never a value, and the fetch
+//! sampling text built from catalog names, never a sampled value, and the fetch
 //! account of R22). The Audit stream consumes a credit for each record it
 //! takes as the agent's own; a record of the agent's attachment whose text
 //! finds no credit left is ambiguous (loud).
@@ -13,13 +13,16 @@
 //! Persisted with the parser checkpoint (R25 item 7, L10: the inputs that
 //! do not come from the log): the stream attaches a store
 //! ([`Ledger::attach_store`]) and the ledger is written at every
-//! checkpoint and at every session's end ([`Ledger::close`]), so a restart
-//! right after a check still finds that check's credits. What is written:
+//! checkpoint and, on a blocking thread, soon after the end of an own
+//! session ([`Ledger::close`]), so a restart right after a check still
+//! finds that check's credits. What is written:
 //! the attachments (a keyed tag of the declared `attach`, the id, the local
 //! port, the server pid, the open and close times) and the credits (a
 //! unique id, the tag of the `attach`, the attachment id, a **keyed tag of
 //! the text**, never the text, the table a sampling text reads, the fetch
-//! account, the time, and the record position that consumed it). A
+//! account, the time, and the record position that consumed it). The
+//! table is a catalog name in clear (a name can embed a value: what the
+//! ADR keeps of relation names). A
 //! restore ([`Ledger::restore`]) keeps only what holds for the checkpoint
 //! it goes with: a credit consumed at or after the checkpoint's position is
 //! a credit again (the re-read consumes it again), one consumed before it
@@ -119,6 +122,11 @@ pub(crate) struct Ledger {
     /// stream, [`Self::attach_store`]); held while writing, so writes are
     /// serialized and the later one holds the later state.
     persist: Mutex<Option<(CursorStore, Arc<LocalTagKey>)>>,
+    /// Changed since it was last written (review L2: a session's end only
+    /// marks it, and schedules the write on a blocking thread).
+    dirty: std::sync::atomic::AtomicBool,
+    /// A write is scheduled.
+    scheduled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -376,7 +384,13 @@ impl Ledger {
 
     /// The session ended: cleanly (`lost` false) or not, after its
     /// statement timeout.
-    pub(crate) fn close(&self, attach: &str, id: u64, lost: bool, statement_timeout: Duration) {
+    pub(crate) fn close(
+        self: &Arc<Self>,
+        attach: &str,
+        id: u64,
+        lost: bool,
+        statement_timeout: Duration,
+    ) {
         let end = if lost {
             SystemTime::now() + statement_timeout + LOST_MARGIN
         } else {
@@ -391,9 +405,31 @@ impl Ledger {
             a.closed = Some(end);
         }
         drop(s);
-        // The session's credits are all issued: persisted now, so that an
-        // agent stopped right after a check still has them (R25 item 7).
-        self.persist();
+        // The session's credits are all issued: written soon, so that an
+        // agent stopped right after a check still has them (R25 item 7),
+        // on a blocking thread, never from async code or a `Drop` (review
+        // L2), one write for the sessions that end meanwhile; without a
+        // runtime (tests), at the next checkpoint.
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(rt) = tokio::runtime::Handle::try_current()
+            && !self
+                .scheduled
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let me = Arc::clone(self);
+            drop(rt.spawn_blocking(move || {
+                me.scheduled
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                me.persist_if_dirty();
+            }));
+        }
+    }
+
+    /// Writes the ledger when it changed since it was last written.
+    pub(crate) fn persist_if_dirty(&self) {
+        if self.dirty.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.persist();
+        }
     }
 
     /// The stream read the attachment's `DETACH_DATABASE`.
@@ -747,6 +783,7 @@ impl Ledger {
     /// Writes the ledger to its store, when one is attached. A failed write
     /// keeps the previous file (logged by kind).
     pub(crate) fn persist(&self) {
+        self.dirty.store(false, std::sync::atomic::Ordering::SeqCst);
         let p = self
             .persist
             .lock()
@@ -943,7 +980,7 @@ mod tests {
     /// both sides.
     #[test]
     fn attachment_lifetimes_bound_record_times() {
-        let l = Ledger::default();
+        let l = Arc::new(Ledger::default());
         let t0 = SystemTime::now() - Duration::from_secs(3600);
         l.register_at("app", 7, 40000, 24, t0);
         l.close("app", 7, false, Duration::from_secs(1));
