@@ -2,7 +2,12 @@
 //! and 9, R39 (a), R42 item 4, the restart residual of the implementation
 //! note of 2026-10-31 c): each [`Proc`] is one agent process on the same
 //! state directory and log.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr
+)]
 
 use std::io::Write as _;
 use std::sync::Arc;
