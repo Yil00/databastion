@@ -1150,6 +1150,12 @@ impl Machine {
                     *p = 0;
                 }
             }
+            // An external transaction opened in an earlier file: its start
+            // position means nothing here, so no caller is taken for it
+            // (review L5 of #402: held until a later transaction).
+            for h in self.ext.values_mut() {
+                h.tx_start = None;
+            }
         }
         self.file = file;
     }
@@ -2447,8 +2453,15 @@ impl Machine {
         while let Some(g) = self.groups.pop_front() {
             self.end_group(g, now, cat, out);
         }
-        // R29: held external-source bindings shed, ambiguous.
-        let keys: Vec<Key> = self.ext.keys().copied().collect();
+        // R29: held external-source bindings shed, ambiguous; a hold with
+        // nothing held stays (review L5 of #402: its binding's next records
+        // are held again, never emitted with no caller).
+        let keys: Vec<Key> = self
+            .ext
+            .iter()
+            .filter(|(_, h)| !h.events.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
         for k in keys {
             self.fail_ext(k);
         }
@@ -3451,6 +3464,17 @@ impl Machine {
         // R29 item 2: an external-source binding detached with events still
         // held saw no caller for them: they, and the detach, are ambiguous.
         if b.kind == Kind::External {
+            // Review L5 of #402: an external-source binding with no hold
+            // (dropped by any path) is never emitted as judged: ambiguous.
+            if !self.ext.contains_key(&key) {
+                if matches!(h.event, Event::DetachDatabase | Event::DropDatabase) {
+                    self.end_binding(key);
+                }
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
             let held = self.ext.get(&key).is_some_and(|h| !h.events.is_empty());
             if matches!(h.event, Event::DetachDatabase | Event::DropDatabase) && held {
                 self.fail_ext(key);

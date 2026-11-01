@@ -3157,3 +3157,60 @@ fn a_failed_external_hold_ends_its_groups_loud() {
     );
     assert_eq!(m.counts.ext_failed, 1);
 }
+
+/// Review L5 of #402: a rotation (`end_all`, the end of a file) with an
+/// external-source binding whose hold is empty keeps the hold, so its
+/// later read is held again and, with no caller, ambiguous at its detach;
+/// and an external binding left with no hold at all is ambiguous.
+#[test]
+fn an_external_source_across_a_file_end_is_never_emitted_without_a_caller() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let attach_ext = format!(
+        "{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({e}) ATTACH_DATABASE\n{line}\n"
+    );
+    let call = stmt(c, 3, 5, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    let (start, _, end) = ext_source(e, 9, 20, "CUSTOMERS");
+    let tx = start
+        .split_once(") START_TRANSACTION")
+        .map(|(_, r)| format!("{HEAD} ({e}) START_TRANSACTION{r}"))
+        .unwrap();
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    // The attach and a first released use (a caller, a transaction end).
+    let first = format!(
+        "{}{attach_ext}{}{call}{HEAD} ({e}) COMMIT_TRANSACTION\n{line}\t\t(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms\n\n",
+        caller_open(c),
+        tx.replace("SELECT * FROM CUSTOMERS", "SELECT * FROM ORDERS")
+            .replace("CUSTOMERS  ", "ORDERS     ")
+    );
+    let _ = feed(&mut m, &cats, &first, 0);
+    assert_eq!(m.counts.ext_released, 1);
+    let mut out = Vec::new();
+    m.end_all(Instant::now(), &cats, &mut out);
+    m.set_file((7, 7));
+    // A new file: the next use has no caller (the caller's transaction
+    // ended); it is held and ambiguous at the detach, never quiet.
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{}{end}",
+            caller_commit(c),
+            tx.replace("TRA_20", "TRA_21")
+        ),
+        100_000,
+    );
+    let cust: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert!(!cust.is_empty(), "{:?}", names(&out));
+    assert!(cust.iter().all(|(_, ev)| ev.always_report()), "never quiet");
+}
