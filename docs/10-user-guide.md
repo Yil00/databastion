@@ -576,6 +576,8 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 
 **Backups.** Run backups through the services manager or over loopback TCP. An embedded `gbak` on the server host writes under its own process and makes its records ambiguous (24 h cap).
 
+**Local external data sources.** Keep `ExtConnPoolSize = 0` (the default) in `firebird.conf` when routines reach a declared database through `EXECUTE STATEMENT … ON EXTERNAL '<path>'`. With pooled external connections (`ExtConnPoolSize` above 0), the agent cannot yet attribute the pool's records: each use makes them ambiguous, and the target is Limited for 24 h ([engine capabilities](08-engine-capabilities.md#gaps-that-cap-the-level-for-24-h)).
+
 **Untraced readers.** The database owner, `RDB$ADMIN` and holders of a utility system privilege (`USE_GBAK_UTILITY`, `USE_GFIX_UTILITY`, `USE_GSTAT_UTILITY` and the like) can read, within their object rights, **with no record in the trace**, so with no event. Grant these privileges only to accounts trusted to read without audit.
 
 ## 7. Least-privilege accounts
