@@ -2414,8 +2414,12 @@ async fn xe_scenario() {
         )
     };
     let (stream, mut rx) = start(&c);
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(!stream.is_finished(), "{:?}", stream.await);
+    if stream.is_finished() {
+        panic!("{:?}", stream.await);
+    }
+    // The activity below must be past the first start's floor
+    // (`xe_first_read`), not after a fixed delay.
+    Box::pin(xe_first_read(&c, &t.id, &stream)).await;
 
     // The agent's own activity while the stream reads.
     let h = Box::pin(c.check(&t)).await;
@@ -5314,6 +5318,41 @@ async fn measure_xe_read_cost() {
     .await;
 }
 
+/// Waits until an Extended Events stream has completed its first poll
+/// (at most 60 s; the stream must not end meanwhile), then for the first
+/// start's clock skew. The first start skips the session's history: every
+/// event stamped before the server time read when the stream opens its
+/// session, plus `XE_CLOCK_SKEW_US`, is history, never reported (by design,
+/// ADR-0051 decision 6). A test that writes the events it counts after a
+/// fixed delay races that first start: on a loaded runner the session
+/// opened after the writes began, and their first part was history (engine
+/// matrix, SQL Server 2025 strict, job 124929503164: 4 769 of 6 000 small
+/// events reported, none dropped by the server or lost by the agent;
+/// reproduced with no delay: 0 of 6 000, all 18 258 events read). The
+/// first poll follows the first start, so events written after it and the
+/// skew are past the floor.
+async fn xe_first_read<T>(
+    c: &SqlserverConnector,
+    target_id: &str,
+    stream: &tokio::task::JoinHandle<T>,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while c.state.audit.xe_reads(target_id).reads == 0 {
+        assert!(
+            !stream.is_finished(),
+            "the stream ended before its first read"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no Extended Events read within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let skew = u64::try_from(crate::audit::xe::XE_CLOCK_SKEW_US).unwrap_or(0);
+    tokio::time::sleep(Duration::from_micros(2 * skew)).await;
+    assert!(!stream.is_finished(), "the stream started");
+}
+
 /// The large-event test's own Extended Events session
 /// ([`xe_large_events_are_read_by_halving`]).
 const LARGE_XE: &str = "it_large_xe";
@@ -5484,8 +5523,9 @@ async fn xe_large_body(major: u32) {
     let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
     let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
     let mut stream = large_stream(&c, &cfg, &sink);
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(!stream.is_finished(), "the stream started");
+    // Not a fixed delay: the small events below must be past the first
+    // start's floor (`xe_first_read`).
+    Box::pin(xe_first_read(&c, &t.id, &stream)).await;
     // Counts the stream's reads of `retail.crm.customers` by `sa` until
     // `want` are counted or `wait` passes.
     let mut seen = 0usize;
