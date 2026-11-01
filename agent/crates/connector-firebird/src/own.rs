@@ -10,9 +10,20 @@
 //! takes as the agent's own; a record of the agent's attachment whose text
 //! finds no credit left is ambiguous (loud).
 //!
-//! In memory only: after a restart, the attachments of the previous
-//! process are no longer known, so their records are reported as any
-//! client's (fail closed, R39 (a)).
+//! Persisted with the parser checkpoint (R25 item 7, L10: the inputs that
+//! do not come from the log): the stream attaches a store
+//! ([`Ledger::attach_store`]) and the ledger is written at every
+//! checkpoint and at every session's end ([`Ledger::close`]), so a restart
+//! right after a check still finds that check's credits. What is written:
+//! the attachments (a keyed tag of the declared `attach`, the id, the local
+//! port, the server pid, the open and close times) and the credits (a
+//! unique id, the tag of the `attach`, the attachment id, a **keyed tag of
+//! the text**, never the text, the table a sampling text reads, the fetch
+//! account, the time, and the record position that consumed it). A
+//! restore ([`Ledger::restore`]) keeps only what holds for the checkpoint
+//! it goes with: a credit consumed at or after the checkpoint's position is
+//! a credit again (the re-read consumes it again), one consumed before it
+//! is dropped, and an `attach` that is no longer declared is dropped.
 //!
 //! A consumed credit is remembered with the record position that consumed
 //! it (the log file identity and offset): a stream restarted in the same
@@ -26,6 +37,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use databastion_classifiers::masking::LocalTagKey;
+use databastion_core::audit::CursorStore;
+
+use crate::ckpt::{Bad, Reader, Writer};
 use crate::conn::{FetchAccount, FetchEnd};
 
 /// Credits kept per ledger (the oldest go first).
@@ -57,15 +72,32 @@ struct Attachment {
 
 #[derive(Debug, Clone)]
 struct Credit {
+    /// Unique in the ledger and across agent processes (a restore never
+    /// adds a credit twice).
+    uid: u64,
     attach: String,
     id: u64,
-    text: String,
+    text: Text,
     /// The table a built text (sampling, CAS guard) reads; `None` for a
     /// constant text of the closed set.
     table: Option<String>,
     account: FetchAccount,
     at: SystemTime,
 }
+
+/// A credit's text: as executed, or, restored from the persisted ledger,
+/// its keyed tag (the text is never persisted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Text {
+    Clear(String),
+    Tag([u8; 32]),
+}
+
+/// The tag purpose of persisted texts and `attach` names.
+const TEXT_PURPOSE: &[u8] = b"databastion.firebird.ledger.text.v1";
+const ATTACH_PURPOSE: &[u8] = b"databastion.firebird.ledger.attach.v1";
+/// The persisted ledger's magic.
+pub(crate) const MAGIC: &[u8; 4] = b"FBLG";
 
 /// What the stream's own rule concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +115,10 @@ pub(crate) enum Verdict {
 #[derive(Debug, Default)]
 pub(crate) struct Ledger {
     inner: Mutex<State>,
+    /// Where the ledger is persisted, with the key of its tags (set by the
+    /// stream, [`Self::attach_store`]); held while writing, so writes are
+    /// serialized and the later one holds the later state.
+    persist: Mutex<Option<(CursorStore, Arc<LocalTagKey>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -91,6 +127,34 @@ struct State {
     credits: std::collections::VecDeque<Credit>,
     /// Credits consumed, with the record position that consumed them.
     consumed: std::collections::VecDeque<(RecordAt, Credit)>,
+    /// The key of the tagged texts of restored credits.
+    key: Option<Arc<LocalTagKey>>,
+    /// The next credit id.
+    next_uid: u64,
+}
+
+impl State {
+    fn uid(&mut self) -> u64 {
+        if self.next_uid == 0 {
+            // A random start, so credit ids of two agent processes differ.
+            let mut b = [0u8; 8];
+            let _ = getrandom::fill(&mut b);
+            self.next_uid = u64::from_be_bytes(b) | 1;
+        }
+        let u = self.next_uid;
+        self.next_uid = self.next_uid.wrapping_add(1).max(1);
+        u
+    }
+}
+
+/// Whether a credit's text is `text`.
+fn same_text(t: &Text, text: &str, key: Option<&LocalTagKey>) -> bool {
+    match t {
+        Text::Clear(c) => c == text,
+        Text::Tag(g) => {
+            key.is_some_and(|k| crate::ckpt::tag(k, TEXT_PURPOSE, &[text.as_bytes()]) == *g)
+        }
+    }
 }
 
 /// A record's position: the log file's `(st_dev, st_ino)` and the offset
@@ -144,10 +208,12 @@ impl Ledger {
         if s.credits.len() >= MAX_CREDITS {
             s.credits.pop_front();
         }
+        let uid = s.uid();
         s.credits.push_back(Credit {
+            uid,
             attach: attach.to_owned(),
             id,
-            text: text.to_owned(),
+            text: Text::Clear(text.to_owned()),
             table: table.map(str::to_owned),
             account,
             at: SystemTime::now(),
@@ -223,7 +289,10 @@ impl Ledger {
                 a.last,
                 a.largest,
                 a.end,
-                c.text
+                match &c.text {
+                    Text::Clear(t) => t.as_str(),
+                    Text::Tag(_) => "<tag>",
+                }
             ));
         }
         out
@@ -295,7 +364,13 @@ impl Ledger {
         self.state()
             .credits
             .iter()
-            .map(|c| (c.text.clone(), c.account.end))
+            .map(|c| {
+                let t = match &c.text {
+                    Text::Clear(t) => t.clone(),
+                    Text::Tag(_) => "<tag>".to_owned(),
+                };
+                (t, c.account.end)
+            })
             .collect()
     }
 
@@ -315,6 +390,10 @@ impl Ledger {
         {
             a.closed = Some(end);
         }
+        drop(s);
+        // The session's credits are all issued: persisted now, so that an
+        // agent stopped right after a check still has them (R25 item 7).
+        self.persist();
     }
 
     /// The stream read the attachment's `DETACH_DATABASE`.
@@ -406,7 +485,10 @@ impl Ledger {
         let live = |c: &Credit| now.duration_since(c.at).unwrap_or_default() < CREDIT_LIFE;
         s.credits.retain(live);
         s.consumed.retain(|(_, c)| live(c));
-        let same = |c: &Credit| c.attach == attach && c.id == id && c.text == text;
+        let key = s.key.clone();
+        let same = |c: &Credit| {
+            c.attach == attach && c.id == id && same_text(&c.text, text, key.as_deref())
+        };
         if let Some((_, c)) = s.consumed.iter().find(|(p, c)| *p == at && same(c)) {
             return if accept(&c.account, c.table.as_deref(), c.at) {
                 Verdict::Own
@@ -435,6 +517,320 @@ impl Ledger {
         }
         s.consumed.push_back((at, c));
         Verdict::Own
+    }
+}
+
+/// The largest persisted ledger (the core's counters file): with the
+/// checkpoint file, the 16 MiB of R25 item 9's one cap.
+const MAX_PERSISTED: usize = 2 * 1024 * 1024;
+
+fn ms(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn from_ms(v: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(v)
+}
+
+fn end_code(e: FetchEnd) -> u8 {
+    match e {
+        FetchEnd::NotRun => 0,
+        FetchEnd::End => 1,
+        FetchEnd::Early => 2,
+        FetchEnd::Lost => 3,
+        FetchEnd::Failed => 4,
+        FetchEnd::Cancelled => 5,
+        FetchEnd::Error => 6,
+    }
+}
+
+fn end_of(c: u8) -> Result<FetchEnd, Bad> {
+    Ok(match c {
+        0 => FetchEnd::NotRun,
+        1 => FetchEnd::End,
+        2 => FetchEnd::Early,
+        3 => FetchEnd::Lost,
+        4 => FetchEnd::Failed,
+        5 => FetchEnd::Cancelled,
+        6 => FetchEnd::Error,
+        _ => return Err(Bad),
+    })
+}
+
+/// A persisted attachment, its `attach` as a tag.
+struct SavedAttachment {
+    attach: [u8; 32],
+    id: u64,
+    port: u16,
+    pid: u32,
+    opened: SystemTime,
+    closed: Option<SystemTime>,
+}
+
+/// A persisted credit.
+struct SavedCredit {
+    uid: u64,
+    attach: [u8; 32],
+    id: u64,
+    text: [u8; 32],
+    table: Option<String>,
+    account: FetchAccount,
+    at: SystemTime,
+    consumed: Option<RecordAt>,
+}
+
+/// A persisted ledger, decoded.
+pub(crate) struct Saved {
+    attachments: Vec<SavedAttachment>,
+    credits: Vec<SavedCredit>,
+}
+
+impl Saved {
+    /// Decodes a persisted ledger body (strict, bounded; the fuzz target).
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, Bad> {
+        let mut r = Reader::new(body);
+        let n = r.len(MAX_ATTACHMENTS, 32 + 8 + 4 + 4 + 8 + 1)?;
+        let mut attachments = Vec::with_capacity(n);
+        for _ in 0..n {
+            let attach = r.bytes32()?;
+            let id = r.u64()?;
+            let port = u16::try_from(r.u32()?).map_err(|_| Bad)?;
+            let pid = r.u32()?;
+            let opened = from_ms(r.u64()?);
+            let closed = r.opt_u64()?.map(from_ms);
+            attachments.push(SavedAttachment {
+                attach,
+                id,
+                port,
+                pid,
+                opened,
+                closed,
+            });
+        }
+        let n = r.len(MAX_CREDITS + MAX_CONSUMED, 8 + 32 + 8 + 32 + 1)?;
+        let mut credits = Vec::with_capacity(n);
+        for _ in 0..n {
+            let uid = r.u64()?;
+            let attach = r.bytes32()?;
+            let id = r.u64()?;
+            let text = r.bytes32()?;
+            let table = if r.bool()? { Some(r.str()?) } else { None };
+            let account = FetchAccount {
+                counted: r.u64()?,
+                requested: r.u64()?,
+                last: r.u32()?,
+                largest: r.u32()?,
+                end: end_of(r.u8()?)?,
+                stale_cancel_follow_up: r.bool()?,
+                session_retired: r.bool()?,
+            };
+            let at = from_ms(r.u64()?);
+            let consumed = if r.bool()? {
+                Some(((r.u64()?, r.u64()?), r.u64()?))
+            } else {
+                None
+            };
+            credits.push(SavedCredit {
+                uid,
+                attach,
+                id,
+                text,
+                table,
+                account,
+                at,
+                consumed,
+            });
+        }
+        r.done()?;
+        Ok(Self {
+            attachments,
+            credits,
+        })
+    }
+}
+
+impl Ledger {
+    /// The stream's store for the persisted ledger, and the key of its
+    /// tags. The first store attached is kept (one stream per endpoint).
+    pub(crate) fn attach_store(&self, store: CursorStore, key: Arc<LocalTagKey>) {
+        let mut p = self
+            .persist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if p.is_none() {
+            *p = Some((store, Arc::clone(&key)));
+        }
+        drop(p);
+        self.state().key.get_or_insert(key);
+    }
+
+    /// The persisted body (newest credits first kept within
+    /// [`MAX_PERSISTED`]: an older credit left out is lost at a restart,
+    /// so its record is reported as any client's, fail closed).
+    fn encode(&self, key: &LocalTagKey) -> Vec<u8> {
+        let s = self.state();
+        let t_attach = |a: &str| crate::ckpt::tag(key, ATTACH_PURPOSE, &[a.as_bytes()]);
+        let mut w = Writer::default();
+        w.len(s.attachments.len());
+        for a in &s.attachments {
+            w.bytes32(&t_attach(&a.attach));
+            w.u64(a.id);
+            w.u32(u32::from(a.port));
+            w.u32(a.pid);
+            w.u64(ms(a.opened));
+            w.opt_u64(a.closed.map(ms));
+        }
+        let all: Vec<(Option<RecordAt>, &Credit)> = s
+            .consumed
+            .iter()
+            .map(|(p, c)| (Some(*p), c))
+            .chain(s.credits.iter().map(|c| (None, c)))
+            .collect();
+        let mut items: Vec<Vec<u8>> = Vec::new();
+        let mut size = w.buf.len() + 4;
+        // Newest first (credits are kept in issue order).
+        let mut sorted = all;
+        sorted.sort_by_key(|(_, c)| std::cmp::Reverse(c.at));
+        for (consumed, c) in sorted {
+            let mut e = Writer::default();
+            e.u64(c.uid);
+            e.bytes32(&t_attach(&c.attach));
+            e.u64(c.id);
+            e.bytes32(&match &c.text {
+                Text::Clear(t) => crate::ckpt::tag(key, TEXT_PURPOSE, &[t.as_bytes()]),
+                Text::Tag(g) => *g,
+            });
+            match c
+                .table
+                .as_deref()
+                .filter(|t| t.len() <= crate::ckpt::MAX_NAME)
+            {
+                Some(t) => {
+                    e.bool(true);
+                    e.str(t);
+                }
+                None => e.bool(false),
+            }
+            let a = &c.account;
+            e.u64(a.counted);
+            e.u64(a.requested);
+            e.u32(a.last);
+            e.u32(a.largest);
+            e.u8(end_code(a.end));
+            e.bool(a.stale_cancel_follow_up);
+            e.bool(a.session_retired);
+            e.u64(ms(c.at));
+            match consumed {
+                Some(((dev, ino), off)) => {
+                    e.bool(true);
+                    e.u64(dev);
+                    e.u64(ino);
+                    e.u64(off);
+                }
+                None => e.bool(false),
+            }
+            if size + e.buf.len() > MAX_PERSISTED - 64 {
+                break;
+            }
+            size += e.buf.len();
+            items.push(e.buf);
+        }
+        drop(s);
+        w.len(items.len());
+        for i in items {
+            w.buf.extend_from_slice(&i);
+        }
+        w.buf
+    }
+
+    /// Writes the ledger to its store, when one is attached. A failed write
+    /// keeps the previous file (logged by kind).
+    pub(crate) fn persist(&self) {
+        let p = self
+            .persist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((store, key)) = p.as_ref() else {
+            return;
+        };
+        let body = self.encode(key);
+        match crate::ckpt::seal(key, MAGIC, &body) {
+            Some(bytes) => {
+                if let Err(e) = store.save(&bytes) {
+                    tracing::warn!(error = %e, "Firebird own-statement ledger not saved");
+                }
+            }
+            None => tracing::warn!("Firebird own-statement ledger not saved"),
+        }
+    }
+
+    /// Restores a persisted ledger with the checkpoint it goes with (the
+    /// checkpoint's file and position `at`): attachments and credits whose
+    /// `attach` is one of `attaches` (the declared databases); a credit
+    /// consumed at or after `at` in that file becomes a credit again, one
+    /// consumed elsewhere is dropped; nothing already in the ledger is added
+    /// twice. Returns the credits restored.
+    pub(crate) fn restore(&self, saved: Saved, attaches: &[String], at: RecordAt) -> usize {
+        let mut s = self.state();
+        let Some(key) = s.key.clone() else {
+            return 0;
+        };
+        let names: HashMap<[u8; 32], &String> = attaches
+            .iter()
+            .map(|a| (crate::ckpt::tag(&key, ATTACH_PURPOSE, &[a.as_bytes()]), a))
+            .collect();
+        for a in saved.attachments {
+            let Some(attach) = names.get(&a.attach) else {
+                continue;
+            };
+            if s.attachments.len() >= MAX_ATTACHMENTS
+                || s.attachments
+                    .iter()
+                    .any(|x| &x.attach == *attach && x.id == a.id)
+            {
+                continue;
+            }
+            s.attachments.push(Attachment {
+                attach: (*attach).clone(),
+                id: a.id,
+                port: a.port,
+                pid: a.pid,
+                opened: a.opened,
+                closed: a.closed,
+            });
+        }
+        let known: std::collections::HashSet<u64> = s
+            .credits
+            .iter()
+            .map(|c| c.uid)
+            .chain(s.consumed.iter().map(|(_, c)| c.uid))
+            .collect();
+        let mut n = 0;
+        for c in saved.credits {
+            let Some(attach) = names.get(&c.attach) else {
+                continue;
+            };
+            let again = match c.consumed {
+                None => true,
+                Some((file, off)) => file == at.0 && off >= at.1,
+            };
+            if !again || known.contains(&c.uid) || s.credits.len() >= MAX_CREDITS {
+                continue;
+            }
+            s.credits.push_back(Credit {
+                uid: c.uid,
+                attach: (*attach).clone(),
+                id: c.id,
+                text: Text::Tag(c.text),
+                table: c.table,
+                account: c.account,
+                at: c.at,
+            });
+            n += 1;
+        }
+        s.credits.make_contiguous().sort_by_key(|c| c.at);
+        n
     }
 }
 
@@ -559,6 +955,89 @@ mod tests {
             40000,
             Some(SystemTime::now() + Duration::from_secs(60))
         ));
+    }
+
+    /// The persisted ledger (R25 item 7, L10): a restore with its
+    /// checkpoint's position makes the credits consumed at or after it
+    /// credits again, drops those consumed before it and those of an
+    /// `attach` no longer declared, adds nothing twice, and holds no text.
+    #[test]
+    fn the_persisted_ledger_restores_what_its_checkpoint_needs() {
+        let key = std::sync::Arc::new(
+            databastion_classifiers::masking::HmacKey::new(&[5; 32])
+                .unwrap()
+                .local_tag_key("databastion.audit.cursor")
+                .unwrap(),
+        );
+        let dir = std::env::temp_dir().join(format!("fb-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = || CursorStore::counters(&dir, "t", "fblg").unwrap();
+        let l = Ledger::default();
+        l.attach_store(store(), Arc::clone(&key));
+        l.register("app", 7, 40000, 24);
+        l.register("gone", 8, 40001, 24);
+        let text = crate::sql::OWN_ATTACHMENT;
+        let one = acc(FetchEnd::End, 1, 64, 64, 64);
+        for _ in 0..3 {
+            l.credit("app", 7, text, None, one);
+        }
+        l.credit("gone", 8, text, None, one);
+        // Consumed before the checkpoint's position (100), and after it.
+        assert_eq!(
+            l.consume("app", 7, text, ((1, 2), 50), bounded(1)),
+            Verdict::Own
+        );
+        assert_eq!(
+            l.consume("app", 7, text, ((1, 2), 150), bounded(1)),
+            Verdict::Own
+        );
+        l.persist();
+        let bytes = store().load().unwrap().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("MON$"), "no text");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("app"),
+            "no attach"
+        );
+        let body = crate::ckpt::open(&key, MAGIC, &bytes).unwrap();
+        let fresh = Ledger::default();
+        fresh.attach_store(store(), Arc::clone(&key));
+        let saved = Saved::decode(body).unwrap();
+        assert_eq!(fresh.restore(saved, &["app".to_owned()], ((1, 2), 100)), 2);
+        // The one consumed after the position and the unconsumed one; not
+        // the one consumed before it, nor `gone`'s.
+        assert_eq!(fresh.credits_left().len(), 2);
+        assert!(fresh.is_own_attach("app", 7, 40000, None));
+        assert!(!fresh.is_own_attach("gone", 8, 40001, None));
+        // The restored credit matches its text by its tag.
+        assert_eq!(
+            fresh.consume("app", 7, text, ((1, 2), 150), bounded(1)),
+            Verdict::Own
+        );
+        assert_eq!(
+            fresh.consume(
+                "app",
+                7,
+                "SELECT 1 FROM RDB$DATABASE",
+                ((1, 2), 160),
+                bounded(1)
+            ),
+            Verdict::NotOwn
+        );
+        // Restoring again adds nothing twice.
+        let saved = Saved::decode(body).unwrap();
+        assert_eq!(fresh.restore(saved, &["app".to_owned()], ((1, 2), 100)), 0);
+        assert_eq!(fresh.credits_left().len(), 1);
+        // Another file: only the unconsumed one.
+        let other = Ledger::default();
+        other.attach_store(store(), Arc::clone(&key));
+        let saved = Saved::decode(body).unwrap();
+        assert_eq!(other.restore(saved, &["app".to_owned()], ((9, 9), 0)), 1);
+        // Every cut of the body is refused.
+        for n in 0..body.len() {
+            assert!(Saved::decode(&body[..n]).is_err(), "cut {n}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A built text's credit carries its table.
