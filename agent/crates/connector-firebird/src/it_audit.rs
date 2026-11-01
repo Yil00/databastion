@@ -300,32 +300,22 @@ fn the_server_trace_log_through_the_stream() {
     assert_eq!(m.counts.panics, 0);
     assert_eq!(m.counts.ambiguous, bare, "{:?}", m.why);
     assert!(!out.is_empty());
-    // R29: the local external data source's read (an `<internal>`
-    // attachment on crm.fdb), reported under its user, not ambiguous.
-    let ext: Vec<_> = out
-        .iter()
-        .filter(|(_, e)| {
-            e.objects()
-                .iter()
-                .any(|o| o.object().as_str().eq_ignore_ascii_case("payment_cards"))
-        })
-        .collect();
+    // R29: the local external data source's attachment (an `<internal>`
+    // attachment on app.fdb, called from crm.fdb), decided with its caller
+    // and reported under its user, nothing of it ambiguous.
     eprintln!(
-        "[measure] R29 external-source events {} (principals {:?})",
-        ext.len(),
-        ext.iter()
-            .map(|(_, e)| e.principal().account_name().to_owned())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        ext.iter()
-            .any(|(_, e)| e.principal().account_name() == "SYSDBA"),
-        "the external-source read"
+        "[measure] R29 external-source bindings released {}, failed {}",
+        m.counts.ext_released, m.counts.ext_failed
     );
     assert_eq!(
         m.ext_holds_for_tests(),
         0,
         "every external-source hold decided"
+    );
+    assert!(
+        m.counts.ext_released >= 1 && m.counts.ext_failed == 0,
+        "{:?}",
+        m.counts
     );
     // #82: no marker of the workload reaches an event through the stream.
     for (_, ev) in &out {
@@ -525,9 +515,13 @@ fn the_agent_records_match_the_own_statement_table() {
         "[measure] own error follow-ups consumed {}, own error records not followed {}",
         m.counts.follow_ups, m.counts.own_errors_not_followed
     );
-    if ledger.dump().contains("+cut") {
-        assert!(m.counts.follow_ups >= 1, "{:?}", m.counts);
-    }
+    // Measured, not asserted: whether the server wrote the request
+    // synchronization error depends on the cut (3i: a multi-round cut whose
+    // last request reached the end; a cut inside one request writes none).
+    eprintln!(
+        "[measure] row-limit cuts in the ledger: {}",
+        ledger.dump().matches("+cut").count()
+    );
     assert!(m.counts.own > 50, "{:?}", m.counts);
     assert_eq!(m.counts.own_not_matched, 0, "{:?}", m.counts);
     assert!(m.probe_seen.is_some(), "the read-back probe (proof 7)");

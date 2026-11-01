@@ -344,19 +344,22 @@ SQL
   >/dev/null
 
 # ADR-0060 R29: a local external data source (EXECUTE STATEMENT ... ON EXTERNAL with a path and no
-# host, no AS USER: the caller's user), from an EXECUTE BLOCK on app.fdb reading crm.fdb. The server
+# host, no AS USER: the caller's user), from an EXECUTE BLOCK on crm.fdb reading app.fdb. The server
 # writes an <internal> attachment with a user and a role; with its caller (this isql session, which
 # has a transaction open and writes the EXECUTE BLOCK's finish record), the stream reports its read
-# under its user with no ambiguous record (it_audit::the_server_trace_log_through_the_stream).
+# under its user with no ambiguous record (it_audit::the_server_trace_log_through_the_stream). The
+# target is app.fdb, which has no ON CONNECT trigger: on crm.fdb (the dev seed's ON CONNECT trigger)
+# the external attachment runs the trigger in a first transaction of its own, which ends before the
+# caller's code record, and its records are ambiguous (measured; R29 names one transaction).
 {
   cat "$WORK/root.pw"
   cat <<'SQL'
 SET TERM ^ ;
-EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM PAYMENT_CARDS' ON EXTERNAL '/var/lib/firebird/data/crm.fdb' INTO :N; SUSPEND; END^
+EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN EXECUTE STATEMENT 'SELECT COUNT(*) FROM CUSTOMERS' ON EXTERNAL '/var/lib/firebird/data/app.fdb' INTO :N; SUSPEND; END^
 SET TERM ; ^
 COMMIT;
 SQL
-} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" \
   >/dev/null
 
 # The #82 marker cases the stock tools can write (ADR-0060 item 5): a routine's returned value,
@@ -618,14 +621,15 @@ timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L1 + 1))"
 L2="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
 # shellcheck disable=SC2016 # The inner shell's loop.
 timeout 60 $SUDO nsenter --net="/proc/$PID/ns/net" sh -c \
-  'for i in $(seq 1 150); do cat /proc/net/tcp /proc/net/tcp6; echo ==; sleep 0.02; done' \
+  'for i in $(seq 1 150); do cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; echo ==; sleep 0.02; done' \
   > "$WORK/svc-samples.txt" &
 SAMPLER=$!
 as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
   /var/lib/firebird/data/crm.fdb /tmp/it-crm.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
 wait "$SAMPLER"
 sleep 1
-timeout 30 $SUDO nsenter --net="/proc/$PID/ns/net" cat /proc/net/tcp /proc/net/tcp6 >> "$WORK/svc-samples.txt"
+timeout 30 $SUDO nsenter --net="/proc/$PID/ns/net" sh -c 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null; true' \
+  >> "$WORK/svc-samples.txt"
 timeout 60 docker exec "$NAME" rm -f /tmp/it-crm.fbk
 sleep 2
 timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L2 + 1))" > "$WORK/svc.log"

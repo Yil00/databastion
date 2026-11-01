@@ -537,6 +537,10 @@ pub(crate) struct Counts {
     pub(crate) tcp_not_evaluated: u64,
     /// R1 rule 9: fresh TCP attaches whose socket was found.
     pub(crate) tcp_corroborated: u64,
+    /// R29: external-source bindings emitted with a caller, and those whose
+    /// records were made ambiguous.
+    pub(crate) ext_released: u64,
+    pub(crate) ext_failed: u64,
     /// Error follow-ups of the agent's own records consumed (R22, R35).
     pub(crate) follow_ups: u64,
     /// `ERROR` records of the agent's own anchored bindings that were no
@@ -1538,6 +1542,7 @@ impl Machine {
     /// bound reached, the run's end): its records are ambiguous.
     fn fail_ext(&mut self, key: Key) {
         if let Some(h) = self.ext.remove(&key) {
+            self.counts.ext_failed += 1;
             self.ext_events = self.ext_events.saturating_sub(h.events.len());
             self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes);
             self.ext_fail.push(h);
@@ -1576,6 +1581,7 @@ impl Machine {
         let Some(h) = self.ext.remove(&key) else {
             return;
         };
+        self.counts.ext_released += 1;
         self.ext_events = self.ext_events.saturating_sub(h.events.len());
         self.ext_bytes = self.ext_bytes.saturating_sub(h.bytes);
         for e in h.events {

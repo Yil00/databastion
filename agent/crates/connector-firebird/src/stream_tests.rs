@@ -2929,3 +2929,53 @@ fn tcp_lines_are_corroborated_by_the_servers_connections() {
     );
     assert!(m.counts.ambiguous >= 2);
 }
+
+/// Measured on 5.0.4 (`dev/firebird/it.sh`): on a target database with an
+/// `ON CONNECT` trigger, the external attachment runs the trigger in a
+/// first transaction of its own, committed before the caller's code record.
+/// R29 item 2 decides at "its transaction-end record": with no caller yet,
+/// every record of the binding is ambiguous (fail closed, as before R29);
+/// which transaction decides is for a refinement.
+#[test]
+fn an_external_source_with_a_connect_trigger_transaction_stays_ambiguous() {
+    let c = "24:0x7f0000000100";
+    let e = "24:0x7f0000000500";
+    let line = format!("\t{APP} (ATT_9, SYSDBA:NONE, NONE, <internal>)\n");
+    let ctx = |t: u64| format!("{line}\t\t(TRA_{t}, CONCURRENCY | WAIT | READ_WRITE)\n");
+    let trigger = format!(
+        "{HEAD} ({e}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({e}) ATTACH_DATABASE\n{line}\n{HEAD} ({e}) START_TRANSACTION\n{}\n{HEAD} ({e}) EXECUTE_TRIGGER_FINISH\n{}\nTrigger TRG_CONNECT (ON CONNECT):\n      0 ms\n\n{HEAD} ({e}) COMMIT_TRANSACTION\n{}      0 ms\n\n",
+        ctx(41),
+        ctx(41),
+        ctx(41)
+    );
+    let (start, _, end) = ext_source(e, 9, 42, "CUSTOMERS");
+    // The inner statement's transaction, after the trigger's.
+    let inner = start
+        .split_once(") START_TRANSACTION")
+        .map(|(_, r)| format!("{HEAD} ({e}) START_TRANSACTION{r}"))
+        .unwrap();
+    let call = stmt(c, 3, 5, "APP", "EXECUTE PROCEDURE P_EXT", 0, &[]);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{trigger}{inner}{call}{end}{}",
+            caller_open(c),
+            caller_commit(c)
+        ),
+        0,
+    );
+    assert_eq!((m.counts.ext_released, m.counts.ext_failed), (0, 1));
+    let cust: Vec<_> = out
+        .iter()
+        .filter(|(_, ev)| {
+            ev.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert!(!cust.is_empty() && cust.iter().all(|(_, ev)| ev.always_report()));
+}

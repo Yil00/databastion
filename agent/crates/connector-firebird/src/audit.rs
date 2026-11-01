@@ -2088,7 +2088,8 @@ mod tests {
     /// less than 10 s before) is corroborated by the server's connection
     /// table; a forged attach naming a port with no connection is
     /// ambiguous. Then the measurement of security review N7: the client
-    /// end of a `service_mgr` backup's own TCP attachment (`FIREBIRD_IT_SVC_LOG`)
+    /// end of a `service_mgr` backup's own TCP attachment (its
+    /// `ATTACH_DATABASE` records in `FIREBIRD_IT_SVC_LOG`)
     /// in the connection tables sampled during and 1 s after the backup
     /// (`FIREBIRD_IT_SVC_SAMPLES`, raw `/proc/net/tcp*` copies separated by
     /// `==` lines; no secret).
@@ -2179,14 +2180,26 @@ mod tests {
             let client = lines
                 .get(i + 2)
                 .is_some_and(|n| n.starts_with('\t') && !n.is_empty());
+            eprintln!(
+                "[measure] N7 attach in the backup's records: protocol {}, client line {client}",
+                att.rsplit_once(", ")
+                    .map_or("?", |(_, p)| p.split('/').next().unwrap_or("?"))
+            );
             if let Some(p) = att
                 .rsplit_once("TCPv4:127.0.0.1/")
                 .and_then(|(_, p)| p.trim_end_matches(')').parse::<u16>().ok())
-                && !client
             {
                 ports.push(p);
             }
         }
+        eprintln!(
+            "[measure] N7 backup's records: {} lines, {} headers",
+            lines.len(),
+            lines
+                .iter()
+                .filter(|l| crate::trace_log::header(l.as_bytes()).is_some())
+                .count()
+        );
         let chunks: Vec<&str> = samples.split("==\n").collect();
         let found = |p: u16, chunk: &str| {
             let mut out = std::collections::HashSet::new();
@@ -2206,7 +2219,7 @@ mod tests {
             );
         }
         eprintln!(
-            "[measure] N7 service_mgr backup attachments (TCP, no client line): {}",
+            "[measure] N7 service_mgr backup attachments (TCP): {}",
             ports.len()
         );
     }
