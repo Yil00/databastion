@@ -346,3 +346,10 @@ path = "fuzz_targets/firebird_statement.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "firebird_checkpoint"
+path = "fuzz_targets/firebird_checkpoint.rs"
+test = false
+doc = false
+bench = false
