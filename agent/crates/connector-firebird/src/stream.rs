@@ -706,7 +706,8 @@ impl Machine {
     /// watermark; it holds across stream and agent restarts, and the
     /// evidence is forgotten once applied). Then the database's bindings
     /// end, its own-attachment set, watermark, highest and seen ids and
-    /// learned floor are cleared. Returns the databases restored.
+    /// learned floor are cleared, its DDL waits end, and its dependent sets
+    /// are invalidated until the next check. Returns the databases restored.
     pub(crate) fn apply_restores(&mut self) -> usize {
         let mut n = 0;
         for i in 0..self.s.databases.len().min(self.restore_facts.len()) {
@@ -741,13 +742,17 @@ impl Machine {
         for k in keys {
             self.end_binding(k);
         }
-        // Its DDL transactions end with its bindings (as at a run's end,
-        // re-review L-5): invalidated until the next check.
-        let before = self.ddl_open.len();
+        // Its DDL transactions and waits end with its bindings (as at a
+        // run's end and an eviction, re-review L-5; review L1).
         self.ddl_open.retain(|(k, _), _| k.0 != db);
-        if self.ddl_open.len() != before {
-            self.invalidate(i, SystemTime::now());
+        for w in self.ddl_wait.values_mut() {
+            w.retain(|p| p.key().0 != db);
         }
+        self.ddl_wait.retain(|_, w| !w.is_empty());
+        // Review L2: the records between the read position and the real
+        // restore point are of the earlier life, judged with this check's
+        // sets: invalidated until the next check, whatever was open.
+        self.invalidate(i, SystemTime::now());
         self.watermark.remove(&i);
         self.highest.remove(&db);
         if let Some(seen) = self.seen_ids.remove(&db) {
@@ -952,6 +957,27 @@ impl Machine {
     #[cfg(test)]
     pub(crate) fn all_relations_for_tests(&self, db: usize) -> bool {
         self.all_relations.contains(&db)
+    }
+
+    /// Test support: a DDL wait on database `db` for a binding of it.
+    #[cfg(test)]
+    pub(crate) fn fill_ddl_wait_for_tests(&mut self, db: usize) {
+        self.ddl_wait
+            .entry(db)
+            .or_default()
+            .insert(Pend::Binding((DbId::Declared(db), 50)));
+    }
+
+    /// Test support: the databases with a DDL wait.
+    #[cfg(test)]
+    pub(crate) fn ddl_wait_len_for_tests(&self) -> usize {
+        self.ddl_wait.len()
+    }
+
+    /// Test support: whether `db`'s dependent sets are invalidated.
+    #[cfg(test)]
+    pub(crate) fn views_invalid_for_tests(&self, db: usize) -> bool {
+        self.views_invalid.contains(&db)
     }
 
     /// Test support: the DDL transactions tracked.

@@ -2549,3 +2549,26 @@ fn a_restore_confirmed_before_a_stream_restart_is_applied() {
     assert_eq!(m.counts.restores, 1);
     assert_eq!(m.apply_restores(), 0);
 }
+
+/// Review L1 and L2: a confirmed restore ends the database's DDL waits
+/// (no empty entry left) and invalidates its dependent sets until the next
+/// check, whether or not a DDL transaction was open.
+#[test]
+fn a_restore_ends_ddl_waits_and_invalidates() {
+    for wait in [false, true] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.restore_baseline(&[RestoreFacts::default()]);
+        if wait {
+            m.fill_ddl_wait_for_tests(0);
+            assert_eq!(m.ddl_wait_len_for_tests(), 1);
+        }
+        assert!(!m.views_invalid_for_tests(0));
+        m.set_restore_facts(vec![RestoreFacts {
+            confirmed: 1,
+            own_id: None,
+        }]);
+        assert_eq!(m.counts.restores, 1);
+        assert_eq!(m.ddl_wait_len_for_tests(), 0);
+        assert!(m.views_invalid_for_tests(0), "wait {wait}");
+    }
+}
