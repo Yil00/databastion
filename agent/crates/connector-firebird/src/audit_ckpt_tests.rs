@@ -1584,16 +1584,17 @@ fn a_restore_with_the_same_schema_while_stopped_invalidates_the_re_read() {
     );
 }
 
-/// R1 rule 5 across a restart: a restored checkpoint holds the
-/// watermark of the database's earlier life (the agent's own attachment
-/// 3); the check after the restart attached as id 1, below it, so the
-/// database was restored while the agent was stopped. Its attachments
-/// start again at the checkpoint's restore: a new attachment with id 3 (a
-/// duplicate of the earlier life's) is not ambiguous. With the check's id
-/// above the watermark, nothing is restored and the duplicate is
-/// ambiguous, as before (R1 rule 3).
+/// R1 rule 5 across an agent restart (L3): the persisted ledger, restored
+/// with the checkpoint, holds the agent's own attachment 3 of the
+/// database's earlier life; the check after the restart attached as id 1
+/// more than the margin later, below 3: the database was restored while
+/// the agent was stopped. Its attachments start again at the checkpoint's
+/// restore: a new attachment with id 3 (a duplicate of the earlier life's)
+/// is not ambiguous. With the check's id above every earlier own one,
+/// nothing is restored and the duplicate is ambiguous, as before (R1 rule
+/// 3).
 #[test]
-fn a_restore_while_stopped_is_confirmed_by_the_watermark() {
+fn a_restore_while_stopped_is_confirmed_from_the_ledger() {
     for restored in [false, true] {
         let dir = temp(if restored {
             "restore-wm"
@@ -1637,8 +1638,17 @@ fn a_restore_while_stopped_is_confirmed_by_the_watermark() {
         append(&dir, &next);
         let l2 = Arc::new(Ledger::default());
         let own = if restored { 1 } else { 9 };
-        l2.register(APP, own, 40000 + u16::try_from(own).unwrap(), 24);
+        // Registered well after the earlier life's attachment (the margin
+        // of `Ledger::new_life`).
+        l2.register_at(
+            APP,
+            own,
+            40000 + u16::try_from(own).unwrap(),
+            24,
+            opened + Duration::from_secs(600),
+        );
         let mut p = Proc::start(&dir, l2);
+        // The facts the first check after the restart gave the stream.
         p.m.restore_baseline(&[crate::stream::RestoreFacts {
             confirmed: 0,
             own_id: Some(own),

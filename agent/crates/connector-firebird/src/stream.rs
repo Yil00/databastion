@@ -699,14 +699,14 @@ impl Machine {
     /// R1 rule 5: restores are recognised from `check()` only, never from
     /// a log record. A declared database is restored when a check of this
     /// process read another `DB_GUID` or `MON$CREATION_DATE` than the one
-    /// before, or when the check attachment's `CURRENT_CONNECTION` is below
-    /// the database's watermark (attachment ids grow within a database's
-    /// life, so a lower one is a new life: this also covers a restore while
-    /// the agent was stopped, against a restored checkpoint's watermark).
-    /// Then the database's bindings end, its own-attachment set, watermark,
-    /// highest and seen ids and learned floor are cleared, and the ledger
-    /// forgets its own attachments closed before the check's. Returns the
-    /// databases restored.
+    /// before, or when the agent's persisted ledger shows the check's
+    /// attachment to be of a new database life (an own attachment with a
+    /// higher id registered well before it, [`Ledger::new_life`]: the
+    /// maintainer's decision of 2026-11-01 on L3, instead of the trace's
+    /// watermark; it holds across stream and agent restarts, and the
+    /// evidence is forgotten once applied). Then the database's bindings
+    /// end, its own-attachment set, watermark, highest and seen ids and
+    /// learned floor are cleared. Returns the databases restored.
     pub(crate) fn apply_restores(&mut self) -> usize {
         let mut n = 0;
         for i in 0..self.s.databases.len().min(self.restore_facts.len()) {
@@ -719,8 +719,7 @@ impl Machine {
             let by_state = f.confirmed > seen;
             let by_id = f
                 .own_id
-                .zip(self.watermark.get(&i).copied())
-                .is_some_and(|(own, w)| own < w);
+                .is_some_and(|own| self.ledger.new_life(&d.attach, own));
             self.restores_seen.insert(d.attach.clone(), f.confirmed);
             if by_state || by_id {
                 self.restore_db(i, f.own_id);
@@ -759,7 +758,7 @@ impl Machine {
         self.gc_alone_since.remove(&db);
         if let Some(id) = own_id {
             self.ledger
-                .forget_closed_before(&self.s.databases[i].attach, id);
+                .forget_earlier_life(&self.s.databases[i].attach, id);
         }
         self.counts.restores += 1;
         tracing::info!(

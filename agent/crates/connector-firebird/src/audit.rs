@@ -856,6 +856,11 @@ pub(crate) async fn stream(
         }
         let polled;
         (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, sink).await?;
+        // R1 rule 5 (L3, L4): the ledger's evidence of a new database life
+        // is used once the first poll has restored a checkpoint (or found
+        // none), so a restore confirmed before this stream started is
+        // applied now, not to the state this stream builds later.
+        machine.apply_restores();
         let now = SystemTime::now();
         // Proofs 8 and 9 from this stream's deltas (review L2: a restarted
         // stream's counters start again at 0), and the gaps of proof 8

@@ -2439,17 +2439,46 @@ fn a_restore_confirmed_by_the_check_starts_the_attachments_again() {
     }
 }
 
-/// R1 rule 5, the other condition: the check attachment's
-/// `CURRENT_CONNECTION` below the watermark (the agent's first own
-/// attachment read in the run) is a restore. The ledger then forgets the
-/// earlier life's own attachments closed before the check's, so the run
-/// bound starts from the restored database's ids; an id at or above the
-/// watermark is no restore.
+/// R1 rule 5 by id from the persisted ledger (L3, maintainer decision of
+/// 2026-11-01): the check's own attachment 7 registered after an own
+/// attachment with a higher id (the earlier life's 480, registered more
+/// than the margin before) is of a new life: a restore, applied once (the
+/// evidence is forgotten with its credits, so the run bound starts from
+/// the restored database's ids). The case the watermark missed (4 then 7:
+/// the restore's own attachments consume ids) is caught the same way: the
+/// earlier life's own attachment 9 (above 7). The R7 case (concurrent own
+/// sessions of one life, registered out of id order within the margin)
+/// never fires.
 #[test]
-fn a_check_attachment_below_the_watermark_is_a_restore() {
+fn a_new_database_life_is_confirmed_from_the_ledger() {
+    let t0 = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let after = |s: u64| t0 + Duration::from_secs(s);
+    let acc = crate::conn::FetchAccount::default();
+    // The R7 case: 11 registered before 10, 1 s apart; then 12, 13.
     let ledger = Arc::new(Ledger::default());
-    let (head, printed) = now_head(0);
-    ledger.register_at(APP, 480, 40480, 24, printed);
+    ledger.register_at(APP, 11, 40011, 24, after(0));
+    ledger.register_at(APP, 10, 40010, 24, after(1));
+    ledger.register_at(APP, 12, 40012, 24, after(60));
+    assert!(!ledger.new_life(APP, 10));
+    assert!(!ledger.new_life(APP, 11));
+    assert!(!ledger.new_life(APP, 12));
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    m.restore_baseline(&[RestoreFacts::default()]);
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(10),
+    }]);
+    assert_eq!(m.counts.restores, 0, "never within one life");
+    // A new life: 480 then, 120 s and more later, 7.
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 480, 40480, 24, after(0));
+    ledger.credit(APP, 480, crate::sql::VERSION, None, acc);
+    ledger.register_at(APP, 7, 40007, 24, after(600));
+    assert!(ledger.new_life(APP, 7));
     let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
     m.confirm_run(Run {
         pid: 24,
@@ -2458,50 +2487,65 @@ fn a_check_attachment_below_the_watermark_is_a_restore() {
     m.restore_baseline(&[RestoreFacts::default()]);
     let cat = Cat;
     let cats: [&dyn Catalog; 1] = [&cat];
-    let own = "24:0x7f0000000100";
-    feed_h(
-        &head,
+    let now = Instant::now();
+    feed_raw(
         &mut m,
         &cats,
-        &attach_as(own, 480, "DATABASTION_AGENT"),
+        attach("24:0x7f0000000200", 470, APP).as_bytes(),
         0,
+        now,
     );
-    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
-    ledger.note_detach(APP, 480);
-    // A check at or above the watermark: no restore.
-    m.set_restore_facts(vec![RestoreFacts {
-        confirmed: 0,
-        own_id: Some(480),
-    }]);
-    assert_eq!(m.counts.restores, 0);
-    // The check of the restored database attached as id 7.
-    ledger.register_at(
-        APP,
-        7,
-        40007,
-        24,
-        std::time::SystemTime::now() + Duration::from_secs(1),
-    );
-    assert_eq!(ledger.latest_id(APP), Some(480));
     m.set_restore_facts(vec![RestoreFacts {
         confirmed: 0,
         own_id: Some(7),
     }]);
     assert_eq!(m.counts.restores, 1);
     assert_eq!(ledger.latest_id(APP), Some(7), "the earlier life forgotten");
-    // The restored database's attaches are in order again.
-    feed_h(
-        &head,
-        &mut m,
-        &cats,
-        &attach("24:0x7f0000000300", 8, APP),
-        1000,
-    );
-    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
-    // Applied once: the watermark is set again from the next own attach.
+    assert!(ledger.credits_left().is_empty(), "with its credits (L5)");
+    assert!(!ledger.new_life(APP, 7), "used once");
     m.set_restore_facts(vec![RestoreFacts {
         confirmed: 0,
         own_id: Some(7),
     }]);
+    assert_eq!(m.counts.restores, 1, "applied once");
+    // The restored database's attaches are in order again.
+    feed_raw(
+        &mut m,
+        &cats,
+        attach("24:0x7f0000000300", 8, APP).as_bytes(),
+        1000,
+        now,
+    );
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    // 4 then 7: the earlier life's own 9 (above 7) is the evidence.
+    let ledger = Ledger::default();
+    ledger.register_at(APP, 4, 40004, 24, after(0));
+    ledger.register_at(APP, 9, 40009, 24, after(10));
+    ledger.register_at(APP, 7, 40007, 24, after(900));
+    assert!(ledger.new_life(APP, 7));
+    // Within the margin: not (concurrent sessions of one life).
+    let ledger = Ledger::default();
+    ledger.register_at(APP, 9, 40009, 24, after(0));
+    ledger.register_at(APP, 7, 40007, 24, after(119));
+    assert!(!ledger.new_life(APP, 7));
+}
+
+/// L4: a restore the checks confirmed before a stream restart (counted
+/// in the new stream's baseline) is still caught by the new stream from
+/// the ledger's evidence, which only the application forgets.
+#[test]
+fn a_restore_confirmed_before_a_stream_restart_is_applied() {
+    let t0 = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 480, 40480, 24, t0);
+    ledger.register_at(APP, 7, 40007, 24, t0 + Duration::from_secs(600));
+    let facts = RestoreFacts {
+        confirmed: 1,
+        own_id: Some(7),
+    };
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.restore_baseline(&[facts]);
+    assert_eq!(m.apply_restores(), 1);
     assert_eq!(m.counts.restores, 1);
+    assert_eq!(m.apply_restores(), 0);
 }
