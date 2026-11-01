@@ -692,7 +692,10 @@ run_tests audit::tests::it_run_change FIREBIRD_IT_RUN_CHANGE_LOG="$WORK/run-chan
 # sources on the restarted server, with ExtConnPoolSize > 0 (pooled external connections):
 # a target with an ON CONNECT trigger (crm.fdb, the dev seed's), two caller sessions in turn on one
 # pooled target (app.fdb), and two calls in one caller transaction. it_audit::external_sources reads
-# the records: every external-source hold released with its caller, none failed or ambiguous.
+# the records and reports (a measurement): the pooled connection's return to the pool (an ALTER
+# SESSION RESET record outside any transaction, after the target's ON CONNECT trigger in its own
+# transaction) and its reuse with no ATTACH_DATABASE are shapes no accepted rule covers yet, so
+# they are ambiguous (fail closed).
 L3="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
 ext_call() { # caller database, target database, statements
   {
