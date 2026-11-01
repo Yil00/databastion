@@ -17,7 +17,8 @@
 //!   `peer_uid`, never a default. An agent in a container without
 //!   declared host files proves nothing.
 //! - [`process_start`] (R1 rule 1, R5): field 22 of `/proc/<pid>/stat`,
-//!   converted with the boot time and the clock ticks.
+//!   converted with the boot time and the clock ticks; a wall-clock start
+//!   later than now is no start (R60).
 //!
 //! No path or file content is logged or returned in an error.
 
@@ -201,7 +202,7 @@ pub(crate) fn identity(path: &Path) -> Option<((u64, u64), u64)> {
 /// `/proc/<pid>/stat` in clock ticks since boot, returned as the raw tick
 /// count (compared as is between samples) and as a wall-clock time (for
 /// the configuration files' times, proof 2). `None` when not visible.
-pub(crate) fn process_start(pid: u32) -> Option<(u64, SystemTime)> {
+pub(crate) fn process_start(pid: u32) -> Option<(u64, Option<SystemTime>)> {
     if !is_firebird(pid) {
         return None;
     }
@@ -222,8 +223,12 @@ pub(crate) fn process_start(pid: u32) -> Option<(u64, SystemTime)> {
 /// `e2e-firebird` Discovery failure with no finding). The result is moved
 /// [`START_MARGIN`] earlier, more than the ticks' and the centiseconds'
 /// cut together, so it is never later than the start (fail closed).
-/// `btime` is the fallback when `/proc/uptime` cannot be read.
-fn start_of(pid: u32) -> Option<(u64, SystemTime)> {
+/// `btime` is the fallback when `/proc/uptime` cannot be read. A start
+/// later than the time now (a virtualised `btime` with a virtualised
+/// `/proc/uptime`, ADR-0060 R60) gives no wall-clock time: the tick count
+/// still identifies the run, and the caller fails closed (proof 2 not
+/// proven).
+fn start_of(pid: u32) -> Option<(u64, Option<SystemTime>)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ticks = stat_start_ticks(&stat)?;
     let hz = rustix::param::clock_ticks_per_second().max(1);
@@ -241,7 +246,7 @@ fn start_of(pid: u32) -> Option<(u64, SystemTime)> {
     });
     let by_btime = btime.map(|b| SystemTime::UNIX_EPOCH + Duration::from_secs(b) + since_boot);
     let by_uptime = uptime.and_then(|up| started_at(now, up, since_boot));
-    Some((ticks, choose_start(by_uptime, by_btime)?))
+    Some((ticks, choose_start(by_uptime, by_btime, now)))
 }
 
 /// The start to use (security review M3 of round 2): the `/proc/uptime`
@@ -255,11 +260,16 @@ fn start_of(pid: u32) -> Option<(u64, SystemTime)> {
 /// files' times, written on the earlier clock, are then compared with a
 /// start on today's, which a step back makes look later: a residual of any
 /// wall-clock comparison, as before.
+///
+/// A start later than `now` (sampled before `/proc/uptime` and `/proc/stat`
+/// were read) by more than [`NOW_EPSILON`] cannot be the true start, which
+/// is never later than now: no start (ADR-0060 R60, virtualised clocks).
 pub(crate) fn choose_start(
     by_uptime: Option<SystemTime>,
     by_btime: Option<SystemTime>,
+    now: SystemTime,
 ) -> Option<SystemTime> {
-    match (by_uptime, by_btime) {
+    let start = match (by_uptime, by_btime) {
         (Some(u), Some(b)) => {
             let low = b.checked_sub(START_MARGIN).unwrap_or(b);
             let high = b + Duration::from_millis(1100);
@@ -267,8 +277,14 @@ pub(crate) fn choose_start(
         }
         (Some(u), None) => Some(u),
         (None, b) => b,
-    }
+    }?;
+    (start <= now + NOW_EPSILON).then_some(start)
 }
+
+/// How much later than the time now a computed start may lie before it is
+/// rejected: the reads of `/proc/uptime` and `/proc/stat` follow the
+/// sample of now, and neither computed start can pass it otherwise.
+pub(crate) const NOW_EPSILON: Duration = Duration::from_millis(10);
 
 /// How much earlier than measured a process start is taken: the tick
 /// (10 ms at 100 Hz) and `/proc/uptime`'s centisecond, each cut down, with
@@ -670,6 +686,7 @@ mod tests {
             .unwrap();
         let after = SystemTime::now();
         let (_, started) = super::start_of(child.id()).unwrap();
+        let started = started.unwrap();
         let _ = child.kill();
         let _ = child.wait();
         // Never later than the start (ticks are cut down: up to one tick
@@ -690,29 +707,60 @@ mod tests {
     fn a_late_uptime_start_gives_way_to_btime() {
         let b = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let ms = Duration::from_millis;
+        let now = b + ms(7_200_000);
+        let choose = |u, b| super::choose_start(u, b, now);
         // Within the window: the precise one.
-        assert_eq!(
-            super::choose_start(Some(b + ms(900)), Some(b)),
-            Some(b + ms(900))
-        );
-        assert_eq!(
-            super::choose_start(Some(b - ms(40)), Some(b)),
-            Some(b - ms(40))
-        );
+        assert_eq!(choose(Some(b + ms(900)), Some(b)), Some(b + ms(900)));
+        assert_eq!(choose(Some(b - ms(40)), Some(b)), Some(b - ms(40)));
         // Later than 1.1 s after `btime`'s start: `btime`'s.
-        assert_eq!(super::choose_start(Some(b + ms(1200)), Some(b)), Some(b));
-        assert_eq!(
-            super::choose_start(Some(b + ms(3_600_000)), Some(b)),
-            Some(b)
-        );
+        assert_eq!(choose(Some(b + ms(1200)), Some(b)), Some(b));
+        assert_eq!(choose(Some(b + ms(3_600_000)), Some(b)), Some(b));
         // Earlier than the window: the earlier, itself.
+        assert_eq!(choose(Some(b - ms(5000)), Some(b)), Some(b - ms(5000)));
+        assert_eq!(choose(None, Some(b)), Some(b));
+        assert_eq!(choose(Some(b), None), Some(b));
+        assert_eq!(choose(None, None), None);
+    }
+
+    /// ADR-0060 R60 (virtualised clocks): a computed start later than the
+    /// time now, beyond [`super::NOW_EPSILON`], is no start, whichever
+    /// source gave it; one within the epsilon is kept.
+    #[test]
+    fn a_start_later_than_now_is_rejected() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ms = Duration::from_millis;
+        let eps = super::NOW_EPSILON;
+        // `btime` alone, in the future.
+        assert_eq!(super::choose_start(None, Some(now + ms(1000)), now), None);
         assert_eq!(
-            super::choose_start(Some(b - ms(5000)), Some(b)),
-            Some(b - ms(5000))
+            super::choose_start(None, Some(now + eps + ms(1)), now),
+            None
         );
-        assert_eq!(super::choose_start(None, Some(b)), Some(b));
-        assert_eq!(super::choose_start(Some(b), None), Some(b));
-        assert_eq!(super::choose_start(None, None), None);
+        // Both in the future, the uptime one within `btime`'s window.
+        assert_eq!(
+            super::choose_start(Some(now + ms(5000)), Some(now + ms(4500)), now),
+            None
+        );
+        // Both in the future, apart: the earlier is still later than now.
+        assert_eq!(
+            super::choose_start(Some(now + ms(60_000)), Some(now + ms(5000)), now),
+            None
+        );
+        // A future `btime` with a past uptime start: the earlier, past one.
+        assert_eq!(
+            super::choose_start(Some(now - ms(5000)), Some(now + ms(3_600_000)), now),
+            Some(now - ms(5000))
+        );
+        // At now, and within the epsilon: kept.
+        assert_eq!(super::choose_start(None, Some(now), now), Some(now));
+        assert_eq!(
+            super::choose_start(None, Some(now + eps), now),
+            Some(now + eps)
+        );
+        assert_eq!(
+            super::choose_start(Some(now - ms(1)), None, now),
+            Some(now - ms(1))
+        );
     }
 
     #[test]

@@ -400,10 +400,18 @@ pub(crate) fn evaluate(
     let run = input
         .server_pid
         .map(|pid| (pid, crate::fsread::process_start(pid)));
-    let started = run.and_then(|(_, s)| s.map(|(_, t)| t));
+    let started = run.and_then(|(_, s)| s.and_then(|(_, t)| t));
     if started.is_none() {
-        // Proof 2: another pid namespace, or `hidepid`.
+        // Proof 2: another pid namespace, or `hidepid`; or a computed start
+        // later than now (R60: virtualised clocks), which proves nothing.
         not_eval.push("server_process_not_visible");
+        if run.is_some_and(|(_, s)| s.is_some()) {
+            detail.push(
+                "the Firebird server's computed start time is later than now (virtualised \
+                 clocks?): not bound to the running server"
+                    .to_owned(),
+            );
+        }
     }
     let changed = |t: SystemTime| started.is_none_or(|s| t > s);
     // firebird.conf (M3).
