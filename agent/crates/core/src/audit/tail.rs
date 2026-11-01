@@ -770,6 +770,20 @@ pub struct ReplayFrom {
     pub replay: Replay,
 }
 
+/// The saved position a tailer resumed from when it opened its file
+/// ([`Tailer::take_resumed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resumed {
+    /// Device and inode of the file.
+    pub file: (u64, u64),
+    /// The saved offset reading resumed at.
+    pub offset: u64,
+    /// The cursor's keyed fingerprints were checked and matched under the
+    /// current agent key (not a positions-only check: an older cursor, a
+    /// cursor of another key, or no key).
+    pub verified: bool,
+}
+
 /// Why the log could not be read (kind only; never a path or content).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailError {
@@ -812,6 +826,9 @@ pub struct Tailer {
     store: Option<CursorStore>,
     /// Replay found in the cursor at open, until taken.
     replay: Option<ReplayFrom>,
+    /// The saved position the tailer resumed from at open, until taken
+    /// (see [`Self::take_resumed`]).
+    resumed: Option<Resumed>,
     /// Oversized records seen (skipped).
     pub oversized: u64,
     /// Rotations or truncations seen.
@@ -973,6 +990,7 @@ impl Tailer {
             splitter: Splitter::new(framing),
             store,
             replay: None,
+            resumed: None,
             oversized: 0,
             rotations: 0,
             ended: None,
@@ -1036,6 +1054,11 @@ impl Tailer {
                 // tailer saves: ignored, as before.
                 c.replay = c.replay.filter(|r| r.end >= c.offset);
                 if self.cursor_intact(&file, len, &c) {
+                    self.resumed = Some(Resumed {
+                        file: (dev, ino),
+                        offset: c.offset,
+                        verified: self.cursor_verified(&c),
+                    });
                     self.replay = c.replay.map(|replay| ReplayFrom {
                         file: (dev, ino),
                         replay,
@@ -1089,6 +1112,17 @@ impl Tailer {
         self.file = Some((file, dev, ino));
         self.offset = start;
         Ok(())
+    }
+
+    /// Whether the intact cursor `c` was checked by its keyed fingerprints
+    /// (every position it saves fingerprinted, under the current key).
+    fn cursor_verified(&self, c: &Cursor) -> bool {
+        let Some(key) = self.store.as_ref().and_then(CursorStore::tag_key) else {
+            return false;
+        };
+        c.kid.as_deref() == Some(key_id(key).as_str())
+            && c.fp.is_some()
+            && (c.replay.is_none() || c.end_fp.is_some())
     }
 
     /// Whether the saved cursor `c` of the open file (same inode, length
@@ -1285,6 +1319,16 @@ impl Tailer {
     /// (once).
     pub fn take_replay(&mut self) -> Option<ReplayFrom> {
         self.replay.take()
+    }
+
+    /// The saved position the tailer resumed from when it opened its file
+    /// (known after the first poll), once: `None` when it did not resume
+    /// from a saved cursor (first start, a file rotated or rewritten while
+    /// the agent was stopped, a cursor reset). A source that keeps state
+    /// bound to its saved position (the Firebird parser checkpoint) uses
+    /// that state only when it is bound to exactly this position.
+    pub fn take_resumed(&mut self) -> Option<Resumed> {
+        self.resumed.take()
     }
 
     /// Saves a cursor that holds nothing back: [`Self::commit`] when the
@@ -1557,6 +1601,46 @@ mod tests {
 
     fn saved(store: &CursorStore) -> Cursor {
         serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap()
+    }
+
+    /// `take_resumed`: the saved position a restart resumed from, verified
+    /// by its fingerprints; none after a reset, and none at a first start.
+    #[test]
+    fn a_restart_tells_the_position_it_resumed_from() {
+        let d = Dir::new("resumed");
+        let log = d.0.join("server_audit.log");
+        append(&log, "history\n");
+        let key = tag_key(9);
+        let store =
+            || CursorStore::new(&d.0, "t", "server_audit").map(|s| s.with_tag_key(key.clone()));
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        assert!(t.poll().unwrap().records.is_empty());
+        assert_eq!(t.take_resumed(), None, "a first start resumes from nothing");
+        append(&log, "a1\nb1\n");
+        let p = t.poll().unwrap();
+        t.commit_from(&[(0, p.positions[1])]);
+        drop(t);
+        let mut t = Tailer::new(log.clone(), Framing::Lines, store());
+        assert_eq!(lines(t.poll().unwrap()), ["b1"]);
+        let r = t.take_resumed().unwrap();
+        assert_eq!(r.offset, 11);
+        assert!(r.verified);
+        assert_eq!(t.take_resumed(), None, "once");
+        t.commit();
+        drop(t);
+        // Without the key: positions only, not verified.
+        let mut t = Tailer::new(
+            log.clone(),
+            Framing::Lines,
+            CursorStore::new(&d.0, "t", "server_audit"),
+        );
+        let _ = t.poll().unwrap();
+        assert!(!t.take_resumed().unwrap().verified);
+        drop(t);
+        copytruncate(&log, "n1 xxxxxxxxxxxxxxxxxxxxx\n");
+        let mut t = Tailer::new(log, Framing::Lines, store());
+        let _ = t.poll().unwrap();
+        assert_eq!(t.take_resumed(), None, "a reset resumes from nothing");
     }
 
     #[test]

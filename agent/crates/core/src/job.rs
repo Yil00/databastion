@@ -978,6 +978,25 @@ impl AuditConfig {
         crate::audit::CursorStore::counters(self.state_dir.as_deref()?, &self.target_id, name)
     }
 
+    /// The persisted checkpoint `name` (`[a-z0-9_.-]`) of this target: a
+    /// `0600` file under `<state_dir>/audit/` (see
+    /// [`crate::audit::CursorStore::checkpoint`]), with the agent key's
+    /// sub-key for what the source keys or authenticates in it. Never part
+    /// of the stream's read position. `None` without a state directory
+    /// (tests) or for an invalid name.
+    #[must_use]
+    pub fn checkpoint(&self, name: &str) -> Option<crate::audit::CursorStore> {
+        let store = crate::audit::CursorStore::checkpoint(
+            self.state_dir.as_deref()?,
+            &self.target_id,
+            name,
+        )?;
+        Some(match &self.tag_key {
+            Some(key) => store.with_tag_key(std::sync::Arc::clone(key)),
+            None => store,
+        })
+    }
+
     /// The core's registry of the cursors this stream uses, and its
     /// request after panics (isolation mode, one record to skip at the
     /// exact position it panicked at; see
