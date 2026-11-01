@@ -1149,6 +1149,126 @@ async fn the_lot_3_texts_and_the_ledger() {
     s.close().await;
 }
 
+/// R30 item 3 (ADR-0060 R60): `check()`'s linger read, as the minimal
+/// account with no grant on the database: 0 on a database whose linger was
+/// never set (`RDB$LINGER` NULL), 7 on `linger.fdb` (`dev/firebird/it.sh`
+/// sets `LINGER TO 7` there, outside the trace and the dev seed).
+#[tokio::test]
+async fn the_linger_on_the_server() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    for (db, want) in [
+        (attach(), Some(0)),
+        ("/var/lib/firebird/data/linger.fdb".to_owned(), Some(7)),
+    ] {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut s = crate::conn::connect(
+            &endpoint,
+            password.as_bytes(),
+            &db,
+            deadline,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        crate::check::prepare(&mut s, false, deadline)
+            .await
+            .unwrap();
+        let state = crate::check::read_db_state(&mut s, deadline).await.unwrap();
+        eprintln!(
+            "[measure] linger read by the minimal account: {:?}",
+            state.linger
+        );
+        assert_eq!(state.linger, want, "{db}");
+        s.close().await;
+    }
+}
+
+/// R1 rule 5 (ADR-0060 R60, measurement 8d as `check()` reads it): the
+/// restore state of `restore.fdb` and the attachment id, as the minimal
+/// account. `dev/firebird/it.sh` runs phase 1, then restores the database
+/// with `gbak -rep` through the services API, then phase 2, which finds
+/// another `DB_GUID` and creation date (and reports whether the
+/// attachment id is below phase 1's). Between the phases only a hash of the state and the id are kept
+/// (`FIREBIRD_IT_RESTORE_FILE`, in the run's 0700 directory).
+async fn restore_state_phase(phase: u8) {
+    let Ok(file) = std::env::var("FIREBIRD_IT_RESTORE_FILE") else {
+        return;
+    };
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        "/var/lib/firebird/data/restore.fdb",
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    crate::check::prepare(&mut s, false, deadline)
+        .await
+        .unwrap();
+    let st = crate::check::read_db_state(&mut s, deadline).await.unwrap();
+    s.close().await;
+    let r = st.restore.expect("the restore state is readable");
+    let own = st.own_id.expect("the attachment id");
+    let hash = |v: &str| {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        v.hash(&mut h);
+        h.finish()
+    };
+    let now = format!("{} {} {own}", hash(&r.guid), hash(&r.created));
+    if phase == 1 {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file)
+            .unwrap()
+            .write_all(now.as_bytes())
+            .unwrap();
+        return;
+    }
+    let before = std::fs::read_to_string(&file).unwrap();
+    let b: Vec<&str> = before.split(' ').collect();
+    let a: Vec<&str> = now.split(' ').collect();
+    let (guid, created) = (a[0] != b[0], a[1] != b[1]);
+    let lower = a[2].parse::<u64>().unwrap() < b[2].parse::<u64>().unwrap();
+    eprintln!(
+        "[measure] restore (gbak -rep): DB_GUID changed {guid}, creation date changed {created}, \
+         attachment id lower {lower} ({} then {})",
+        b[2], a[2]
+    );
+    // R1 rule 5 confirms a restore from either change. The attachment id
+    // below the watermark is the other, sufficient condition: the restore's
+    // own attachments consume ids, so on a young database (phase 1 at id 4)
+    // the next id can be above the earlier life's (measured: 7).
+    assert!(guid && created, "R1 rule 5 as the ADR states it");
+}
+
+#[tokio::test]
+async fn restore_state_phase_1() {
+    restore_state_phase(1).await;
+}
+
+#[tokio::test]
+async fn restore_state_phase_2() {
+    restore_state_phase(2).await;
+}
+
 /// The engine-matrix own-statement test of R20, phase 1 (`dev/firebird/
 /// it.sh` runs it before it copies the server's trace log): `check()` and a
 /// Discovery scan of the main database as the agent account, then the
@@ -1187,6 +1307,8 @@ async fn own_reads_for_the_matrix() {
         .await
         .unwrap();
     crate::views::read(&mut s, deadline).await.unwrap();
+    // R30 item 3 (R20: its row of the own-statement table).
+    crate::check::read_db_state(&mut s, deadline).await.unwrap();
     let _ = s
         .query(
             crate::sql::READ_BACK_PROBE,

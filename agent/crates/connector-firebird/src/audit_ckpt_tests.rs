@@ -1320,6 +1320,8 @@ fn catalog(views: &[&str], dependent: &[&str], external: &[&str]) -> Classes {
             routines: Default::default(),
             complete: true,
         },
+        linger: None,
+        restore: None,
     }
 }
 
@@ -1520,6 +1522,145 @@ fn a_restore_while_stopped_invalidates_the_re_read() {
     );
     assert_eq!(k.invalidated, 1);
     assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+}
+
+/// ADR-0060 R60: the linger joins the digest (it sets the Garbage
+/// Collector's expected end, R30 item 3). A linger changed while the agent
+/// was stopped invalidates the re-read; the same linger, or none read
+/// twice, does not.
+#[test]
+fn a_linger_changed_while_stopped_invalidates_the_re_read() {
+    let c = |l: Option<u32>| catalog(&[], &[], &[]).with_linger(l);
+    let (k, out) = restart_with_catalogs("digest-linger", c(Some(0)), c(Some(15)));
+    assert_eq!((k.restored, k.invalidated), (1, 1));
+    assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+    let (k, _) = restart_with_catalogs("digest-linger-read", c(None), c(Some(0)));
+    assert_eq!((k.restored, k.invalidated), (1, 1), "a linger read since");
+    for l in [None, Some(0), Some(15)] {
+        let (k, out) = restart_with_catalogs("digest-linger-same", c(l), c(l));
+        assert_eq!((k.restored, k.invalidated), (1, 0), "{l:?}");
+        assert_eq!(marked(&out, "ORDERS"), Some(false), "{:?}", objects(&out));
+    }
+    let key = key();
+    assert_ne!(c(Some(1)).digest(&key), c(Some(2)).digest(&key));
+    assert_ne!(c(None).digest(&key), c(Some(0)).digest(&key));
+}
+
+/// ADR-0060 R60: R1 rule 5's restore state joins the digest. A database
+/// restored while the agent was stopped from a backup with the same
+/// schema (same catalog, another `DB_GUID` and creation date) invalidates
+/// the re-read; the same restore state does not.
+#[test]
+fn a_restore_with_the_same_schema_while_stopped_invalidates_the_re_read() {
+    let state = |g: &str| crate::check::RestoreState {
+        guid: g.to_owned(),
+        created: format!("2026-11-01 14:16:12.{g} UTC"),
+    };
+    let c = |r: Option<crate::check::RestoreState>| catalog(&[], &[], &[]).with_restore(r);
+    let (k, out) = restart_with_catalogs(
+        "digest-restore-state",
+        c(Some(state("1"))),
+        c(Some(state("2"))),
+    );
+    assert_eq!((k.restored, k.invalidated), (1, 1));
+    assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+    assert_eq!(marked(&out, "PAYROLL"), Some(true), "{:?}", objects(&out));
+    let (k, out) = restart_with_catalogs(
+        "digest-restore-same",
+        c(Some(state("1"))),
+        c(Some(state("1"))),
+    );
+    assert_eq!((k.restored, k.invalidated), (1, 0));
+    assert_eq!(marked(&out, "ORDERS"), Some(false), "{:?}", objects(&out));
+    let key = key();
+    assert_ne!(c(None).digest(&key), c(Some(state("1"))).digest(&key));
+    let other_date = crate::check::RestoreState {
+        created: "2026-11-02 00:00:00.0000 UTC".to_owned(),
+        ..state("1")
+    };
+    assert_ne!(
+        c(Some(state("1"))).digest(&key),
+        c(Some(other_date)).digest(&key)
+    );
+}
+
+/// R1 rule 5 across an agent restart (L3): the persisted ledger, restored
+/// with the checkpoint, holds the agent's own attachment 3 of the
+/// database's earlier life; the check after the restart attached as id 1
+/// more than the margin later, below 3: the database was restored while
+/// the agent was stopped. Its attachments start again at the checkpoint's
+/// restore: a new attachment with id 3 (a duplicate of the earlier life's)
+/// is not ambiguous. With the check's id above every earlier own one,
+/// nothing is restored and the duplicate is ambiguous, as before (R1 rule
+/// 3).
+#[test]
+fn a_restore_while_stopped_is_confirmed_from_the_ledger() {
+    for restored in [false, true] {
+        let dir = temp(if restored {
+            "restore-wm"
+        } else {
+            "restore-wm-no"
+        });
+        first_start(&dir);
+        let (head, opened) = now_head(3600);
+        let ledger = Arc::new(Ledger::default());
+        ledger.register_at(APP, 3, 40003, 24, opened);
+        own_credits(&ledger, opened, 1);
+        let a = "24:0x7f0000000100";
+        let first = format!(
+            "{}{}",
+            attach_as(a, 3, AGENT),
+            stmt(
+                a,
+                3,
+                5,
+                AGENT,
+                crate::sql::VERSION,
+                1,
+                &[("RDB$DATABASE", 1)]
+            )
+        )
+        .replace(HEAD, &head);
+        append(
+            &dir,
+            &format!("{first}{}{}", detach_as(&head, a, 3, AGENT), fini(&head, a)),
+        );
+        let mut p = Proc::start(&dir, Arc::clone(&ledger));
+        p.read();
+        p.spooled();
+        p.commit();
+        assert_eq!(p.m.counts.ambiguous, 0, "{:?}", p.m.why);
+        assert!(p.m.counts.own > 0);
+        drop(p);
+        let b = "24:0x7f0000000300";
+        let next = format!("{}{}", attach(b, 3, APP), select(b, 3, 7, APP, "ORDERS", 1))
+            .replace(HEAD, &head);
+        append(&dir, &next);
+        let l2 = Arc::new(Ledger::default());
+        let own = if restored { 1 } else { 9 };
+        // Registered well after the earlier life's attachment (the margin
+        // of `Ledger::new_life`).
+        l2.register_at(
+            APP,
+            own,
+            40000 + u16::try_from(own).unwrap(),
+            24,
+            opened + Duration::from_secs(600),
+        );
+        let mut p = Proc::start(&dir, l2);
+        // The facts the first check after the restart gave the stream.
+        p.m.restore_baseline(&[crate::stream::RestoreFacts {
+            confirmed: 0,
+            own_id: Some(own),
+        }]);
+        p.read();
+        let (c, k) = p.counts();
+        assert_eq!(k.restored, 1, "the checkpoint is used");
+        assert_eq!(c.restores, u64::from(restored));
+        assert_eq!(c.ambiguous > 0, !restored, "{:?}", p.m.why);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The invalidation of a re-read goes on in the next checkpoint: a second

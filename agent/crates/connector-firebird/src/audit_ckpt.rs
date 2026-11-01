@@ -516,6 +516,11 @@ impl Checkpointer {
                 let credits = l.ledger.map_or(0, |s| {
                     self.ledger.restore(s, &attaches, (l.body.file, l.body.pos))
                 });
+                // R1 rule 5 (L3): a database restored while the agent was
+                // stopped (the persisted ledger, now restored, shows the
+                // check's attachment to be of a new life) starts its
+                // attachments again.
+                m.apply_restores();
                 self.restored = l.body.dedup.iter().copied().collect();
                 m.set_suppress(self.restored.clone());
                 self.counts.restored += 1;

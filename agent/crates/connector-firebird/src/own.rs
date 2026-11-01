@@ -215,6 +215,25 @@ fn same_text(t: &Text, text: &str, key: Option<&LocalTagKey>) -> bool {
     }
 }
 
+/// R1 rule 5 (L3): the margin of [`Ledger::new_life`], above the time a
+/// session can take from the server's attach to its registration (three
+/// statements under the longest statement timeout, 30 s each, and the
+/// connection's own margin).
+pub(crate) const NEW_LIFE_MARGIN: Duration = Duration::from_secs(120);
+
+fn opened_of(s: &State, attach: &str, id: u64) -> Option<SystemTime> {
+    s.attachments
+        .iter()
+        .find(|a| a.attach == attach && a.id == id)
+        .map(|a| a.opened)
+}
+
+/// An own attachment of `attach` that shows `id` (registered at `at`) to be
+/// of a new life: a higher id registered more than the margin earlier.
+fn earlier_life(a: &Attachment, attach: &str, id: u64, at: SystemTime) -> bool {
+    a.attach == attach && a.id > id && a.opened + NEW_LIFE_MARGIN < at
+}
+
 /// A record's position: the log file's `(st_dev, st_ino)` and the offset
 /// of its first byte.
 pub(crate) type RecordAt = ((u64, u64), u64);
@@ -544,6 +563,56 @@ impl Ledger {
             .filter(|a| a.attach == attach)
             .map(|a| a.id)
             .max()
+    }
+
+    /// R1 rule 5 by attachment id (maintainer decision of 2026-11-01, L3):
+    /// whether the agent's own attachment `id` of `attach` belongs to a new
+    /// database life. Within one life the server hands out attachment ids
+    /// in order, so an own attachment with a higher id registered more than
+    /// [`NEW_LIFE_MARGIN`] before `id` was registered (a later attachment
+    /// with a lower id) can only be of an earlier life. The margin covers
+    /// the time between the server's attach and the session's registration
+    /// (three statements of the session, each under its statement timeout),
+    /// so concurrent own sessions of one life never satisfy it. From the
+    /// persisted ledger: it holds across stream and agent restarts.
+    pub(crate) fn new_life(&self, attach: &str, id: u64) -> bool {
+        let s = self.state();
+        let Some(at) = opened_of(&s, attach, id) else {
+            return false;
+        };
+        s.attachments
+            .iter()
+            .any(|a| earlier_life(a, attach, id, at))
+    }
+
+    /// R1 rule 5, a confirmed restore: the own attachments that show the
+    /// earlier life ([`Self::new_life`]: a higher id registered before the
+    /// margin) are forgotten with their credits, consumed ones included, so
+    /// that the run bound starts again from the restored database's ids and
+    /// the evidence is used once. Without attachment `id`, nothing is
+    /// forgotten.
+    pub(crate) fn forget_earlier_life(&self, attach: &str, id: u64) {
+        let mut s = self.state();
+        let Some(at) = opened_of(&s, attach, id) else {
+            return;
+        };
+        let gone: std::collections::HashSet<u64> = s
+            .attachments
+            .iter()
+            .filter(|a| earlier_life(a, attach, id, at))
+            .map(|a| a.id)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        s.attachments
+            .retain(|a| a.attach != attach || !gone.contains(&a.id));
+        s.credits
+            .retain(|c| c.attach != attach || !gone.contains(&c.id));
+        s.consumed
+            .retain(|(_, c)| c.attach != attach || !gone.contains(&c.id));
+        drop(s);
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The server pid the agent's attachments saw last (R1 rule 1).

@@ -120,8 +120,24 @@ const HOLD_TIME: Duration = Duration::from_secs(10);
 /// The largest change of a confirmed clock offset a credited record other
 /// than the read-back probe may make (one hour: a daylight-saving change).
 const OFFSET_STEP: i64 = 3600;
-/// R30 item 3: the Garbage Collector's expected end.
+/// R30 item 3: the Garbage Collector's expected end after the last other
+/// binding of its database ends, past the database's linger when the last
+/// check read one above 0 (with no linger, or the linger not known, this
+/// alone: a later record of the Garbage Collector is ambiguous, loud).
 const GC_END: Duration = Duration::from_secs(10);
+
+/// The longest linger taken as known (24 h, review N2); a longer one is
+/// not known (the 10 s bound, fail closed).
+pub(crate) const MAX_LINGER: u32 = 24 * 3600;
+
+/// R30 item 3: the Garbage Collector's expected end for a database whose
+/// last check read the linger `linger` (seconds).
+pub(crate) fn gc_end(linger: Option<u32>) -> Duration {
+    match linger {
+        Some(l) if l > 0 && l <= MAX_LINGER => GC_END + Duration::from_secs(u64::from(l)),
+        _ => GC_END,
+    }
+}
 
 /// The names one declared database can be printed under (R2 rule 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +154,17 @@ pub(crate) struct DeclaredNames {
     pub(crate) attach: String,
     /// When the last check's catalog read of it started (R41 item 8).
     pub(crate) read_at: Option<SystemTime>,
+}
+
+/// What the last `check()` gives the stream for R1 rule 5, per declared
+/// database (the order of [`Settings::databases`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RestoreFacts {
+    /// Restores the checks of this process confirmed from a changed
+    /// `DB_GUID` or `MON$CREATION_DATE` (a count).
+    pub(crate) confirmed: u64,
+    /// The check attachment's `CURRENT_CONNECTION`.
+    pub(crate) own_id: Option<u64>,
 }
 
 /// Database identity (R1 rule 3).
@@ -434,6 +461,8 @@ pub(crate) struct Counts {
     /// block or count matched no credit's own-statement table row (the
     /// engine-matrix test of R20 expects none).
     pub(crate) own_not_matched: u64,
+    /// Restores confirmed by `check()` and applied (R1 rule 5).
+    pub(crate) restores: u64,
 }
 
 /// The stream's settings.
@@ -577,6 +606,10 @@ pub(crate) struct Machine {
     /// every relation counts as dependent for the records re-read before
     /// that process's read end, `(database, file, end)`.
     reread_invalid: Vec<(usize, (u64, u64), u64)>,
+    /// R1 rule 5: the last check's restore facts, and per declared
+    /// `attach` the confirmed-restore count already applied.
+    restore_facts: Vec<RestoreFacts>,
+    restores_seen: HashMap<String, u64>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -642,7 +675,104 @@ impl Machine {
             unkeyed: false,
             suppress_cleared: false,
             reread_invalid: Vec::new(),
+            restore_facts: Vec::new(),
+            restores_seen: HashMap::new(),
         }
+    }
+
+    /// R1 rule 5, at the stream's start: the restores the checks confirmed
+    /// before it are not applied again (the stream starts with no state, or
+    /// with a checkpoint's, which the watermark rule covers).
+    pub(crate) fn restore_baseline(&mut self, facts: &[RestoreFacts]) {
+        self.restores_seen = self
+            .s
+            .databases
+            .iter()
+            .zip(facts)
+            .map(|(d, f)| (d.attach.clone(), f.confirmed))
+            .collect();
+        self.restore_facts = facts.to_vec();
+    }
+
+    /// R1 rule 5: a new check's restore facts, applied at once.
+    pub(crate) fn set_restore_facts(&mut self, facts: Vec<RestoreFacts>) {
+        self.restore_facts = facts;
+        self.apply_restores();
+    }
+
+    /// R1 rule 5: restores are recognised from `check()` only, never from
+    /// a log record. A declared database is restored when a check of this
+    /// process read another `DB_GUID` or `MON$CREATION_DATE` than the one
+    /// before, or when the agent's persisted ledger shows the check's
+    /// attachment to be of a new database life (an own attachment with a
+    /// higher id registered well before it, [`Ledger::new_life`]: the
+    /// maintainer's decision of 2026-11-01 on L3, instead of the trace's
+    /// watermark; it holds across stream and agent restarts, and the
+    /// evidence is forgotten once applied). Then the database's bindings
+    /// end, its own-attachment set, watermark, highest and seen ids and
+    /// learned floor are cleared, its DDL waits end, and its dependent sets
+    /// are invalidated until the next check. Returns the databases restored.
+    pub(crate) fn apply_restores(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..self.s.databases.len().min(self.restore_facts.len()) {
+            let f = self.restore_facts[i];
+            let d = &self.s.databases[i];
+            if d.excluded {
+                continue;
+            }
+            let seen = self.restores_seen.get(&d.attach).copied().unwrap_or(0);
+            let by_state = f.confirmed > seen;
+            let by_id = f
+                .own_id
+                .is_some_and(|own| self.ledger.new_life(&d.attach, own));
+            self.restores_seen.insert(d.attach.clone(), f.confirmed);
+            if by_state || by_id {
+                self.restore_db(i, f.own_id);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// R1 rule 5: a confirmed restore of declared database `i`.
+    fn restore_db(&mut self, i: usize, own_id: Option<u64>) {
+        let db = DbId::Declared(i);
+        let keys: Vec<Key> = self
+            .bindings
+            .keys()
+            .filter(|k| k.0 == db)
+            .copied()
+            .collect();
+        for k in keys {
+            self.end_binding(k);
+        }
+        // Its DDL transactions and waits end with its bindings (as at a
+        // run's end and an eviction, re-review L-5; review L1).
+        self.ddl_open.retain(|(k, _), _| k.0 != db);
+        for w in self.ddl_wait.values_mut() {
+            w.retain(|p| p.key().0 != db);
+        }
+        self.ddl_wait.retain(|_, w| !w.is_empty());
+        // Review L2: the records between the read position and the real
+        // restore point are of the earlier life, judged with this check's
+        // sets: invalidated until the next check, whatever was open.
+        self.invalidate(i, SystemTime::now());
+        self.watermark.remove(&i);
+        self.highest.remove(&db);
+        if let Some(seen) = self.seen_ids.remove(&db) {
+            self.seen_total = self.seen_total.saturating_sub(seen.order.len());
+        }
+        self.learned_floor.remove(&db);
+        self.gc_alone_since.remove(&db);
+        if let Some(id) = own_id {
+            self.ledger
+                .forget_earlier_life(&self.s.databases[i].attach, id);
+        }
+        self.counts.restores += 1;
+        tracing::info!(
+            database = i,
+            "Firebird declared database restored (R1 rule 5): its attachments start again"
+        );
     }
 
     /// The suppressed positions the read has passed are dropped: those
@@ -830,6 +960,27 @@ impl Machine {
     #[cfg(test)]
     pub(crate) fn all_relations_for_tests(&self, db: usize) -> bool {
         self.all_relations.contains(&db)
+    }
+
+    /// Test support: a DDL wait on database `db` for a binding of it.
+    #[cfg(test)]
+    pub(crate) fn fill_ddl_wait_for_tests(&mut self, db: usize) {
+        self.ddl_wait
+            .entry(db)
+            .or_default()
+            .insert(Pend::Binding((DbId::Declared(db), 50)));
+    }
+
+    /// Test support: the databases with a DDL wait.
+    #[cfg(test)]
+    pub(crate) fn ddl_wait_len_for_tests(&self) -> usize {
+        self.ddl_wait.len()
+    }
+
+    /// Test support: whether `db`'s dependent sets are invalidated.
+    #[cfg(test)]
+    pub(crate) fn views_invalid_for_tests(&self, db: usize) -> bool {
+        self.views_invalid.contains(&db)
     }
 
     /// Test support: the DDL transactions tracked.
@@ -1754,10 +1905,14 @@ impl Machine {
         if self.hold_since.is_some() && !self.groups.iter().any(Group::blockless) {
             self.release(false, out);
         }
+        let linger = |d: &DbId| match d {
+            DbId::Declared(i) => cat.get(*i).and_then(|c| c.linger()),
+            DbId::Undeclared(_) => None,
+        };
         let gone: Vec<DbId> = self
             .gc_alone_since
             .iter()
-            .filter(|(_, t)| now.duration_since(**t) > GC_END)
+            .filter(|(d, t)| now.duration_since(**t) > gc_end(linger(d)))
             .map(|(d, _)| *d)
             .collect();
         for d in gone {
@@ -1836,6 +1991,10 @@ impl Catalog for Invalidated<'_> {
 
     fn computed(&self, relation: &str) -> bool {
         self.inner.computed(relation)
+    }
+
+    fn linger(&self) -> Option<u32> {
+        self.inner.linger()
     }
 }
 

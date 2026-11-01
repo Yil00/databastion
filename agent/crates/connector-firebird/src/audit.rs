@@ -75,6 +75,16 @@ pub(crate) struct DbFacts {
     /// read started after every DDL transaction's end clears the
     /// invalidation).
     pub(crate) read_at: Option<SystemTime>,
+    /// The linger, the restore state and the check attachment's id (R30
+    /// item 3, R1 rule 5).
+    pub(crate) state: crate::check::DbState,
+    /// Restores the checks of this process confirmed for this database from
+    /// a changed `DB_GUID` or `MON$CREATION_DATE` (R1 rule 5), counted by
+    /// [`evaluate`].
+    pub(crate) restores: u64,
+    /// The last restore state read (kept across a check whose read
+    /// failed, so the next one is compared with it).
+    pub(crate) restore_seen: Option<crate::check::RestoreState>,
 }
 
 /// The relation classes of one database's catalog read (decision 5's
@@ -86,6 +96,10 @@ pub(crate) struct Classes {
     complete: bool,
     /// The views that depend on an always-reported relation (R12 item 5).
     deps: crate::views::ViewDeps,
+    /// The database's linger in seconds (R30 item 3), `None` when not read.
+    linger: Option<u32>,
+    /// The restore state of R1 rule 5, `None` when not read.
+    restore: Option<crate::check::RestoreState>,
 }
 
 impl Classes {
@@ -113,7 +127,23 @@ impl Classes {
             user,
             complete: !c.relations_cut && c.relations_dropped == 0,
             deps,
+            linger: None,
+            restore: None,
         }
+    }
+
+    /// With the restore state the check read (R1 rule 5).
+    #[must_use]
+    pub(crate) fn with_restore(mut self, restore: Option<crate::check::RestoreState>) -> Self {
+        self.restore = restore;
+        self
+    }
+
+    /// With the linger the check read (R30 item 3).
+    #[must_use]
+    pub(crate) fn with_linger(mut self, linger: Option<u32>) -> Self {
+        self.linger = linger;
+        self
     }
 }
 
@@ -125,7 +155,11 @@ impl Classes {
     /// relations classed as external-file tables (the block-blind set of
     /// R28) and as views; the dependent set of R41 (dependent objects,
     /// tables with a computed column and whether the columns were read,
-    /// routine names, whether those reads were complete). Names are sorted;
+    /// routine names, whether those reads were complete); the linger of R30
+    /// item 3 and the restore state of R1 rule 5 (`DB_GUID` and
+    /// `MON$CREATION_DATE`: ADR-0060 R60, so that a database restored while
+    /// the agent was stopped, from a backup with the same schema, is
+    /// invalidated at the restore). Names are sorted;
     /// only the tag is kept. Any relation class or check result the stream
     /// comes to use beyond these must join the digest.
     pub(crate) fn digest(&self, key: &databastion_classifiers::masking::LocalTagKey) -> [u8; 32] {
@@ -152,6 +186,12 @@ impl Classes {
         w.bool(self.deps.computed_known);
         set(&mut w, &mut self.deps.routines.iter());
         w.bool(self.deps.complete);
+        w.opt_u64(self.linger.map(u64::from));
+        w.bool(self.restore.is_some());
+        if let Some(r) = &self.restore {
+            w.str(&r.guid);
+            w.str(&r.created);
+        }
         crate::ckpt::tag(
             key,
             b"databastion.firebird.checkpoint.check_digest.v1",
@@ -212,6 +252,10 @@ impl Catalog for Classes {
     /// R41 item 6: any identifier token equal to a dependent object's name.
     fn dependent_token(&self, name: &str) -> bool {
         self.deps.dependent.contains(name.trim_end_matches(' '))
+    }
+
+    fn linger(&self) -> Option<u32> {
+        self.linger
     }
 }
 
@@ -281,6 +325,8 @@ impl std::fmt::Debug for Classes {
             .field("complete", &self.complete)
             .field("dependent_views", &self.deps.dependent.len())
             .field("dependencies_complete", &self.deps.complete)
+            .field("linger", &self.linger)
+            .field("restore", &self.restore.is_some())
             .finish()
     }
 }
@@ -400,10 +446,18 @@ pub(crate) fn evaluate(
     let run = input
         .server_pid
         .map(|pid| (pid, crate::fsread::process_start(pid)));
-    let started = run.and_then(|(_, s)| s.map(|(_, t)| t));
+    let started = run.and_then(|(_, s)| s.and_then(|(_, t)| t));
     if started.is_none() {
-        // Proof 2: another pid namespace, or `hidepid`.
+        // Proof 2: another pid namespace, or `hidepid`; or a computed start
+        // later than now (R60: virtualised clocks), which proves nothing.
         not_eval.push("server_process_not_visible");
+        if run.is_some_and(|(_, s)| s.is_some()) {
+            detail.push(
+                "the Firebird server process has no wall-clock start (unreadable or later than \
+                 now): not bound to the running server"
+                    .to_owned(),
+            );
+        }
     }
     let changed = |t: SystemTime| started.is_none_or(|s| t > s);
     // firebird.conf (M3).
@@ -595,6 +649,7 @@ pub(crate) fn evaluate(
         if !fresh {
             notes.add(TargetNote::new(NoteCode::AuditPartialPendingFirstRecord));
         }
+        count_restores(&t.dbs, &mut dbs);
         t.dbs = dbs;
         t.aliases = aliases.clone();
         t.proof11 = proof11;
@@ -615,6 +670,38 @@ pub(crate) fn evaluate(
         } else {
             AuditLevel::None
         }
+    })
+}
+
+/// R1 rule 5: a restore is confirmed when a database's `DB_GUID` or
+/// `MON$CREATION_DATE` differs from the last one a check of this process
+/// read for it (both read). The count goes on from the previous check's
+/// facts, and the last state read is kept across a check whose read
+/// failed.
+fn count_restores(previous: &[DbFacts], dbs: &mut [DbFacts]) {
+    for d in dbs.iter_mut() {
+        let prev = previous.iter().find(|p| p.attach == d.attach);
+        let seen = prev.and_then(|p| p.restore_seen.clone());
+        d.restores = prev.map_or(0, |p| p.restores);
+        match (&seen, &d.state.restore) {
+            (Some(a), Some(b)) if a != b => d.restores += 1,
+            _ => {}
+        }
+        d.restore_seen = d.state.restore.clone().or(seen);
+    }
+}
+
+/// What the stream needs of the last check for R1 rule 5, per declared
+/// database (the order of [`settings`]'s).
+pub(crate) fn restore_facts(state: &AuditState, id: &str) -> Vec<crate::stream::RestoreFacts> {
+    state.with(id, |t| {
+        t.dbs
+            .iter()
+            .map(|d| crate::stream::RestoreFacts {
+                confirmed: d.restores,
+                own_id: d.state.own_id,
+            })
+            .collect()
     })
 }
 
@@ -712,6 +799,7 @@ pub(crate) async fn stream(
         &ledger,
     );
     let mut machine = Machine::new(s, ledger);
+    machine.restore_baseline(&restore_facts(&state, &id));
     if let Some(c) = &ckpt {
         machine.enable_checkpoint(c.key());
     }
@@ -747,6 +835,8 @@ pub(crate) async fn stream(
         if g != generation {
             generation = g;
             machine.reconfigure(s);
+            // R1 rule 5: restores the check confirmed.
+            machine.set_restore_facts(restore_facts(&state, &id));
             cats = c;
             if let Some(ck) = &runner.ckpt {
                 let key = ck.key();
@@ -766,6 +856,11 @@ pub(crate) async fn stream(
         }
         let polled;
         (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, sink).await?;
+        // R1 rule 5 (L3, L4): the ledger's evidence of a new database life
+        // is used once the first poll has restored a checkpoint (or found
+        // none), so a restore confirmed before this stream started is
+        // applied now, not to the state this stream builds later.
+        machine.apply_restores();
         let now = SystemTime::now();
         // Proofs 8 and 9 from this stream's deltas (review L2: a restarted
         // stream's counters start again at 0), and the gaps of proof 8
@@ -2338,6 +2433,9 @@ mod tests {
             catalog: Classes::default(),
             excluded: false,
             read_at: None,
+            state: crate::check::DbState::default(),
+            restores: 0,
+            restore_seen: None,
         };
         let (mut notes, mut detail) = (Notes::default(), Vec::new());
         let _ = evaluate(
@@ -2357,6 +2455,56 @@ mod tests {
         assert!(s.databases.iter().all(|d| d.excluded));
     }
 
+    /// R1 rule 5: a changed `DB_GUID` or creation date between two checks
+    /// of this process is a restore, counted per database; the same state,
+    /// or a read that failed, is not; the last state read is kept across a
+    /// failed read, so a change across it is still counted.
+    #[test]
+    fn restores_are_counted_from_the_checks_restore_state() {
+        let st = |g: &str| crate::check::RestoreState {
+            guid: g.to_owned(),
+            created: "2026-11-01 14:16:12.3840 UTC".to_owned(),
+        };
+        let db = |attach: &str, r: Option<crate::check::RestoreState>| DbFacts {
+            attach: attach.to_owned(),
+            state: crate::check::DbState {
+                restore: r,
+                ..crate::check::DbState::default()
+            },
+            ..DbFacts::default()
+        };
+        let mut prev: Vec<DbFacts> = Vec::new();
+        let mut step = |dbs: Vec<DbFacts>| {
+            let mut dbs = dbs;
+            count_restores(&prev, &mut dbs);
+            let n: Vec<u64> = dbs.iter().map(|d| d.restores).collect();
+            prev = dbs;
+            n
+        };
+        assert_eq!(step(vec![db("a", Some(st("1"))), db("b", None)]), [0, 0]);
+        assert_eq!(
+            step(vec![db("a", Some(st("1"))), db("b", Some(st("x")))]),
+            [0, 0]
+        );
+        assert_eq!(
+            step(vec![db("a", Some(st("2"))), db("b", Some(st("x")))]),
+            [1, 0]
+        );
+        // A failed read: no restore, the last state kept.
+        assert_eq!(step(vec![db("a", None), db("b", Some(st("x")))]), [1, 0]);
+        assert_eq!(
+            step(vec![db("a", Some(st("3"))), db("b", Some(st("y")))]),
+            [2, 1]
+        );
+        // Another creation date alone is a restore too.
+        let mut later = st("3");
+        later.created = "2026-11-02 00:00:00.0000 UTC".to_owned();
+        assert_eq!(
+            step(vec![db("a", Some(later)), db("b", Some(st("y")))]),
+            [3, 1]
+        );
+    }
+
     /// Review N3: the audit facts' `Debug` shows no path, label or name.
     #[test]
     fn audit_facts_debug_is_redacted() {
@@ -2368,9 +2516,14 @@ mod tests {
                 user: HashMap::from([("SECRET_TABLE".to_owned(), RelClass::Table)]),
                 complete: true,
                 deps: crate::views::ViewDeps::default(),
+                linger: None,
+                restore: None,
             },
             excluded: false,
             read_at: None,
+            state: crate::check::DbState::default(),
+            restores: 0,
+            restore_seen: None,
         };
         let state = AuditState::default();
         state.with("t", |t| t.dbs = vec![d.clone()]);
@@ -2400,6 +2553,8 @@ mod tests {
                     .collect(),
                 complete: true,
             },
+            linger: None,
+            restore: None,
         };
         assert_eq!(c.class("RDB$CUSTOMER_ARCHIVE"), RelClass::Table);
         assert_eq!(c.class("RDB$RELATIONS"), RelClass::System);

@@ -713,6 +713,12 @@ impl Session {
         }
     }
 
+    /// The attachment id the session registered in the ledger (its
+    /// `CURRENT_CONNECTION`), `None` before or without one.
+    pub(crate) fn own_id(&self) -> Option<u64> {
+        self.own.id
+    }
+
     /// `DSQL_drop` of a statement handle (R22 item 3). After a stale
     /// cancel, the drop may meet it: an `isc_cancelled` answer is its
     /// expected follow-up (the drop is sent once more, and the attachment

@@ -248,6 +248,18 @@ const STATEMENT_ROWS: &[Row] = &[
         loading: NONE,
         bound: limit(crate::views::MAX_ROWS),
     },
+    // R30 item 3: one row of `RDB$DATABASE`.
+    own_row(sql::LINGER, DB),
+    // R1 rule 5: one row of `MON$DATABASE`, block-less or the `MON$`
+    // metadata-loading set (as `DATABASE_FILE`).
+    Row {
+        text: sql::RESTORE_STATE,
+        may: &["MON$DATABASE"],
+        must: NONE,
+        must_with_rows: NONE,
+        loading: MON_LOADING,
+        bound: 1,
+    },
 ];
 
 /// The probe of `relation` (decision 4): `RDB$DATABASE` always, the probed

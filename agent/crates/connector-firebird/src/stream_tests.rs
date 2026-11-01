@@ -2313,3 +2313,265 @@ fn an_ambiguous_ddl_record_of_an_undeclared_database_invalidates_nothing() {
     assert!(!marked, "{n:?}");
     assert!(!m.all_relations_for_tests(0));
 }
+
+/// A catalog with the linger the last check read (R30 item 3).
+struct LingerCat(Option<u32>);
+impl Catalog for LingerCat {
+    fn class(&self, r: &str) -> RelClass {
+        Cat.class(r)
+    }
+    fn always_view(&self, _: &str) -> bool {
+        false
+    }
+    fn linger(&self) -> Option<u32> {
+        self.0
+    }
+}
+
+/// R30 item 3, with the linger `check()` reads (ADR-0060 R60): a Garbage
+/// Collector alone on its database is expected to end within 10 s of
+/// reading time, or within L + 10 s when the linger L is known and above
+/// 0. Its `COMMIT_TRANSACTION` 20 s later is well formed under a linger of
+/// 15 s, and ambiguous with no linger, a linger of 0 or one not known (the
+/// binding ended at 10 s: fail closed, as before).
+#[test]
+fn the_garbage_collectors_end_follows_the_linger() {
+    let gc = "24:0x7f0000000500";
+    let ctx = format!(
+        "\t{APP} (ATT_2, Garbage Collector, NONE, <internal>)\n\t\t(TRA_8, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)\n"
+    );
+    let start = format!(
+        "{HEAD} ({gc}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({gc}) START_TRANSACTION\n{ctx}\n"
+    );
+    let end = format!(
+        "{HEAD} ({gc}) COMMIT_TRANSACTION\n{ctx}      0 ms\n\n{HEAD} ({gc}) TRACE_FINI\n\tSESSION_1 Firebird Audit\n\t\n\n"
+    );
+    for (linger, after, ambiguous) in [
+        (Some(15), 20, false),
+        (Some(15), 26, true),
+        (Some(0), 20, true),
+        (None, 20, true),
+        (None, 5, false),
+        (Some(3600), 3000, false),
+    ] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1),
+        });
+        let cat = LingerCat(linger);
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let now = Instant::now();
+        feed_raw(&mut m, &cats, start.as_bytes(), 0, now);
+        assert_eq!(m.counts.ambiguous, 0, "{linger:?}: {:?}", m.why);
+        let later = now + Duration::from_secs(after);
+        let mut out = Vec::new();
+        m.expire(later, &cats, &mut out);
+        feed_raw(&mut m, &cats, end.as_bytes(), 10_000, later);
+        assert_eq!(
+            m.counts.ambiguous > 0,
+            ambiguous,
+            "linger {linger:?}, {after} s: {:?}",
+            m.why
+        );
+    }
+    assert_eq!(gc_end(None), Duration::from_secs(10));
+    assert_eq!(gc_end(Some(0)), Duration::from_secs(10));
+    assert_eq!(gc_end(Some(15)), Duration::from_secs(25));
+    // Review N2: a linger above 24 h is not known.
+    assert_eq!(gc_end(Some(MAX_LINGER)), Duration::from_secs(10 + 86_400));
+    assert_eq!(gc_end(Some(MAX_LINGER + 1)), Duration::from_secs(10));
+}
+
+/// R1 rule 5, a restore confirmed by `check()` from a changed `DB_GUID` or
+/// `MON$CREATION_DATE`: the restored database's attachment ids restart
+/// low. Before the confirmation, a new low id is out of order (ambiguous,
+/// as before); once the check confirms the restore, the database's
+/// bindings, highest and seen ids start again and the same attach is
+/// normal. The same facts again restore nothing more; a restore the checks
+/// confirmed before the stream started is not applied (the baseline).
+#[test]
+fn a_restore_confirmed_by_the_check_starts_the_attachments_again() {
+    for confirm in [false, true] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1),
+        });
+        m.restore_baseline(&[RestoreFacts {
+            confirmed: 4,
+            own_id: None,
+        }]);
+        let cat = Cat;
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let now = Instant::now();
+        feed_raw(
+            &mut m,
+            &cats,
+            attach("24:0x7f0000000200", 500, APP).as_bytes(),
+            0,
+            now,
+        );
+        assert_eq!(m.counts.ambiguous, 0);
+        if confirm {
+            m.set_restore_facts(vec![RestoreFacts {
+                confirmed: 5,
+                own_id: None,
+            }]);
+            assert_eq!(m.counts.restores, 1);
+            m.set_restore_facts(vec![RestoreFacts {
+                confirmed: 5,
+                own_id: None,
+            }]);
+            assert_eq!(m.counts.restores, 1, "applied once");
+        } else {
+            m.set_restore_facts(vec![RestoreFacts {
+                confirmed: 4,
+                own_id: None,
+            }]);
+            assert_eq!(m.counts.restores, 0, "the baseline");
+        }
+        feed_raw(
+            &mut m,
+            &cats,
+            attach("24:0x7f0000000300", 5, APP).as_bytes(),
+            1000,
+            now,
+        );
+        assert_eq!(m.counts.ambiguous > 0, !confirm, "{:?}", m.why);
+    }
+}
+
+/// R1 rule 5 by id from the persisted ledger (L3, maintainer decision of
+/// 2026-11-01): the check's own attachment 7 registered after an own
+/// attachment with a higher id (the earlier life's 480, registered more
+/// than the margin before) is of a new life: a restore, applied once (the
+/// evidence is forgotten with its credits, so the run bound starts from
+/// the restored database's ids). The case the watermark missed (4 then 7:
+/// the restore's own attachments consume ids) is caught the same way: the
+/// earlier life's own attachment 9 (above 7). The R7 case (concurrent own
+/// sessions of one life, registered out of id order within the margin)
+/// never fires.
+#[test]
+fn a_new_database_life_is_confirmed_from_the_ledger() {
+    let t0 = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let after = |s: u64| t0 + Duration::from_secs(s);
+    let acc = crate::conn::FetchAccount::default();
+    // The R7 case: 11 registered before 10, 1 s apart; then 12, 13.
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 11, 40011, 24, after(0));
+    ledger.register_at(APP, 10, 40010, 24, after(1));
+    ledger.register_at(APP, 12, 40012, 24, after(60));
+    assert!(!ledger.new_life(APP, 10));
+    assert!(!ledger.new_life(APP, 11));
+    assert!(!ledger.new_life(APP, 12));
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    m.restore_baseline(&[RestoreFacts::default()]);
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(10),
+    }]);
+    assert_eq!(m.counts.restores, 0, "never within one life");
+    // A new life: 480 then, 120 s and more later, 7.
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 480, 40480, 24, after(0));
+    ledger.credit(APP, 480, crate::sql::VERSION, None, acc);
+    ledger.register_at(APP, 7, 40007, 24, after(600));
+    assert!(ledger.new_life(APP, 7));
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    m.restore_baseline(&[RestoreFacts::default()]);
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let now = Instant::now();
+    feed_raw(
+        &mut m,
+        &cats,
+        attach("24:0x7f0000000200", 470, APP).as_bytes(),
+        0,
+        now,
+    );
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(7),
+    }]);
+    assert_eq!(m.counts.restores, 1);
+    assert_eq!(ledger.latest_id(APP), Some(7), "the earlier life forgotten");
+    assert!(ledger.credits_left().is_empty(), "with its credits (L5)");
+    assert!(!ledger.new_life(APP, 7), "used once");
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(7),
+    }]);
+    assert_eq!(m.counts.restores, 1, "applied once");
+    // The restored database's attaches are in order again.
+    feed_raw(
+        &mut m,
+        &cats,
+        attach("24:0x7f0000000300", 8, APP).as_bytes(),
+        1000,
+        now,
+    );
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    // 4 then 7: the earlier life's own 9 (above 7) is the evidence.
+    let ledger = Ledger::default();
+    ledger.register_at(APP, 4, 40004, 24, after(0));
+    ledger.register_at(APP, 9, 40009, 24, after(10));
+    ledger.register_at(APP, 7, 40007, 24, after(900));
+    assert!(ledger.new_life(APP, 7));
+    // Within the margin: not (concurrent sessions of one life).
+    let ledger = Ledger::default();
+    ledger.register_at(APP, 9, 40009, 24, after(0));
+    ledger.register_at(APP, 7, 40007, 24, after(119));
+    assert!(!ledger.new_life(APP, 7));
+}
+
+/// L4: a restore the checks confirmed before a stream restart (counted
+/// in the new stream's baseline) is still caught by the new stream from
+/// the ledger's evidence, which only the application forgets.
+#[test]
+fn a_restore_confirmed_before_a_stream_restart_is_applied() {
+    let t0 = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 480, 40480, 24, t0);
+    ledger.register_at(APP, 7, 40007, 24, t0 + Duration::from_secs(600));
+    let facts = RestoreFacts {
+        confirmed: 1,
+        own_id: Some(7),
+    };
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.restore_baseline(&[facts]);
+    assert_eq!(m.apply_restores(), 1);
+    assert_eq!(m.counts.restores, 1);
+    assert_eq!(m.apply_restores(), 0);
+}
+
+/// Review L1 and L2: a confirmed restore ends the database's DDL waits
+/// (no empty entry left) and invalidates its dependent sets until the next
+/// check, whether or not a DDL transaction was open.
+#[test]
+fn a_restore_ends_ddl_waits_and_invalidates() {
+    for wait in [false, true] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.restore_baseline(&[RestoreFacts::default()]);
+        if wait {
+            m.fill_ddl_wait_for_tests(0);
+            assert_eq!(m.ddl_wait_len_for_tests(), 1);
+        }
+        assert!(!m.views_invalid_for_tests(0));
+        m.set_restore_facts(vec![RestoreFacts {
+            confirmed: 1,
+            own_id: None,
+        }]);
+        assert_eq!(m.counts.restores, 1);
+        assert_eq!(m.ddl_wait_len_for_tests(), 0);
+        assert!(m.views_invalid_for_tests(0), "wait {wait}");
+    }
+}
