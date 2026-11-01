@@ -9,6 +9,7 @@
     clippy::print_stderr
 )]
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,6 +91,8 @@ fn objects(out: &[Emitted]) -> Vec<String> {
 struct Proc {
     r: Runner,
     m: Machine,
+    /// The check's catalog results per declared database.
+    classes: Vec<Classes>,
     submitted: u64,
     durable: u64,
     out: Vec<Emitted>,
@@ -101,6 +104,17 @@ impl Proc {
     }
 
     fn start_with(dir: &std::path::Path, ledger: Arc<Ledger>, s: Settings, run: Run) -> Self {
+        let n = s.databases.len();
+        Self::start_full(dir, ledger, s, run, vec![Classes::default(); n])
+    }
+
+    fn start_full(
+        dir: &std::path::Path,
+        ledger: Arc<Ledger>,
+        s: Settings,
+        run: Run,
+        classes: Vec<Classes>,
+    ) -> Self {
         let k = key();
         let log = dir.join("audit.log");
         let store = CursorStore::new(dir, "t", "fb").map(|s| s.with_tag_key(Arc::clone(&k)));
@@ -117,7 +131,9 @@ impl Proc {
         let mut m = Machine::new(s, Arc::clone(&ledger));
         m.enable_checkpoint(ck.key());
         m.confirm_run(run);
+        let digests = classes.iter().map(|c| c.digest(&k)).collect();
         let r = Runner {
+            digests,
             ckpt: Some(ck),
             shed: 0,
             tailer: Tailer::new(log.clone(), FRAMING, store).with_open_check(open_check(log)),
@@ -135,6 +151,7 @@ impl Proc {
         Self {
             r,
             m,
+            classes,
             submitted: 0,
             durable: 0,
             out: Vec::new(),
@@ -163,8 +180,8 @@ impl Proc {
 
     /// Reads what the log holds (no stable end of file).
     fn read(&mut self) {
-        let classes = Classes::default();
-        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let classes = std::mem::take(&mut self.classes);
+        let cats: Vec<&dyn Catalog> = classes.iter().map(|c| c as &dyn Catalog).collect();
         loop {
             let mut out = Vec::new();
             let more = self.r.poll(&mut self.m, &cats, &mut out).unwrap();
@@ -173,14 +190,18 @@ impl Proc {
                 break;
             }
         }
+        drop(cats);
+        self.classes = classes;
     }
 
     /// Reading time passes (`after`): the bounds that run on it.
     fn expire(&mut self, after: Duration) {
-        let classes = Classes::default();
-        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let classes = std::mem::take(&mut self.classes);
+        let cats: Vec<&dyn Catalog> = classes.iter().map(|c| c as &dyn Catalog).collect();
         let mut out = Vec::new();
         self.m.expire(Instant::now() + after, &cats, &mut out);
+        drop(cats);
+        self.classes = classes;
         self.deliver(out);
     }
 
@@ -659,6 +680,8 @@ fn a_restart_right_after_a_check_finds_its_credits() {
     // session ends (the ledger is written then).
     own_credits(&ledger, opened, 1);
     ledger.close(APP, 3, false, Duration::from_secs(1));
+    // No runtime here: the write the session's end schedules, done.
+    ledger.persist_if_dirty();
     drop(p);
     drop(ledger);
     // The agent is killed: the server writes the rest afterwards.
@@ -811,7 +834,7 @@ fn the_cap_ends_groups_first_and_never_truncates() {
     let size = |p: &Proc| p.m.export(Instant::now()).unwrap().len();
     let with_group = size(&p);
     // A cap the state with its group does not fit in, without it does.
-    let cap = 74 + with_group - 1;
+    let cap = crate::audit_ckpt::Body::size(with_group, 0, 1) - 1;
     p.r.ckpt
         .as_mut()
         .unwrap()
@@ -1115,4 +1138,550 @@ fn it_restart_phase_2_reads_the_rest_as_without_a_restart() {
     for d in [run, one, reference] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// Reviewer PoC: a procedure record of `a`'s transaction 5 (no start)
+/// with a block naming `rel`.
+fn routine_only(rel: &str) -> String {
+    let a = "24:0x7f0000000100";
+    let ctx = format!(
+        "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    );
+    let blk = format!(
+        "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n",
+        "Table",
+        "*".repeat(115),
+        rel,
+        5,
+        ""
+    );
+    format!(
+        "{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n{blk}\n"
+    )
+}
+
+/// Reviewer PoC: the group boundary depends on reading time; the re-read
+/// merges a later group into a suppressed one.
+#[test]
+fn reviewer_poc_group_merge_after_restore_loses_a_read() {
+    let dir = temp("poc");
+    first_start(&dir);
+    append(
+        &dir,
+        &format!(
+            "{}{}{}{}{}",
+            attach("24:0x7f0000000200", 4, APP),
+            select("24:0x7f0000000200", 4, 7, APP, "CUSTOMERS", 2),
+            attach("24:0x7f0000000100", 3, APP),
+            pending_routine(true),
+            attach("24:0x7f0000000300", 5, APP),
+        ),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    assert!(objects(&p.out).contains(&"CUSTOMERS".to_owned()));
+    // Checkpoint C taken (group G with SECRETS pending), not yet written.
+    p.commit();
+    assert_eq!(p.counts().1.written, 0);
+    // G ends on reading time; then a later record of the same transaction
+    // starts G' (PAYROLL), still pending.
+    p.expire(Duration::from_secs(11));
+    assert!(objects(&p.out).contains(&"SECRETS".to_owned()));
+    append(
+        &dir,
+        &format!(
+            "{}{}",
+            routine_only("PAYROLL"),
+            attach("24:0x7f0000000400", 6, APP)
+        ),
+    );
+    p.read();
+    assert!(
+        !objects(&p.out).contains(&"PAYROLL".to_owned()),
+        "G' pending"
+    );
+    // The core spools G's event: C is written with G's key in its dedup.
+    p.spooled();
+    p.commit();
+    eprintln!("ckpt counts after commit: {:?}", p.counts().1);
+    drop(p); // crash: G' never emitted
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.expire(Duration::from_secs(11));
+    let (c, k) = p.counts();
+    eprintln!(
+        "restart: restored={} deduped={} out={:?}",
+        k.restored,
+        c.deduped,
+        objects(&p.out)
+    );
+    assert!(
+        objects(&p.out).contains(&"PAYROLL".to_owned()),
+        "PAYROLL lost: {:?} deduped={}",
+        objects(&p.out),
+        c.deduped
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reviewer PoC 2: the suppress set outlives a truncation of the same file.
+#[test]
+fn reviewer_poc_suppress_survives_truncation() {
+    let dir = temp("poc2");
+    first_start(&dir);
+    let a = "24:0x7f0000000100";
+    let prefix = format!(
+        "{}{}{}",
+        attach(a, 3, APP),
+        select(a, 3, 5, APP, "CUSTOMERS", 2),
+        attach("24:0x7f0000000200", 4, APP)
+    );
+    append(&dir, &prefix);
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.commit();
+    let tail = format!(
+        "{}{}{}",
+        select("99:0x7f0000000900", 9, 9, APP, "LEDGER", 1),
+        select(a, 3, 6, APP, "ORDERS", 4),
+        attach("24:0x7f0000000300", 5, APP)
+    );
+    append(&dir, &tail);
+    p.read();
+    p.spooled();
+    p.commit();
+    drop(p);
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    assert!(p.m.counts.deduped > 0);
+    assert!(p.out.is_empty());
+    p.spooled();
+    p.commit();
+    // Truncated in place (same inode), then new records written: a read of
+    // SECRETS lands at the offset of an old deduplicated position.
+    std::fs::write(dir.join("audit.log"), b"").unwrap();
+    p.read();
+    let pad = prefix.clone();
+    let b2 = "24:0x7f0000000500";
+    let newtail = format!(
+        "{}{}{}",
+        select(b2, 7, 9, APP, "SECRETS", 1),
+        select(b2, 7, 6, APP, "SECRET2", 4),
+        attach("24:0x7f0000000600", 8, APP)
+    );
+    append(&dir, &format!("{}{}", pad, newtail));
+    let before = p.m.counts.deduped;
+    p.read();
+    p.expire(Duration::from_secs(11));
+    eprintln!(
+        "after truncation: deduped +{} out={:?}",
+        p.m.counts.deduped - before,
+        objects(&p.out)
+    );
+    let o = objects(&p.out);
+    assert!(
+        o.contains(&"SECRETS".to_owned()) && o.contains(&"SECRET2".to_owned()),
+        "lost: {o:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------- review round 2
+
+/// A complete catalog: `CUSTOMERS`, `ORDERS` and `PAYROLL` tables, the
+/// views and dependent objects given.
+fn catalog(views: &[&str], dependent: &[&str], external: &[&str]) -> Classes {
+    let mut user: HashMap<String, RelClass> = ["CUSTOMERS", "ORDERS", "PAYROLL"]
+        .iter()
+        .map(|t| ((*t).to_owned(), RelClass::Table))
+        .collect();
+    for v in views {
+        user.insert((*v).to_owned(), RelClass::View);
+    }
+    for e in external {
+        user.insert((*e).to_owned(), RelClass::External);
+    }
+    Classes {
+        user,
+        complete: true,
+        deps: crate::views::ViewDeps {
+            dependent: dependent.iter().map(|d| (*d).to_owned()).collect(),
+            computed: Default::default(),
+            computed_known: true,
+            routines: Default::default(),
+            complete: true,
+        },
+    }
+}
+
+/// Process 1 reads up to the middle of an `ORDERS` read with catalog
+/// `before`; process 2 reads the rest with catalog `after`: the events of
+/// process 2.
+fn restart_with_catalogs(
+    name: &str,
+    before: Classes,
+    after: Classes,
+) -> (CkptCounts, Vec<Emitted>) {
+    let dir = temp(name);
+    first_start(&dir);
+    let a = "24:0x7f0000000100";
+    let orders = select(a, 3, 6, APP, "ORDERS", 4);
+    let cut = orders.len() / 2;
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            attach(a, 3, APP),
+            select(a, 3, 5, APP, "CUSTOMERS", 2),
+            &orders[..cut]
+        ),
+    );
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![before],
+    );
+    p.read();
+    p.spooled();
+    p.commit();
+    drop(p);
+    // After the previous process's read end: a read of PAYROLL.
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            &orders[cut..],
+            select(a, 3, 7, APP, "PAYROLL", 1),
+            attach("24:0x7f0000000300", 5, APP)
+        ),
+    );
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![after],
+    );
+    p.read();
+    let k = p.counts().1;
+    let out = std::mem::take(&mut p.out);
+    let _ = std::fs::remove_dir_all(&dir);
+    (k, out)
+}
+
+fn marked(out: &[Emitted], rel: &str) -> Option<bool> {
+    out.iter()
+        .find(|(_, e)| e.objects().iter().any(|o| o.object().as_str() == rel))
+        .map(|(_, e)| e.always_report() && e.objects().iter().any(|o| o.object().as_str() == "*"))
+}
+
+/// L10, decision of 2026-11-01: a view created while the agent was stopped
+/// (the check after the restart reads another dependent set) invalidates
+/// the database for the records re-read up to the previous process's read
+/// end: the `ORDERS` read cut by the restart is `*` and always reported;
+/// the `PAYROLL` read after that end is not. With the same check results,
+/// neither is.
+#[test]
+fn a_view_changed_while_stopped_invalidates_the_re_read() {
+    let (k, out) = restart_with_catalogs(
+        "digest-view",
+        catalog(&[], &[], &[]),
+        catalog(&["V_NEW"], &["V_NEW"], &[]),
+    );
+    assert_eq!(k.restored, 1);
+    assert_eq!(k.invalidated, 1);
+    assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+    assert_eq!(marked(&out, "PAYROLL"), Some(false), "{:?}", objects(&out));
+    let (k, out) = restart_with_catalogs(
+        "digest-same",
+        catalog(&[], &[], &[]),
+        catalog(&[], &[], &[]),
+    );
+    assert_eq!((k.restored, k.invalidated), (1, 0));
+    assert_eq!(marked(&out, "ORDERS"), Some(false), "{:?}", objects(&out));
+}
+
+/// The same for a database restored while the agent was stopped from a
+/// backup whose schema differs (here a table that is now an external-file
+/// table, the block-blind set of R28): the re-read is invalidated.
+#[test]
+fn a_restore_while_stopped_invalidates_the_re_read() {
+    let (k, out) = restart_with_catalogs(
+        "digest-restore",
+        catalog(&[], &[], &[]),
+        catalog(&[], &[], &["EXT_LOAD"]),
+    );
+    assert_eq!(k.invalidated, 1);
+    assert_eq!(marked(&out, "ORDERS"), Some(true), "{:?}", objects(&out));
+}
+
+/// The invalidation of a re-read goes on in the next checkpoint: a second
+/// restart inside the same region still invalidates it, even when the
+/// check results did not change again.
+#[test]
+fn a_re_read_invalidation_survives_a_second_restart() {
+    let dir = temp("digest-twice");
+    first_start(&dir);
+    let a = "24:0x7f0000000100";
+    let orders = select(a, 3, 6, APP, "ORDERS", 4);
+    let cut = orders.len() / 2;
+    append(&dir, &format!("{}{}", attach(a, 3, APP), &orders[..cut]));
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![catalog(&[], &[], &[])],
+    );
+    p.read();
+    p.spooled();
+    p.commit();
+    drop(p);
+    let changed = || catalog(&["V_NEW"], &["V_NEW"], &[]);
+    // Process 2 restores, reads nothing new and writes its checkpoint.
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![changed()],
+    );
+    p.read();
+    assert_eq!(p.counts().1.invalidated, 1);
+    p.spooled();
+    p.commit();
+    drop(p);
+    append(
+        &dir,
+        &format!("{}{}", &orders[cut..], attach("24:0x7f0000000300", 5, APP)),
+    );
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        vec![changed()],
+    );
+    p.read();
+    assert_eq!(p.counts().1.invalidated, 0, "the digests agree now");
+    assert_eq!(
+        marked(&p.out, "ORDERS"),
+        Some(true),
+        "{:?}",
+        objects(&p.out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `a`'s transaction `t` starts and a procedure record of it pends with a
+/// block naming `rel` (seven characters, as `SECRETS`).
+fn routine_in(t: u64, rel: &str) -> String {
+    pending_routine(true)
+        .replace("TRA_5", &format!("TRA_{t}"))
+        .replace("SECRETS", rel)
+}
+
+/// H1 regression (shedding): a group ended by the cap's shedding before a
+/// crash, and a later record of its transaction: the restart, from the
+/// checkpoint that still holds the group, sends both relations (a group of
+/// other members than any sent before).
+#[test]
+fn a_group_shed_before_a_crash_is_sent_with_its_later_members() {
+    let dir = temp("shed-crash");
+    first_start(&dir);
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            attach("24:0x7f0000000100", 3, APP),
+            pending_routine(true),
+            attach("24:0x7f0000000300", 5, APP),
+        ),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.spooled();
+    p.commit();
+    assert_eq!(p.counts().1.written, 1, "the checkpoint holds the group");
+    // A cap the group does not fit in: it is shed and sent.
+    p.r.ckpt
+        .as_mut()
+        .unwrap()
+        .tune_for_tests(Duration::ZERO, 200);
+    append(&dir, &attach("24:0x7f0000000400", 6, APP));
+    p.read();
+    p.commit();
+    p.read();
+    assert!(objects(&p.out).contains(&"SECRETS".to_owned()));
+    assert_eq!(p.counts().1.shed, 1);
+    append(
+        &dir,
+        &format!(
+            "{}{}",
+            routine_only("PAYROLL"),
+            attach("24:0x7f0000000500", 7, APP)
+        ),
+    );
+    p.read();
+    p.spooled();
+    p.commit();
+    drop(p);
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.expire(Duration::from_secs(11));
+    let o = objects(&p.out);
+    assert!(o.contains(&"PAYROLL".to_owned()), "{o:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// H1 regression (a cap): 17 transactions with a pending routine on one
+/// binding: the oldest group is ended by the per-binding cap of 16 (R25
+/// item 4); after a restart, every relation is sent, none lost.
+#[test]
+fn groups_ended_on_the_per_binding_cap_are_not_lost() {
+    let dir = temp("cap-groups");
+    first_start(&dir);
+    let mut log = attach("24:0x7f0000000100", 3, APP);
+    for t in 0..17 {
+        log.push_str(&routine_in(10 + t, &format!("REL{t:04}")));
+    }
+    let half = log.len() * 3 / 4;
+    append(&dir, &log[..half]);
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.spooled();
+    p.commit();
+    let mut seen = objects(&p.out);
+    drop(p);
+    append(
+        &dir,
+        &format!("{}{}", &log[half..], attach("24:0x7f0000000300", 5, APP)),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.expire(Duration::from_secs(11));
+    seen.extend(objects(&p.out));
+    for t in 0..17 {
+        assert!(
+            seen.contains(&format!("REL{t:04}")),
+            "REL{t:04} lost: {seen:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M1: a run change drops the suppressed positions (sent again rather than
+/// suppressed under another run).
+#[test]
+fn a_run_change_drops_the_suppressed_positions() {
+    let mut m = Machine::new(settings(), Arc::new(Ledger::default()));
+    m.confirm_run(RUN);
+    let k = crate::stream::DKey {
+        file: (1, 2),
+        off: 10,
+        group: false,
+        members: 0,
+        last: 0,
+    };
+    m.set_suppress([k].into_iter().collect());
+    m.confirm_run(RUN);
+    assert!(!m.suppress_cleared);
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    assert!(m.suppress_cleared);
+}
+
+/// L1: a checkpoint of another boot is not used.
+#[test]
+fn a_checkpoint_of_another_boot_is_not_used() {
+    let dir = temp("boot");
+    first_start(&dir);
+    let a = "24:0x7f0000000100";
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            attach(a, 3, APP),
+            select(a, 3, 5, APP, "CUSTOMERS", 2),
+            attach("24:0x7f0000000300", 5, APP)
+        ),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.spooled();
+    p.commit();
+    drop(p);
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.r.ckpt
+        .as_mut()
+        .unwrap()
+        .set_boot_for_tests(b"another-boot");
+    p.read();
+    assert_eq!(p.counts().1.restored, 0);
+    assert_eq!(p.counts().1.refused, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L3: checkpoints that do not fit the cap are counted; after three in a
+/// row the last one is dropped and its file removed, so the position is
+/// held back as without a checkpoint.
+#[test]
+fn checkpoints_past_the_cap_fall_back_after_three() {
+    let dir = temp("toolarge");
+    first_start(&dir);
+    let a = "24:0x7f0000000100";
+    append(
+        &dir,
+        &format!(
+            "{}{}{}",
+            attach(a, 3, APP),
+            select(a, 3, 5, APP, "CUSTOMERS", 2),
+            attach("24:0x7f0000000300", 5, APP)
+        ),
+    );
+    let mut p = Proc::start(&dir, Arc::new(Ledger::default()));
+    p.read();
+    p.spooled();
+    p.commit();
+    assert!(checkpoint_file(&dir).exists());
+    p.r.ckpt
+        .as_mut()
+        .unwrap()
+        .tune_for_tests(Duration::ZERO, 100);
+    for i in 0..3 {
+        append(&dir, &attach(&format!("24:0x7f00000004{i}0"), 6 + i, APP));
+        p.read();
+        p.commit();
+    }
+    assert_eq!(p.counts().1.too_large, 3);
+    assert!(!checkpoint_file(&dir).exists(), "dropped after three");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L2: a session's end does not write the ledger itself: it schedules one
+/// write on a blocking thread.
+#[tokio::test]
+async fn a_session_end_writes_the_ledger_on_a_blocking_thread() {
+    let dir = temp("ledger-async");
+    let k = key();
+    let ledger = Arc::new(Ledger::default());
+    ledger.attach_store(
+        CursorStore::counters(&dir, "t", "fblg").unwrap(),
+        Arc::clone(&k),
+    );
+    ledger.register(APP, 3, 40003, 24);
+    ledger.close(APP, 3, false, Duration::from_secs(1));
+    let file = dir.join("t.fblg.counters");
+    for _ in 0..200 {
+        if file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(file.exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
