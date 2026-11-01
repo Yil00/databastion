@@ -35,6 +35,8 @@
 mod audit;
 mod catalog;
 mod check;
+#[cfg_attr(not(test), allow(dead_code))]
+mod ckpt;
 mod conn;
 mod crypt;
 mod discover;
