@@ -228,21 +228,46 @@ fn start_of(pid: u32) -> Option<(u64, SystemTime)> {
     let ticks = stat_start_ticks(&stat)?;
     let hz = rustix::param::clock_ticks_per_second().max(1);
     let since_boot = Duration::from_millis(ticks.saturating_mul(1000) / hz);
-    let uptime = std::fs::read_to_string("/proc/uptime").ok();
+    // The time now is taken before `/proc/uptime` is read: a delay between
+    // the two reads (a preemption) makes the start earlier, never later.
     let now = SystemTime::now();
-    if let Some(started) = uptime
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
         .as_deref()
-        .and_then(parse_uptime)
-        .and_then(|up| started_at(now, up, since_boot))
-    {
-        return Some((ticks, started));
+        .and_then(parse_uptime);
+    let btime = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())
+    });
+    let by_btime = btime.map(|b| SystemTime::UNIX_EPOCH + Duration::from_secs(b) + since_boot);
+    let by_uptime = uptime.and_then(|up| started_at(now, up, since_boot));
+    Some((ticks, choose_start(by_uptime, by_btime)?))
+}
+
+/// The start to use (security review M3 of round 2): the `/proc/uptime`
+/// one when it lies where the true start can be given the `btime` one
+/// (which is at most a second early, never late: from [`START_MARGIN`]
+/// before it to 1.1 s after it); otherwise the earlier of the two (a
+/// virtualised `/proc/uptime`, LXCFS in LXD, LXC or some Kubernetes nodes,
+/// counts from the container's start, not the host's boot). A wall-clock
+/// step between the server's start and now (NTP, `settimeofday`) moves
+/// both the same way (`btime` is the boot time on today's clock): the
+/// files' times, written on the earlier clock, are then compared with a
+/// start on today's, which a step back makes look later: a residual of any
+/// wall-clock comparison, as before.
+pub(crate) fn choose_start(
+    by_uptime: Option<SystemTime>,
+    by_btime: Option<SystemTime>,
+) -> Option<SystemTime> {
+    match (by_uptime, by_btime) {
+        (Some(u), Some(b)) => {
+            let low = b.checked_sub(START_MARGIN).unwrap_or(b);
+            let high = b + Duration::from_millis(1100);
+            Some(if u >= low && u <= high { u } else { u.min(b) })
+        }
+        (Some(u), None) => Some(u),
+        (None, b) => b,
     }
-    let btime = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())?;
-    let started = SystemTime::UNIX_EPOCH + Duration::from_secs(btime) + since_boot;
-    Some((ticks, started))
 }
 
 /// How much earlier than measured a process start is taken: the tick
@@ -269,7 +294,9 @@ pub(crate) fn started_at(
     uptime: Duration,
     since_boot: Duration,
 ) -> Option<SystemTime> {
-    let ago = uptime.checked_sub(since_boot).unwrap_or_default() + START_MARGIN;
+    // An uptime below the process's time since boot is not the host's
+    // (a virtualised `/proc/uptime`): no start from it (never "now").
+    let ago = uptime.checked_sub(since_boot)? + START_MARGIN;
     now.checked_sub(ago)
 }
 
@@ -655,6 +682,39 @@ mod tests {
         );
     }
 
+    /// Security review M3 of round 2: the uptime start is used only where
+    /// the true start can be given the `btime` one; a late one (a
+    /// virtualised uptime) gives way to the earlier `btime` start, never
+    /// now.
+    #[test]
+    fn a_late_uptime_start_gives_way_to_btime() {
+        let b = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ms = Duration::from_millis;
+        // Within the window: the precise one.
+        assert_eq!(
+            super::choose_start(Some(b + ms(900)), Some(b)),
+            Some(b + ms(900))
+        );
+        assert_eq!(
+            super::choose_start(Some(b - ms(40)), Some(b)),
+            Some(b - ms(40))
+        );
+        // Later than 1.1 s after `btime`'s start: `btime`'s.
+        assert_eq!(super::choose_start(Some(b + ms(1200)), Some(b)), Some(b));
+        assert_eq!(
+            super::choose_start(Some(b + ms(3_600_000)), Some(b)),
+            Some(b)
+        );
+        // Earlier than the window: the earlier, itself.
+        assert_eq!(
+            super::choose_start(Some(b - ms(5000)), Some(b)),
+            Some(b - ms(5000))
+        );
+        assert_eq!(super::choose_start(None, Some(b)), Some(b));
+        assert_eq!(super::choose_start(Some(b), None), Some(b));
+        assert_eq!(super::choose_start(None, None), None);
+    }
+
     #[test]
     fn uptime_and_start_times() {
         assert_eq!(
@@ -674,8 +734,11 @@ mod tests {
             now.duration_since(started).unwrap(),
             Duration::from_secs(100) + super::START_MARGIN
         );
-        // A start after the uptime (clock reads out of order): taken as now.
-        assert!(super::started_at(now, Duration::from_secs(1), Duration::from_secs(2)).is_some());
+        // An uptime below the time since boot (LXCFS): no start from it.
+        assert_eq!(
+            super::started_at(now, Duration::from_secs(1), Duration::from_secs(2)),
+            None
+        );
     }
     use super::*;
 
