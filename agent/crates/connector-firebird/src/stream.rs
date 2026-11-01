@@ -473,6 +473,11 @@ pub(crate) struct Counts {
     pub(crate) own_not_matched: u64,
     /// Restores confirmed by `check()` and applied (R1 rule 5).
     pub(crate) restores: u64,
+    /// Error follow-ups of the agent's own records consumed (R22, R35).
+    pub(crate) follow_ups: u64,
+    /// `ERROR` records of the agent's own anchored bindings that were no
+    /// expected follow-up (handled as any client's: no event).
+    pub(crate) own_errors_not_followed: u64,
 }
 
 /// The stream's settings.
@@ -636,6 +641,12 @@ pub(crate) struct Machine {
     /// `attach` the confirmed-restore count already applied.
     restore_facts: Vec<RestoreFacts>,
     restores_seen: HashMap<String, u64>,
+    /// R22 items 5 to 8, R35: the error follow-up per own binding, not
+    /// persisted (a restart loses an expected follow-up, so its record is
+    /// handled as any client's error record: no event, nothing hidden; and
+    /// a consumed one, so a forged second copy right after a restart is not
+    /// loud, which hides nothing either).
+    follow_ups: HashMap<Key, FollowUp>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -707,6 +718,7 @@ impl Machine {
             reread_invalid: Vec::new(),
             restore_facts: Vec::new(),
             restores_seen: HashMap::new(),
+            follow_ups: HashMap::new(),
         }
     }
 
@@ -1249,6 +1261,7 @@ impl Machine {
         self.gc_alone_since.clear();
         self.failed_pids.clear();
         self.cooldown_until = None;
+        self.follow_ups.clear();
     }
 
     /// The stream's state in bytes, estimated (R1 rule 11's global cap).
@@ -2138,6 +2151,92 @@ impl Catalog for Invalidated<'_> {
     }
 }
 
+/// The error follow-up a credited own record leaves on its binding (R22
+/// items 5 to 8, R35): the exact `ERROR` record the server writes next on
+/// that binding after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowKind {
+    /// The server's statement timeout (`FAILED` finish of a credit ended
+    /// `failed`): `335544794` and `335545129` at `JResultSet::fetchNext`.
+    Timeout,
+    /// The connector's answered cancel (`FAILED` finish of a credit ended
+    /// `cancelled`): `335544794` alone, at `JStatement::openCursor` or
+    /// `JResultSet::fetchNext`.
+    Cancel,
+    /// A stale cancel met by the `DSQL_drop` (R22 item 3): `335544794`
+    /// alone (its location was not measured: the two of the cancel).
+    StaleCancel,
+    /// The row-limit cut whose last request reached the end of the result
+    /// (R35): `335544364` alone at `JResultSet::fetchNext`.
+    ReqSync,
+}
+
+impl FollowKind {
+    fn of(a: &crate::conn::FetchAccount) -> Option<Self> {
+        use crate::conn::FetchEnd;
+        match a.end {
+            FetchEnd::Failed => Some(Self::Timeout),
+            FetchEnd::Cancelled => Some(Self::Cancel),
+            _ if a.stale_cancel_follow_up => Some(Self::StaleCancel),
+            FetchEnd::End | FetchEnd::Early if a.cut => Some(Self::ReqSync),
+            _ => None,
+        }
+    }
+
+    /// Whether an `ERROR` record's location and codes are this follow-up's
+    /// (the codes exactly, in any order, each once).
+    fn matches(self, at: Option<crate::trace_log::ErrorAt>, codes: &[u32]) -> bool {
+        use crate::error::gds;
+        use crate::trace_log::ErrorAt;
+        let mut c = codes.to_vec();
+        c.sort_unstable();
+        match self {
+            Self::Timeout => {
+                at == Some(ErrorAt::FetchNext) && c == [gds::CANCELLED, gds::REQ_STMT_TIMEOUT]
+            }
+            Self::Cancel | Self::StaleCancel => {
+                matches!(at, Some(ErrorAt::FetchNext | ErrorAt::OpenCursor))
+                    && c == [gds::CANCELLED]
+            }
+            Self::ReqSync => at == Some(ErrorAt::FetchNext) && c == [gds::REQ_SYNC],
+        }
+    }
+
+    const ALL: [Self; 4] = [
+        Self::Timeout,
+        Self::Cancel,
+        Self::StaleCancel,
+        Self::ReqSync,
+    ];
+}
+
+/// One binding's follow-up: expected, or consumed (a second record of the
+/// follow-up shape is then ambiguous, R22 item 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FollowUp {
+    kind: FollowKind,
+    consumed: bool,
+}
+
+/// R22 item 7: an `ERROR` record of the exact follow-up shape (the
+/// header, the attachment line, the client line, the transaction line
+/// where present, the location line, one line per code, no trailer) whose
+/// location and codes are one of the follow-ups'.
+fn follow_up_shape<'r>(rec: &'r Record<'_>) -> Option<&'r [u32]> {
+    let Body::Error { codes, other_lines } = &rec.body else {
+        return None;
+    };
+    (rec.att.is_some()
+        && rec.client.is_some()
+        && *other_lines == 0
+        // A trailer under an `ERROR` record is a defect (ambiguous) at
+        // parse, before this.
+        && FollowKind::ALL
+            .iter()
+            .any(|k| k.matches(rec.header.at, codes)))
+    .then_some(codes.as_slice())
+}
+
 /// The verdict on one record before its event is built.
 enum Decision {
     /// No event (well formed, nothing read, or the agent's own).
@@ -2298,6 +2397,52 @@ impl Machine {
                 };
             }
             Event::Error => {
+                // R22 items 5 to 8, R35: the error follow-up of the credited
+                // own record before it on its binding, of the exact shape,
+                // consumed with no event; a second record of a follow-up
+                // shape once it is consumed is ambiguous (a forged copy is
+                // loud); any other error record of the binding is handled
+                // as any client's, never as the agent's own.
+                if let Some(att) = rec.att
+                    && let Resolved::Db(d) = self.resolve(att.database)
+                {
+                    let key = (d, att.id);
+                    let live_own = self.bindings.get(&key).is_some_and(|b| {
+                        b.own && b.anchored && !b.poisoned && !b.tainted && b.token == token
+                    });
+                    let shape = follow_up_shape(rec);
+                    match self.follow_ups.get(&key).copied() {
+                        Some(f)
+                            if !f.consumed
+                                && live_own
+                                && shape.is_some_and(|c| f.kind.matches(h.at, c)) =>
+                        {
+                            self.follow_ups.insert(
+                                key,
+                                FollowUp {
+                                    consumed: true,
+                                    ..f
+                                },
+                            );
+                            self.counts.follow_ups += 1;
+                            return Decision::Nothing;
+                        }
+                        Some(f) if f.consumed && shape.is_some() => {
+                            return Decision::Ambiguous {
+                                window: false,
+                                at: line!(),
+                            };
+                        }
+                        Some(f) if !f.consumed => {
+                            // Not its follow-up: the next record was another.
+                            self.follow_ups.remove(&key);
+                        }
+                        _ => {}
+                    }
+                    if live_own {
+                        self.counts.own_errors_not_followed += 1;
+                    }
+                }
                 // Their codes are kept, nothing else; follow-ups carry no
                 // object (R22 item 7). A permission refusal on a binding
                 // that is not the agent's own is an attempt to read
@@ -2339,6 +2484,9 @@ impl Machine {
             let _ = i;
         }
         let key = (db, att.id);
+        // R22: a follow-up is the next record of its binding, an `ERROR`
+        // record; any other record ends it.
+        self.follow_ups.remove(&key);
         let internal_line = att.protocol == Protocol::Internal;
         // The Garbage Collector (R6, R16, R30).
         if internal_line && att.user == "Garbage Collector" && att.role.is_none() {
@@ -2655,6 +2803,7 @@ impl Machine {
 
     fn end_binding(&mut self, key: Key) {
         self.probe_records.remove(&key);
+        self.follow_ups.remove(&key);
         if let Some(b) = self.remove_binding(key) {
             self.token_live.remove(&b.token);
             self.end_token(b.token);
@@ -3521,6 +3670,27 @@ impl Machine {
                     .and_then(|d| i64::try_from(d.as_secs()).ok())
                     .map(|c| c - measured_base);
                 self.confirm_offset(key, probe, measured);
+                // R22 items 5 and 6, R35: the credit's error follow-up, for
+                // the next record of this binding.
+                match self
+                    .ledger
+                    .consumed_account((self.file, pos))
+                    .as_ref()
+                    .and_then(FollowKind::of)
+                {
+                    Some(kind) => {
+                        self.follow_ups.insert(
+                            key,
+                            FollowUp {
+                                kind,
+                                consumed: false,
+                            },
+                        );
+                    }
+                    None => {
+                        self.follow_ups.remove(&key);
+                    }
+                }
                 Some(true)
             }
             Verdict::NotOwn => {

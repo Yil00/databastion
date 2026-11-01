@@ -1309,6 +1309,36 @@ async fn own_reads_for_the_matrix() {
     crate::views::read(&mut s, deadline).await.unwrap();
     // R30 item 3 (R20: its row of the own-statement table).
     crate::check::read_db_state(&mut s, deadline).await.unwrap();
+    // R22 item 6, R35: a row-limit cut whose extra request reaches the end
+    // of the result (the relation list read whole, then with a limit of
+    // one row less): the server writes its request synchronization error,
+    // the credit's follow-up.
+    let all = s
+        .query(
+            crate::sql::RELATIONS,
+            &crate::catalog::RELATIONS_SHAPE,
+            4096,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let n = all.rows.len();
+    eprintln!(
+        "[measure] relation list rows {n} (a cut at {} follows)",
+        n.saturating_sub(1)
+    );
+    if n >= 2 {
+        let cut = s
+            .query(
+                crate::sql::RELATIONS,
+                &crate::catalog::RELATIONS_SHAPE,
+                n - 1,
+                deadline,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cut.rows.len(), n - 1);
+    }
     let _ = s
         .query(
             crate::sql::READ_BACK_PROBE,

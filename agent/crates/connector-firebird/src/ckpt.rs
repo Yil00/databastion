@@ -27,8 +27,9 @@ pub(crate) const PURPOSE: &[u8] = b"databastion.firebird.checkpoint.v1";
 /// The longest name kept (R1 rule 11: a longer database name is
 /// ambiguous and not kept; relation and routine names are far shorter).
 pub(crate) const MAX_NAME: usize = 4096;
-/// The format version.
-pub(crate) const VERSION: u16 = 1;
+/// The format version (2: the ledger's fetch accounts carry the row-limit
+/// cut of R22 item 6; a version 1 file is refused whole, fail closed).
+pub(crate) const VERSION: u16 = 2;
 
 /// Why a checkpoint was refused (kind only, logged as such).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,10 +304,13 @@ mod tests {
         let mut longer = sealed.clone();
         longer.push(0);
         assert!(open(&k, b"FBCK", &longer).is_err());
-        // Another version.
-        let mut v2 = sealed;
-        v2[5] = 2;
-        assert_eq!(open(&k, b"FBCK", &v2), Err(Refused::Envelope));
+        // Another version (an earlier one included: version 1's ledger had
+        // no row-limit cut).
+        for v in [1u8, 3] {
+            let mut other = sealed.clone();
+            other[5] = v;
+            assert_eq!(open(&k, b"FBCK", &other), Err(Refused::Envelope));
+        }
     }
 
     #[test]

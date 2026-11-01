@@ -276,6 +276,11 @@ pub(crate) struct FetchAccount {
     /// The session was ended cleanly after a stale cancel whose
     /// `DSQL_drop` succeeded (R22 item 3, review L7).
     pub(crate) session_retired: bool,
+    /// The row limit cut the fetch (the connector asks for one row beyond
+    /// it, R22 item 6): when that request reaches the end of the result,
+    /// the server writes a request synchronization error after the finish
+    /// record (R35), the credit's follow-up.
+    pub(crate) cut: bool,
 }
 
 /// What the server answered to the client's `op_cancel` (decision 4).
@@ -952,6 +957,7 @@ impl Session {
                             }
                         } else {
                             out.cut = true;
+                            self.last_fetch.cut = true;
                         }
                     }
                     Ok(Next::End { more }) => {

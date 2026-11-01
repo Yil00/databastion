@@ -491,6 +491,16 @@ fn the_agent_records_match_the_own_statement_table() {
         "[it] own records {} not matched {} why {:?}",
         m.counts.own, m.counts.own_not_matched, m.why
     );
+    // R22 items 5 to 8, R35: the error follow-ups of the agent's own
+    // records (the row-limit cut reaching the end of the result writes
+    // one), and the own error records that were no expected follow-up.
+    eprintln!(
+        "[measure] own error follow-ups consumed {}, own error records not followed {}",
+        m.counts.follow_ups, m.counts.own_errors_not_followed
+    );
+    if ledger.dump().contains("+cut") {
+        assert!(m.counts.follow_ups >= 1, "{:?}", m.counts);
+    }
     assert!(m.counts.own > 50, "{:?}", m.counts);
     assert_eq!(m.counts.own_not_matched, 0, "{:?}", m.counts);
     assert!(m.probe_seen.is_some(), "the read-back probe (proof 7)");

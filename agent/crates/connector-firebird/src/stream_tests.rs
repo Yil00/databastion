@@ -2575,3 +2575,114 @@ fn a_restore_ends_ddl_waits_and_invalidates() {
         assert!(m.views_invalid_for_tests(0), "wait {wait}");
     }
 }
+
+/// An `ERROR` record of the agent's attachment 3 (`token`) at `at`, one
+/// line per code.
+fn own_error(head: &str, token: &str, at: &str, codes: &[&str]) -> String {
+    let mut out = format!(
+        "{head} ({token}) ERROR AT {at}\n\t{APP} (ATT_3, DATABASTION_AGENT:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n"
+    );
+    for c in codes {
+        out.push_str(&format!("{c} : a message\n"));
+    }
+    out.push('\n');
+    out
+}
+
+/// R22 items 5 to 8 and R35: a credited own record leaves one error
+/// follow-up on its binding (the row-limit cut's request synchronization
+/// error, the server's statement timeout, the connector's answered
+/// cancel), consumed with no event by the next record of that binding if
+/// it is an `ERROR` record of exactly that shape; a second record of a
+/// follow-up shape once it is consumed is ambiguous (a forged copy is
+/// loud). An error record that is no expected follow-up is handled as any
+/// client's (no event, not ambiguous), and a follow-up not met at once is
+/// dropped.
+#[test]
+fn own_error_follow_ups_are_consumed_once_and_a_second_copy_is_loud() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let a = "24:0x7f0000000100";
+    let ledger = Arc::new(Ledger::default());
+    let (head, opened) = now_head(0);
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    let account = |end, cut| FetchAccount {
+        counted: 1,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end,
+        cut,
+        ..FetchAccount::default()
+    };
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let v = crate::sql::VERSION;
+    feed_h(&head, &mut m, &cats, &attach_as(a, 3, agent), 0);
+    let sync = own_error(&head, a, "JResultSet::fetchNext", &["335544364"]);
+    // A cut read reaching the end, then its request synchronization error.
+    ledger.credit_at(APP, 3, v, account(FetchEnd::End, true), opened);
+    let mut pos = 1000;
+    let mut step = |m: &mut Machine, rec: &str| {
+        pos += 1000;
+        feed_h(&head, m, &cats, rec, pos)
+    };
+    let own = stmt(a, 3, 5, agent, v, 1, &[("RDB$DATABASE", 1)]);
+    assert!(step(&mut m, &own).is_empty());
+    assert!(step(&mut m, &sync).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (1, 0));
+    // A second copy right after: loud.
+    let out = step(&mut m, &sync);
+    assert_eq!(m.counts.ambiguous, 1, "{:?}", m.why);
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
+    // A full read leaves no follow-up: the same shape is handled as any
+    // client's error record (no event, not ambiguous).
+    ledger.credit_at(APP, 3, v, account(FetchEnd::End, false), opened);
+    assert!(step(&mut m, &stmt(a, 3, 6, agent, v, 1, &[("RDB$DATABASE", 1)])).is_empty());
+    assert!(step(&mut m, &sync).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (1, 1));
+    assert_eq!(m.counts.own_errors_not_followed, 1);
+    // The server's statement timeout: a FAILED finish, then both codes.
+    ledger.credit_at(APP, 3, v, account(FetchEnd::Failed, false), opened);
+    let failed = stmt(a, 3, 7, agent, v, 0, &[("RDB$DATABASE", 1)]).replacen(
+        ") EXECUTE_STATEMENT_FINISH",
+        ") FAILED EXECUTE_STATEMENT_FINISH",
+        1,
+    );
+    assert!(step(&mut m, &failed).is_empty());
+    let timeout = own_error(
+        &head,
+        a,
+        "JResultSet::fetchNext",
+        &["335544794", "335545129"],
+    );
+    assert!(step(&mut m, &timeout).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (2, 1));
+    // An answered cancel whose error record has the wrong shape (another
+    // code, or a message continuation line): not consumed, no event, and
+    // the follow-up is gone (a later exact copy is no follow-up either).
+    ledger.credit_at(APP, 3, v, account(FetchEnd::Cancelled, false), opened);
+    let cancelled = stmt(a, 3, 8, agent, v, 0, &[("RDB$DATABASE", 1)]).replacen(
+        ") EXECUTE_STATEMENT_FINISH",
+        ") FAILED EXECUTE_STATEMENT_FINISH",
+        1,
+    );
+    assert!(step(&mut m, &cancelled).is_empty());
+    let cont = own_error(&head, a, "JStatement::openCursor", &["335544794"])
+        .replace(" : a message\n", " : a message\n-a continuation\n");
+    assert!(step(&mut m, &cont).is_empty());
+    let cancel = own_error(&head, a, "JStatement::openCursor", &["335544794"]);
+    assert!(step(&mut m, &cancel).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (2, 1));
+    // A cancel follow-up met at once is consumed.
+    ledger.credit_at(APP, 3, v, account(FetchEnd::Cancelled, false), opened);
+    assert!(step(&mut m, &cancelled.replace("TRA_8", "TRA_9")).is_empty());
+    assert!(step(&mut m, &cancel).is_empty());
+    assert_eq!((m.counts.follow_ups, m.counts.ambiguous), (3, 1));
+    // Another binding's record of the follow-up shape is no follow-up of
+    // the agent's binding: as any client's (no event).
+    let other = sync.replace("ATT_3, DATABASTION_AGENT", "ATT_9, APP");
+    assert!(step(&mut m, &other).is_empty());
+    assert_eq!(m.counts.ambiguous, 1);
+}
