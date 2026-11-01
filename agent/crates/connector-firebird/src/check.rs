@@ -881,7 +881,10 @@ fn restore_of(row: &[Value]) -> Option<RestoreState> {
 fn linger_of(v: Option<&Value>) -> Option<u32> {
     match v? {
         Value::Null => Some(0),
-        v => v.as_int().and_then(|n| u32::try_from(n).ok()),
+        v => v
+            .as_int()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n <= crate::stream::MAX_LINGER),
     }
 }
 
@@ -1180,6 +1183,9 @@ mod tests {
         assert_eq!(linger_of(Some(&Value::Int(0))), Some(0));
         assert_eq!(linger_of(Some(&Value::Int(-1))), None);
         assert_eq!(linger_of(Some(&Value::Int(i64::from(u32::MAX) + 1))), None);
+        // Review N2: above 24 h, not known.
+        assert_eq!(linger_of(Some(&Value::Int(86_400))), Some(86_400));
+        assert_eq!(linger_of(Some(&Value::Int(86_401))), None);
         assert_eq!(linger_of(Some(&Value::Bool(true))), None);
         assert_eq!(linger_of(None), None);
     }

@@ -2378,6 +2378,9 @@ fn the_garbage_collectors_end_follows_the_linger() {
     assert_eq!(gc_end(None), Duration::from_secs(10));
     assert_eq!(gc_end(Some(0)), Duration::from_secs(10));
     assert_eq!(gc_end(Some(15)), Duration::from_secs(25));
+    // Review N2: a linger above 24 h is not known.
+    assert_eq!(gc_end(Some(MAX_LINGER)), Duration::from_secs(10 + 86_400));
+    assert_eq!(gc_end(Some(MAX_LINGER + 1)), Duration::from_secs(10));
 }
 
 /// R1 rule 5, a restore confirmed by `check()` from a changed `DB_GUID` or

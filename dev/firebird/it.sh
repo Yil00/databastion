@@ -74,6 +74,8 @@ WORK="$(mktemp -d)"
 cleanup() {
   local c=("$NAME-init" "$NAME" "$NAME-socat" "$NAME-secdb" "$NAME-rot")
   for n in $VARIANTS; do c+=("$NAME-$n"); done
+  # The restore step's backup (R1 rule 5), also when the run stops between its gbak calls.
+  timeout 30 docker exec "$NAME" rm -f /tmp/it-restore.fbk >/dev/null 2>&1 || true
   # -v: the anonymous volumes of the image's VOLUME declarations too.
   timeout 60 docker rm -f -v "${c[@]}" "$NET" >/dev/null 2>&1 || true
   timeout 60 docker volume rm "$VOLUME" "$AUDIT_VOLUME" >/dev/null 2>&1 || true

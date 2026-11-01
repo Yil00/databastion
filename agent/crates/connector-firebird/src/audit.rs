@@ -453,8 +453,8 @@ pub(crate) fn evaluate(
         not_eval.push("server_process_not_visible");
         if run.is_some_and(|(_, s)| s.is_some()) {
             detail.push(
-                "the Firebird server's computed start time is later than now (virtualised \
-                 clocks?): not bound to the running server"
+                "the Firebird server process has no wall-clock start (unreadable or later than \
+                 now): not bound to the running server"
                     .to_owned(),
             );
         }

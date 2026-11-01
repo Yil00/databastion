@@ -126,11 +126,15 @@ const OFFSET_STEP: i64 = 3600;
 /// alone: a later record of the Garbage Collector is ambiguous, loud).
 const GC_END: Duration = Duration::from_secs(10);
 
+/// The longest linger taken as known (24 h, review N2); a longer one is
+/// not known (the 10 s bound, fail closed).
+pub(crate) const MAX_LINGER: u32 = 24 * 3600;
+
 /// R30 item 3: the Garbage Collector's expected end for a database whose
 /// last check read the linger `linger` (seconds).
 pub(crate) fn gc_end(linger: Option<u32>) -> Duration {
     match linger {
-        Some(l) if l > 0 => GC_END + Duration::from_secs(u64::from(l)),
+        Some(l) if l > 0 && l <= MAX_LINGER => GC_END + Duration::from_secs(u64::from(l)),
         _ => GC_END,
     }
 }
@@ -759,7 +763,6 @@ impl Machine {
             self.seen_total = self.seen_total.saturating_sub(seen.order.len());
         }
         self.learned_floor.remove(&db);
-        self.internal.remove(&db);
         self.gc_alone_since.remove(&db);
         if let Some(id) = own_id {
             self.ledger
