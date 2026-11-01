@@ -931,3 +931,183 @@ fn the_parser_state_round_trips_and_refuses_whole() {
     assert!(q.import(&longer, now).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------- against the server's own log
+
+/// The declared databases of `dev/firebird/it.sh`'s main server.
+fn it_settings() -> Settings {
+    let names = |label: &str, path: &str| DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+        read_at: None,
+    };
+    let mut s = settings();
+    s.databases = vec![
+        names("app", "/var/lib/firebird/data/app.fdb"),
+        names("crm", "/var/lib/firebird/data/crm.fdb"),
+    ];
+    if std::env::var("FIREBIRD_IT_MAJOR").as_deref() == Ok("4") {
+        s.parse.series = Series::V4;
+    }
+    s
+}
+
+/// The server's log and the ledger of the agent's own reads that wrote
+/// part of it (`dev/firebird/it.sh`: the R20 matrix phase), and the state
+/// directory of the restart test; `None` outside it.sh.
+fn it_inputs() -> Option<(Vec<u8>, String, std::path::PathBuf)> {
+    if std::env::var("DATABASTION_IT_FIREBIRD").as_deref() != Ok("1") {
+        return None;
+    }
+    let log = std::fs::read(std::env::var("FIREBIRD_IT_AUDIT_LOG").ok()?).ok()?;
+    let dump = std::fs::read_to_string(std::env::var("FIREBIRD_IT_MATRIX_FILE").ok()?).ok()?;
+    let dir = std::path::PathBuf::from(std::env::var("FIREBIRD_IT_RESTART_DIR").ok()?);
+    Some((log, dump, dir))
+}
+
+/// The run of the server's log (the pid of its headers; a fixed start
+/// time, the same in every phase).
+fn it_run(log: &[u8]) -> Run {
+    let pid = log
+        .split(|b| *b == b'\n')
+        .find_map(|l| crate::trace_log::header(l).map(|h| h.pid))
+        .expect("a header");
+    Run {
+        pid,
+        start: Some(1),
+    }
+}
+
+/// Where the restart cuts the log: in the middle of the agent's own
+/// statement record nearest to the middle of the log.
+fn it_cut(log: &[u8]) -> usize {
+    let mut starts = Vec::new();
+    let mut at = 0;
+    for line in log.split(|b| *b == b'\n') {
+        if crate::trace_log::header(line).is_some() {
+            starts.push(at);
+        }
+        at += line.len() + 1;
+    }
+    starts.push(log.len());
+    let own: Vec<(usize, usize)> = starts
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|(a, b)| {
+            let r = &log[*a..*b];
+            let s = String::from_utf8_lossy(r);
+            s.contains("EXECUTE_STATEMENT_FINISH") && s.contains(&format!("{AGENT}:"))
+        })
+        .collect();
+    assert!(own.len() > 10, "the agent's own records are in the log");
+    let mid = log.len() / 2;
+    let (a, b) = own
+        .iter()
+        .min_by_key(|(a, _)| a.abs_diff(mid))
+        .copied()
+        .unwrap();
+    a + (b - a) / 2
+}
+
+/// One process reading `log[..upto]` appended to the test's log.
+fn it_phase(
+    dir: &std::path::Path,
+    log: &[u8],
+    from: usize,
+    upto: usize,
+    ledger: Arc<Ledger>,
+) -> (Counts, CkptCounts, usize) {
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("audit.log"))
+        .unwrap();
+    f.write_all(&log[from..upto]).unwrap();
+    drop(f);
+    let mut p = Proc::start_with(dir, ledger, it_settings(), it_run(log));
+    p.read();
+    p.spooled();
+    p.commit();
+    let n = p.out.len();
+    (p.m.counts, p.counts().1, n)
+}
+
+fn it_fresh(dir: &std::path::Path, log: &[u8]) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("audit.log"), b"").unwrap();
+    let mut p = Proc::start_with(dir, Arc::new(Ledger::default()), it_settings(), it_run(log));
+    p.read();
+    p.commit();
+}
+
+/// it.sh, first agent process: the server's log up to the middle of one of
+/// the agent's own records, read with the ledger of the reads that wrote
+/// it; the process then ends (its checkpoint and ledger on disk).
+#[test]
+fn it_restart_phase_1_reads_up_to_a_cut_own_record() {
+    let Some((log, dump, dir)) = it_inputs() else {
+        return;
+    };
+    databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+    crate::fsread::allow_own_files_for_tests();
+    let run = dir.join("run");
+    it_fresh(&run, &log);
+    let cut = it_cut(&log);
+    let ledger = Arc::new(Ledger::load(&dump));
+    let (c, k, n) = it_phase(&run, &log, 0, cut, ledger);
+    eprintln!(
+        "[it] restart phase 1: cut at {cut} of {}, {n} events, {c:?}, {k:?}",
+        log.len()
+    );
+    assert!(k.written >= 1, "{k:?}");
+    assert!(c.own > 0, "{c:?}");
+}
+
+/// it.sh, second agent process (a new OS process, an empty ledger): the
+/// rest of the log. With the checkpoint and the persisted ledger, the two
+/// processes together read the log as one process without a restart does:
+/// the same own records credited, the same ambiguous records, the same
+/// number of events (none of the agent's own reads reported, no record
+/// made ambiguous by the restart).
+#[test]
+fn it_restart_phase_2_reads_the_rest_as_without_a_restart() {
+    let Some((log, dump, dir)) = it_inputs() else {
+        return;
+    };
+    databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+    crate::fsread::allow_own_files_for_tests();
+    let run = dir.join("run");
+    if !run.join("audit.log").exists() {
+        panic!("phase 1 did not run");
+    }
+    let cut = it_cut(&log);
+    let (c2, k2, n2) = it_phase(&run, &log, cut, log.len(), Arc::new(Ledger::default()));
+    assert_eq!(k2.restored, 1, "{k2:?}");
+    // Phase 1 again in this process, for its counts (a fresh directory).
+    let one = dir.join("one");
+    it_fresh(&one, &log);
+    let (c1, _, n1) = it_phase(&one, &log, 0, cut, Arc::new(Ledger::load(&dump)));
+    // The reference: one process, no restart.
+    let reference = dir.join("ref");
+    it_fresh(&reference, &log);
+    let (cr, _, nr) = it_phase(
+        &reference,
+        &log,
+        0,
+        log.len(),
+        Arc::new(Ledger::load(&dump)),
+    );
+    eprintln!(
+        "[it] restart phase 2: {n2} events, own {} + {} vs {}, ambiguous {} + {} vs {}, events {n1} + {n2} vs {nr}",
+        c1.own, c2.own, cr.own, c1.ambiguous, c2.ambiguous, cr.ambiguous
+    );
+    assert_eq!(c1.own + c2.own, cr.own, "the agent's own records, credited");
+    assert_eq!(c1.ambiguous + c2.ambiguous, cr.ambiguous, "{:?}", c2);
+    assert_eq!(n1 + n2, nr, "the same events");
+    for d in [run, one, reference] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
