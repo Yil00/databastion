@@ -546,6 +546,30 @@ impl Ledger {
             .max()
     }
 
+    /// R1 rule 5, a confirmed restore: the database's own attachments
+    /// closed before attachment `id` (the check that confirmed it) opened
+    /// are forgotten, so that the restored database's lower ids are not
+    /// matched against them and the run bound starts again from its own
+    /// ids. Without that attachment, nothing is forgotten.
+    pub(crate) fn forget_closed_before(&self, attach: &str, id: u64) {
+        let mut s = self.state();
+        let Some(at) = s
+            .attachments
+            .iter()
+            .find(|a| a.attach == attach && a.id == id)
+            .map(|a| a.opened)
+        else {
+            return;
+        };
+        let before = s.attachments.len();
+        s.attachments
+            .retain(|a| a.attach != attach || a.closed.is_none_or(|c| c >= at));
+        if s.attachments.len() != before {
+            drop(s);
+            self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// The server pid the agent's attachments saw last (R1 rule 1).
     pub(crate) fn server_pid(&self) -> Option<u32> {
         self.state().attachments.last().map(|a| a.pid)

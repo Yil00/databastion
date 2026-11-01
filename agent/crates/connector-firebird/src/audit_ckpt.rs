@@ -480,6 +480,10 @@ impl Checkpointer {
         match result {
             Ok(()) => {
                 m.clear_invalidations();
+                // R1 rule 5: a database restored while the agent was
+                // stopped (the check's attachment id below the restored
+                // watermark) starts its attachments again.
+                m.apply_restores();
                 // L10 (decision of 2026-11-01): a database whose check
                 // results differ from any in force since the state's
                 // position is invalidated for every record of the file read

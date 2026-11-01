@@ -440,6 +440,14 @@ fi
   printf 'ALTER DATABASE SET LINGER TO 7;\nCOMMIT;\n'
 } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA >/dev/null
 
+# ADR-0060 R1 rule 5 (R60): a database outside the trace and the dev seed, restored between two
+# phases of it::restore_state_phase_* (below) with gbak through the services API.
+{
+  cat "$WORK/root.pw"
+  printf "CREATE DATABASE '127.0.0.1/%s:/var/lib/firebird/data/restore.fdb';\n" "$PORT"
+  printf 'CREATE TABLE T (ID INTEGER);\nCOMMIT;\n'
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA >/dev/null
+
 # The tests run in the network namespace, as the calling user.
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
 run_tests() { # filter, then extra NAME=value settings
@@ -560,6 +568,18 @@ run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" 
   FIREBIRD_IT_DEFECT_LOG="$WORK/defect.log" \
   FIREBIRD_IT_TZ_OFFSET="${FIREBIRD_IT_TZ_OFFSET:-0}" \
   FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_BOOLEANS_FILE="$WORK/booleans.txt"
+
+# R1 rule 5 (R60): the restore state before and after a gbak restore that replaces restore.fdb.
+# After every copy of the trace log: the restore's service record (of a database the trace does
+# not declare) is ambiguous for the declared ones (fail closed), which the log tests do not expect.
+run_tests it::restore_state_phase_1 FIREBIRD_IT_RESTORE_FILE="$WORK/restore.txt" >&2
+[ -s "$WORK/restore.txt" ] || { echo "[it] the restore state was not read" >&2; exit 1; }
+as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
+  /var/lib/firebird/data/restore.fdb /tmp/it-restore.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
+as_sysdba /opt/firebird/bin/gbak -rep -se "127.0.0.1/$PORT:service_mgr" \
+  /tmp/it-restore.fbk /var/lib/firebird/data/restore.fdb -user SYSDBA < "$WORK/root.pw" >/dev/null
+timeout 60 docker exec "$NAME" rm -f /tmp/it-restore.fbk
+run_tests it::restore_state_phase_2 FIREBIRD_IT_RESTORE_FILE="$WORK/restore.txt" >&2
 
 # 5. The host identity files of the readers check (ADR-0060 refinement of 2026-10-31, R52 items 1
 # to 3), on the real kernel: single-file read-only bind mounts of this host's own identity files in

@@ -152,6 +152,17 @@ pub(crate) struct DeclaredNames {
     pub(crate) read_at: Option<SystemTime>,
 }
 
+/// What the last `check()` gives the stream for R1 rule 5, per declared
+/// database (the order of [`Settings::databases`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RestoreFacts {
+    /// Restores the checks of this process confirmed from a changed
+    /// `DB_GUID` or `MON$CREATION_DATE` (a count).
+    pub(crate) confirmed: u64,
+    /// The check attachment's `CURRENT_CONNECTION`.
+    pub(crate) own_id: Option<u64>,
+}
+
 /// Database identity (R1 rule 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum DbId {
@@ -446,6 +457,8 @@ pub(crate) struct Counts {
     /// block or count matched no credit's own-statement table row (the
     /// engine-matrix test of R20 expects none).
     pub(crate) own_not_matched: u64,
+    /// Restores confirmed by `check()` and applied (R1 rule 5).
+    pub(crate) restores: u64,
 }
 
 /// The stream's settings.
@@ -589,6 +602,10 @@ pub(crate) struct Machine {
     /// every relation counts as dependent for the records re-read before
     /// that process's read end, `(database, file, end)`.
     reread_invalid: Vec<(usize, (u64, u64), u64)>,
+    /// R1 rule 5: the last check's restore facts, and per declared
+    /// `attach` the confirmed-restore count already applied.
+    restore_facts: Vec<RestoreFacts>,
+    restores_seen: HashMap<String, u64>,
 }
 
 /// What the machine emits: an event and the declared databases it goes to.
@@ -654,7 +671,101 @@ impl Machine {
             unkeyed: false,
             suppress_cleared: false,
             reread_invalid: Vec::new(),
+            restore_facts: Vec::new(),
+            restores_seen: HashMap::new(),
         }
+    }
+
+    /// R1 rule 5, at the stream's start: the restores the checks confirmed
+    /// before it are not applied again (the stream starts with no state, or
+    /// with a checkpoint's, which the watermark rule covers).
+    pub(crate) fn restore_baseline(&mut self, facts: &[RestoreFacts]) {
+        self.restores_seen = self
+            .s
+            .databases
+            .iter()
+            .zip(facts)
+            .map(|(d, f)| (d.attach.clone(), f.confirmed))
+            .collect();
+        self.restore_facts = facts.to_vec();
+    }
+
+    /// R1 rule 5: a new check's restore facts, applied at once.
+    pub(crate) fn set_restore_facts(&mut self, facts: Vec<RestoreFacts>) {
+        self.restore_facts = facts;
+        self.apply_restores();
+    }
+
+    /// R1 rule 5: restores are recognised from `check()` only, never from
+    /// a log record. A declared database is restored when a check of this
+    /// process read another `DB_GUID` or `MON$CREATION_DATE` than the one
+    /// before, or when the check attachment's `CURRENT_CONNECTION` is below
+    /// the database's watermark (attachment ids grow within a database's
+    /// life, so a lower one is a new life: this also covers a restore while
+    /// the agent was stopped, against a restored checkpoint's watermark).
+    /// Then the database's bindings end, its own-attachment set, watermark,
+    /// highest and seen ids and learned floor are cleared, and the ledger
+    /// forgets its own attachments closed before the check's. Returns the
+    /// databases restored.
+    pub(crate) fn apply_restores(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..self.s.databases.len().min(self.restore_facts.len()) {
+            let f = self.restore_facts[i];
+            let d = &self.s.databases[i];
+            if d.excluded {
+                continue;
+            }
+            let seen = self.restores_seen.get(&d.attach).copied().unwrap_or(0);
+            let by_state = f.confirmed > seen;
+            let by_id = f
+                .own_id
+                .zip(self.watermark.get(&i).copied())
+                .is_some_and(|(own, w)| own < w);
+            self.restores_seen.insert(d.attach.clone(), f.confirmed);
+            if by_state || by_id {
+                self.restore_db(i, f.own_id);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// R1 rule 5: a confirmed restore of declared database `i`.
+    fn restore_db(&mut self, i: usize, own_id: Option<u64>) {
+        let db = DbId::Declared(i);
+        let keys: Vec<Key> = self
+            .bindings
+            .keys()
+            .filter(|k| k.0 == db)
+            .copied()
+            .collect();
+        for k in keys {
+            self.end_binding(k);
+        }
+        // Its DDL transactions end with its bindings (as at a run's end,
+        // re-review L-5): invalidated until the next check.
+        let before = self.ddl_open.len();
+        self.ddl_open.retain(|(k, _), _| k.0 != db);
+        if self.ddl_open.len() != before {
+            self.invalidate(i, SystemTime::now());
+        }
+        self.watermark.remove(&i);
+        self.highest.remove(&db);
+        if let Some(seen) = self.seen_ids.remove(&db) {
+            self.seen_total = self.seen_total.saturating_sub(seen.order.len());
+        }
+        self.learned_floor.remove(&db);
+        self.internal.remove(&db);
+        self.gc_alone_since.remove(&db);
+        if let Some(id) = own_id {
+            self.ledger
+                .forget_closed_before(&self.s.databases[i].attach, id);
+        }
+        self.counts.restores += 1;
+        tracing::info!(
+            database = i,
+            "Firebird declared database restored (R1 rule 5): its attachments start again"
+        );
     }
 
     /// The suppressed positions the read has passed are dropped: those

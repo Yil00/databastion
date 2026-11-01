@@ -333,7 +333,12 @@ async fn run(
             attach: db.attach.clone(),
             label: db.name.clone(),
             resolved: file.0,
-            catalog: crate::audit::Classes::from_catalog(&read, deps).with_linger(db_state.linger),
+            catalog: crate::audit::Classes::from_catalog(&read, deps)
+                .with_linger(db_state.linger)
+                .with_restore(db_state.restore.clone()),
+            state: db_state,
+            restores: 0,
+            restore_seen: None,
             excluded: reason.is_some(),
             read_at: Some(read_at),
         });
@@ -796,13 +801,44 @@ pub(crate) async fn attached(
 
 /// What `check()` reads of a declared database's state for the Audit
 /// stream, on its own attachment, where Audit is configured: the linger
-/// (ADR-0060 R30 item 3). Each part is `None` when its read failed, was
-/// cut or gave a value out of range (the stream then keeps its fail-closed
-/// default).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// (ADR-0060 R30 item 3) and the restore state of R1 rule 5. Each part is
+/// `None` when its read failed, was cut or gave a value out of range (the
+/// stream then keeps its fail-closed default).
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct DbState {
     /// `RDB$LINGER` in seconds; NULL (never set) is 0.
     pub(crate) linger: Option<u32>,
+    /// `DB_GUID` and `MON$CREATION_DATE` (UTC), as the server prints them:
+    /// a restore changes both (R1 rule 5). Kept in memory and compared;
+    /// only a keyed digest of them is persisted, nothing is logged.
+    pub(crate) restore: Option<RestoreState>,
+    /// The check attachment's `CURRENT_CONNECTION` (R1 rule 5: below the
+    /// stream's watermark, a restore).
+    pub(crate) own_id: Option<u64>,
+}
+
+/// A database's restore state (R1 rule 5).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RestoreState {
+    pub(crate) guid: String,
+    pub(crate) created: String,
+}
+
+// No value of the restore state in a `Debug` output.
+impl std::fmt::Debug for DbState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbState")
+            .field("linger", &self.linger)
+            .field("restore", &self.restore.is_some())
+            .field("own_id", &self.own_id)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RestoreState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestoreState").finish_non_exhaustive()
+    }
 }
 
 /// Reads [`DbState`]: constant texts of the closed set, one row each,
@@ -813,7 +849,31 @@ pub(crate) async fn read_db_state(s: &mut Session, deadline: Instant) -> Result<
         .filter(|r| !r.cut)
         .and_then(|r| r.rows.into_iter().next())
         .and_then(|row| linger_of(row.first()));
-    Ok(DbState { linger })
+    let restore = soft(
+        s.query(
+            sql::RESTORE_STATE,
+            &[Col::Text(152), Col::Text(160)],
+            1,
+            deadline,
+        )
+        .await,
+    )?
+    .filter(|r| !r.cut)
+    .and_then(|r| r.rows.into_iter().next())
+    .and_then(|row| restore_of(&row));
+    Ok(DbState {
+        linger,
+        restore,
+        own_id: s.own_id(),
+    })
+}
+
+/// The restore state of a [`sql::RESTORE_STATE`] row: both values
+/// present and not empty, else not known.
+fn restore_of(row: &[Value]) -> Option<RestoreState> {
+    let guid = text(row, 0)?.trim_end().to_owned();
+    let created = text(row, 1)?.trim_end().to_owned();
+    (!guid.is_empty() && !created.is_empty()).then_some(RestoreState { guid, created })
 }
 
 /// The linger of an `RDB$LINGER` value: NULL (never set) is no linger;
@@ -1122,6 +1182,29 @@ mod tests {
         assert_eq!(linger_of(Some(&Value::Int(i64::from(u32::MAX) + 1))), None);
         assert_eq!(linger_of(Some(&Value::Bool(true))), None);
         assert_eq!(linger_of(None), None);
+    }
+
+    /// R1 rule 5: both values, else not known; never in a `Debug`.
+    #[test]
+    fn the_restore_state_of_its_row() {
+        let t = |v: &str| Value::Text(zeroize::Zeroizing::new(v.to_owned()));
+        let guid = "{7B84540A-B509-4339-814B-BE0BE13B6347}";
+        let r = restore_of(&[t(guid), t("2026-11-01 14:16:12.3840 UTC")]).unwrap();
+        assert_eq!(r.guid, guid);
+        assert!(restore_of(&[t(guid), Value::Null]).is_none());
+        assert!(restore_of(&[Value::Null, t("x")]).is_none());
+        assert!(restore_of(&[t(""), t("x")]).is_none());
+        assert!(restore_of(&[t(guid)]).is_none());
+        let d = DbState {
+            linger: Some(0),
+            restore: Some(r),
+            own_id: Some(7),
+        };
+        let shown = format!("{d:?}");
+        assert!(
+            !shown.contains("7B84540A") && !shown.contains("2026"),
+            "{shown}"
+        );
     }
 
     #[test]

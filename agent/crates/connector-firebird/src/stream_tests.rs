@@ -2379,3 +2379,129 @@ fn the_garbage_collectors_end_follows_the_linger() {
     assert_eq!(gc_end(Some(0)), Duration::from_secs(10));
     assert_eq!(gc_end(Some(15)), Duration::from_secs(25));
 }
+
+/// R1 rule 5, a restore confirmed by `check()` from a changed `DB_GUID` or
+/// `MON$CREATION_DATE`: the restored database's attachment ids restart
+/// low. Before the confirmation, a new low id is out of order (ambiguous,
+/// as before); once the check confirms the restore, the database's
+/// bindings, highest and seen ids start again and the same attach is
+/// normal. The same facts again restore nothing more; a restore the checks
+/// confirmed before the stream started is not applied (the baseline).
+#[test]
+fn a_restore_confirmed_by_the_check_starts_the_attachments_again() {
+    for confirm in [false, true] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(1),
+        });
+        m.restore_baseline(&[RestoreFacts {
+            confirmed: 4,
+            own_id: None,
+        }]);
+        let cat = Cat;
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let now = Instant::now();
+        feed_raw(
+            &mut m,
+            &cats,
+            attach("24:0x7f0000000200", 500, APP).as_bytes(),
+            0,
+            now,
+        );
+        assert_eq!(m.counts.ambiguous, 0);
+        if confirm {
+            m.set_restore_facts(vec![RestoreFacts {
+                confirmed: 5,
+                own_id: None,
+            }]);
+            assert_eq!(m.counts.restores, 1);
+            m.set_restore_facts(vec![RestoreFacts {
+                confirmed: 5,
+                own_id: None,
+            }]);
+            assert_eq!(m.counts.restores, 1, "applied once");
+        } else {
+            m.set_restore_facts(vec![RestoreFacts {
+                confirmed: 4,
+                own_id: None,
+            }]);
+            assert_eq!(m.counts.restores, 0, "the baseline");
+        }
+        feed_raw(
+            &mut m,
+            &cats,
+            attach("24:0x7f0000000300", 5, APP).as_bytes(),
+            1000,
+            now,
+        );
+        assert_eq!(m.counts.ambiguous > 0, !confirm, "{:?}", m.why);
+    }
+}
+
+/// R1 rule 5, the other condition: the check attachment's
+/// `CURRENT_CONNECTION` below the watermark (the agent's first own
+/// attachment read in the run) is a restore. The ledger then forgets the
+/// earlier life's own attachments closed before the check's, so the run
+/// bound starts from the restored database's ids; an id at or above the
+/// watermark is no restore.
+#[test]
+fn a_check_attachment_below_the_watermark_is_a_restore() {
+    let ledger = Arc::new(Ledger::default());
+    let (head, printed) = now_head(0);
+    ledger.register_at(APP, 480, 40480, 24, printed);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    m.restore_baseline(&[RestoreFacts::default()]);
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let own = "24:0x7f0000000100";
+    feed_h(
+        &head,
+        &mut m,
+        &cats,
+        &attach_as(own, 480, "DATABASTION_AGENT"),
+        0,
+    );
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    ledger.note_detach(APP, 480);
+    // A check at or above the watermark: no restore.
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(480),
+    }]);
+    assert_eq!(m.counts.restores, 0);
+    // The check of the restored database attached as id 7.
+    ledger.register_at(
+        APP,
+        7,
+        40007,
+        24,
+        std::time::SystemTime::now() + Duration::from_secs(1),
+    );
+    assert_eq!(ledger.latest_id(APP), Some(480));
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(7),
+    }]);
+    assert_eq!(m.counts.restores, 1);
+    assert_eq!(ledger.latest_id(APP), Some(7), "the earlier life forgotten");
+    // The restored database's attaches are in order again.
+    feed_h(
+        &head,
+        &mut m,
+        &cats,
+        &attach("24:0x7f0000000300", 8, APP),
+        1000,
+    );
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    // Applied once: the watermark is set again from the next own attach.
+    m.set_restore_facts(vec![RestoreFacts {
+        confirmed: 0,
+        own_id: Some(7),
+    }]);
+    assert_eq!(m.counts.restores, 1);
+}

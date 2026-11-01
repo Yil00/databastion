@@ -202,6 +202,12 @@ pub(crate) const ROUTINES: &str = "SELECT CAST(P.RDB$PROCEDURE_NAME AS VARCHAR(2
 /// 5.0.4).
 pub(crate) const LINGER: &str = "SELECT CAST(RDB$LINGER AS INTEGER) FROM RDB$DATABASE";
 
+/// A declared database's restore state (ADR-0060 R1 rule 5, measurement
+/// 8d): `DB_GUID` and `MON$CREATION_DATE` (in UTC, so that the session's
+/// time zone does not change it), both changed by a restore (measured
+/// with `gbak -rep` on 4.0.7 and 5.0.4), readable by the minimal account.
+pub(crate) const RESTORE_STATE: &str = "SELECT CAST(RDB$GET_CONTEXT('SYSTEM', 'DB_GUID') AS VARCHAR(38) CHARACTER SET UTF8), CAST(MON$CREATION_DATE AT TIME ZONE 'UTC' AS VARCHAR(40) CHARACTER SET UTF8) FROM MON$DATABASE";
+
 pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "version",
@@ -298,6 +304,10 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "linger",
         text: LINGER,
+    },
+    Statement {
+        name: "restore_state",
+        text: RESTORE_STATE,
     },
 ];
 
