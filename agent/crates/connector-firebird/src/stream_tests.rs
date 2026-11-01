@@ -2830,3 +2830,102 @@ fn an_external_source_without_a_caller_is_ambiguous() {
     assert!(m.counts.ambiguous >= 1);
     assert_eq!(m.ext_holds_for_tests(), 0);
 }
+
+/// R1 rule 9: a new TCP binding whose client address and port another live
+/// binding holds is ambiguous (and tainted until it detaches); once the
+/// first detaches, the port may come back. With the runner's observation
+/// of a fresh read, a binding still live whose client end no connection of
+/// the server has is ambiguous; found, not evaluated (the table not read
+/// whole), detached later in the same read, or a record not fresh, it is
+/// not.
+#[test]
+fn tcp_lines_are_corroborated_by_the_servers_connections() {
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let (a, b, c) = (
+        "24:0x7f0000000100",
+        "24:0x7f0000000200",
+        "24:0x7f0000000300",
+    );
+    // Attachment 4's line printed with attachment 3's port.
+    let same_port = attach(b, 4, APP).replace("127.0.0.1/40004", "127.0.0.1/40003");
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let _ = feed(
+        &mut m,
+        &cats,
+        &format!("{}{same_port}", attach(a, 3, APP)),
+        0,
+    );
+    assert_eq!(
+        (m.counts.tcp_reused, m.counts.ambiguous),
+        (1, 1),
+        "{:?}",
+        m.why
+    );
+    let detach_a = format!(
+        "{HEAD} ({a}) DETACH_DATABASE\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\n"
+    );
+    // The tainted second binding holds the port too until it detaches.
+    let detach_b = detach_a.replace(a, b).replace("ATT_3", "ATT_4");
+    let again = attach(c, 5, APP).replace("127.0.0.1/40005", "127.0.0.1/40003");
+    let _ = feed(
+        &mut m,
+        &cats,
+        &format!("{detach_a}{detach_b}{again}"),
+        10_000,
+    );
+    assert_eq!(m.counts.tcp_reused, 1, "the port is free again");
+    let ep = |p: u16| std::net::SocketAddr::from(([127, 0, 0, 1], p));
+    let view = |clients: Option<Vec<u16>>, fresh: Option<u64>| TcpView {
+        file: (0, 0),
+        fresh_from: fresh,
+        clients: clients.map(|v| v.into_iter().map(ep).collect()),
+        detached: std::collections::HashMap::new(),
+    };
+    let cases: [(TcpView, u64, u64); 4] = [
+        // No socket for the printed port: ambiguous.
+        (view(Some(vec![40099]), Some(0)), 1, 0),
+        // Found.
+        (view(Some(vec![40007]), Some(0)), 0, 0),
+        // The table was not read whole: not evaluated.
+        (view(None, Some(0)), 0, 1),
+        // Not written within 10 s (the agent lags): not evaluated.
+        (view(Some(vec![]), None), 0, 0),
+    ];
+    for (i, (v, no_socket, not_evaluated)) in cases.into_iter().enumerate() {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        m.set_tcp_view(Some(v));
+        let _ = feed(&mut m, &cats, &attach(a, 7, APP), 0);
+        assert_eq!(m.counts.tcp_no_socket, no_socket, "case {i}");
+        assert_eq!(m.counts.tcp_not_evaluated, not_evaluated, "case {i}");
+        assert_eq!(m.counts.ambiguous, no_socket, "case {i}: {:?}", m.why);
+    }
+    // Detached later in the same read: no longer live when the table was
+    // read, not evaluated.
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let mut v = view(Some(vec![]), Some(0));
+    v.detached.insert((24, 0x7f00_0000_0100), vec![1_000_000]);
+    m.set_tcp_view(Some(v));
+    let _ = feed(&mut m, &cats, &attach(a, 7, APP), 0);
+    assert_eq!((m.counts.tcp_no_socket, m.counts.ambiguous), (0, 0));
+    // A binding made ambiguous by rule 9 is tainted: its read is reported
+    // ambiguous too, and it is never the agent's own.
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.set_tcp_view(Some(view(Some(vec![]), Some(0))));
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{}{}",
+            attach(a, 7, APP),
+            select(a, 7, 9, APP, "PAYROLL", 1)
+        ),
+        0,
+    );
+    assert!(
+        out.iter()
+            .filter(|(_, e)| e.objects().iter().any(|o| o.object().as_str() == "PAYROLL"))
+            .all(|(_, e)| e.always_report())
+    );
+    assert!(m.counts.ambiguous >= 2);
+}

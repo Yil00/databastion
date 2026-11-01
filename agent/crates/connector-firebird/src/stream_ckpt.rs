@@ -285,6 +285,7 @@ impl Machine {
             }
             w.u8(b.sweep_step);
             w.bool(b.own);
+            w.opt_u64(b.addr);
             match b.trigger_wait {
                 None => w.u8(0),
                 Some(TriggerWait::Disconnect(t)) => {
@@ -674,6 +675,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
         }
         let sweep_step = d.r.u8()?;
         let own = d.r.bool()?;
+        let addr = d.r.opt_u64()?;
         let trigger_wait = match d.r.u8()? {
             0 => None,
             1 => Some(TriggerWait::Disconnect(d.r.u64()?)),
@@ -695,6 +697,7 @@ fn decode(d: &mut Dec<'_, '_>, now: Instant) -> Result<Decoded, Bad> {
                 sweep_step,
                 own,
                 trigger_wait,
+                addr,
             },
         ));
     }

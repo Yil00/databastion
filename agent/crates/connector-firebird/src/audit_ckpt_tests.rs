@@ -152,6 +152,9 @@ impl Proc {
             batch: None,
             stop: None,
             sample: None,
+            server_port: None,
+            eofs: std::collections::VecDeque::new(),
+            last_eof: None,
         };
         Self {
             r,

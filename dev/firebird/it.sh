@@ -599,12 +599,45 @@ as_sysdba /opt/firebird/bin/gbak -rep -se "127.0.0.1/$PORT:service_mgr" \
 timeout 60 docker exec "$NAME" rm -f /tmp/it-restore.fbk
 run_tests it::restore_state_phase_2 FIREBIRD_IT_RESTORE_FILE="$WORK/restore.txt" >&2
 
+# ADR-0060 R1 rule 9 (the remote 4-tuple): an isql session held attached (its standard input left
+# open) while audit::tests::it_tcp_corroboration reads its records as a live stream does; then the
+# measurement of security review N7: the server's connection tables sampled during a service_mgr
+# backup and 1 s after it (raw /proc/net/tcp copies, no secret), with the backup's records.
+LOGF=/var/lib/firebird/audit/audit.log
+L1="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
+{
+  cat "$WORK/root.pw"
+  # shellcheck disable=SC2016 # A Firebird name, not a shell expansion.
+  echo 'SELECT COUNT(*) FROM RDB$DATABASE;'
+  sleep 25
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null &
+HELD=$!
+sleep 4
+timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L1 + 1))" > "$WORK/tcp.log"
+L2="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
+# shellcheck disable=SC2016 # The inner shell's loop.
+timeout 60 $SUDO nsenter --net="/proc/$PID/ns/net" sh -c \
+  'for i in $(seq 1 150); do cat /proc/net/tcp /proc/net/tcp6; echo ==; sleep 0.02; done' \
+  > "$WORK/svc-samples.txt" &
+SAMPLER=$!
+as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
+  /var/lib/firebird/data/crm.fdb /tmp/it-crm.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
+wait "$SAMPLER"
+sleep 1
+timeout 30 $SUDO nsenter --net="/proc/$PID/ns/net" cat /proc/net/tcp /proc/net/tcp6 >> "$WORK/svc-samples.txt"
+timeout 60 docker exec "$NAME" rm -f /tmp/it-crm.fbk
+sleep 2
+timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" | tail -c +"$((L2 + 1))" > "$WORK/svc.log"
+run_tests audit::tests::it_tcp_corroboration FIREBIRD_IT_TCP_LOG="$WORK/tcp.log" \
+  FIREBIRD_IT_SVC_LOG="$WORK/svc.log" FIREBIRD_IT_SVC_SAMPLES="$WORK/svc-samples.txt" >&2
+wait "$HELD" || true
+
 # ADR-0060 R1 rule 2 (the stop): the main server restarted under another pid (a shell starts a few
 # processes before the server, so its pid differs from the first run's, which was the container's
 # first process), then an isql workload. The log written from just before the restart is read by
 # audit::tests::it_run_change: the stream stops at the first record of the new pid, the agent's own
 # attachment reads the server's pid, and with it no record of the new run is ambiguous.
-LOGF=/var/lib/firebird/audit/audit.log
 L0="$(timeout 30 docker exec --user 84:84 "$NAME" stat -c %s "$LOGF")"
 OLD_PID="$(timeout 60 docker exec --user 84:84 "$NAME" cat "$LOGF" \
   | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ \([0-9]+:' | tail -n 1 | sed 's/.*(//; s/://')"

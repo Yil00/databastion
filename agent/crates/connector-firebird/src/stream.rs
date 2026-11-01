@@ -78,8 +78,15 @@
 //!   finish record of code meanwhile); otherwise every record of it is
 //!   ambiguous.
 //!
-//! Not implemented here (fail closed, listed in the lot 3 report): R1
-//! rule 9.
+//! - **The remote 4-tuple** (R1 rule 9, with security review L11 of
+//!   2026-10-26): a new TCP binding whose client address and port another
+//!   live binding holds is ambiguous (tainted until it detaches); so is
+//!   one whose `ATTACH_DATABASE` was written within 10 s of being read (past
+//!   an end of file the runner saw less than 10 s earlier), still live
+//!   when the runner read the server's connections after that read (no
+//!   `DETACH_DATABASE` of its token later in the read), with no connection
+//!   of the server's port that has its client end ([`TcpView`]). Not
+//!   evaluated when the agent lags or the table was not read whole.
 
 #[path = "stream_ckpt.rs"]
 mod stream_ckpt;
@@ -266,6 +273,8 @@ struct Binding {
     own: bool,
     /// A database trigger waiting for its sequence (R15 item 2, R34).
     trigger_wait: Option<TriggerWait>,
+    /// R1 rule 9: a keyed hash of its TCP line's client address and port.
+    addr: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,6 +528,15 @@ pub(crate) struct Counts {
     pub(crate) own_not_matched: u64,
     /// Restores confirmed by `check()` and applied (R1 rule 5).
     pub(crate) restores: u64,
+    /// R1 rule 9: new TCP bindings ambiguous for a client address and port
+    /// another live binding holds, for no matching socket, and attaches
+    /// read within 10 s whose socket condition could not be evaluated (the
+    /// table not read whole).
+    pub(crate) tcp_reused: u64,
+    pub(crate) tcp_no_socket: u64,
+    pub(crate) tcp_not_evaluated: u64,
+    /// R1 rule 9: fresh TCP attaches whose socket was found.
+    pub(crate) tcp_corroborated: u64,
     /// Error follow-ups of the agent's own records consumed (R22, R35).
     pub(crate) follow_ups: u64,
     /// `ERROR` records of the agent's own anchored bindings that were no
@@ -693,6 +711,8 @@ pub(crate) struct Machine {
     /// a consumed one, so a forged second copy right after a restart is not
     /// loud, which hides nothing either).
     follow_ups: HashMap<Key, FollowUp>,
+    /// R1 rule 9: the runner's observation of the current read.
+    tcp: Option<TcpView>,
     /// R29: the external-source bindings whose events are held.
     ext: HashMap<Key, ExtHold>,
     /// Their held events and bytes (the stream's bounds).
@@ -773,6 +793,7 @@ impl Machine {
             restore_facts: Vec::new(),
             restores_seen: HashMap::new(),
             follow_ups: HashMap::new(),
+            tcp: None,
             ext: HashMap::new(),
             ext_events: 0,
             ext_bytes: 0,
@@ -1597,6 +1618,53 @@ impl Machine {
         };
         let k = (d, att.id);
         self.ext.contains_key(&k).then_some(k)
+    }
+
+    /// R1 rule 9: the runner's observation for the records handed next.
+    pub(crate) fn set_tcp_view(&mut self, v: Option<TcpView>) {
+        self.tcp = v;
+    }
+
+    /// R1 rule 9 for a new TCP binding at `pos` with `token`: ambiguous
+    /// when another live binding holds the same client address and port,
+    /// or, for a record written within 10 s and a binding still live when
+    /// the table was read, when no server connection has that client end.
+    fn tcp_breach(
+        &mut self,
+        addr: u64,
+        ep: std::net::SocketAddr,
+        token: (u32, u64),
+        pos: u64,
+    ) -> bool {
+        if self.bindings.values().any(|b| b.addr == Some(addr)) {
+            self.counts.tcp_reused += 1;
+            return true;
+        }
+        let Some(v) = self.tcp.as_ref() else {
+            return false;
+        };
+        let fresh = v.file == self.file && v.fresh_from.is_some_and(|f| pos >= f);
+        let detached = v
+            .detached
+            .get(&token)
+            .is_some_and(|ps| ps.iter().any(|p| *p > pos));
+        if !fresh || detached {
+            return false;
+        }
+        match &v.clients {
+            None => {
+                self.counts.tcp_not_evaluated += 1;
+                false
+            }
+            Some(c) if c.contains(&ep) => {
+                self.counts.tcp_corroborated += 1;
+                false
+            }
+            Some(_) => {
+                self.counts.tcp_no_socket += 1;
+                true
+            }
+        }
     }
 
     /// Test support: external-source holds pending.
@@ -2429,6 +2497,26 @@ fn follow_up_shape<'r>(rec: &'r Record<'_>) -> Option<&'r [u32]> {
     .then_some(codes.as_slice())
 }
 
+/// R1 rule 9: what the runner observed for the records of one read, for
+/// the remote 4-tuple corroboration.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TcpView {
+    /// The log file the read was of.
+    pub(crate) file: (u64, u64),
+    /// Records at or after this offset were written within the last 10 s
+    /// of agent time (past an end-of-file offset the tailer recorded less
+    /// than 10 s before the read, security review L11): `None` when no
+    /// such observation exists (the agent lags, or just started), and the
+    /// socket condition is then not evaluated.
+    pub(crate) fresh_from: Option<u64>,
+    /// The client endpoints of the server's connections, read after the
+    /// read (`None`: not read, a bound reached, or no table).
+    pub(crate) clients: Option<std::collections::HashSet<std::net::SocketAddr>>,
+    /// Tokens with a `DETACH_DATABASE` in the read, and its offset: such
+    /// a binding was no longer live when the table was read.
+    pub(crate) detached: HashMap<(u32, u64), Vec<u64>>,
+}
+
 /// The verdict on one record before its event is built.
 enum Decision {
     /// No event (well formed, nothing read, or the agent's own).
@@ -2716,7 +2804,7 @@ impl Machine {
         };
         match h.event {
             Event::AttachDatabase | Event::CreateDatabase if h.outcome == Outcome::Ok => {
-                let d = self.attach(rec, key, token, now, in_window, kind);
+                let d = self.attach(rec, key, token, now, in_window, kind, pos);
                 // R29 item 2: its events are held until its transaction's
                 // end, and a caller is looked for among the bindings with a
                 // transaction open now.
@@ -2838,6 +2926,7 @@ impl Machine {
                         sweep_step: 0,
                         own: false,
                         trigger_wait: None,
+                        addr: None,
                     },
                 );
                 if !self.live_others(db, key) {
@@ -2898,6 +2987,7 @@ impl Machine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         &mut self,
         rec: &Record<'_>,
@@ -2906,6 +2996,7 @@ impl Machine {
         now: Instant,
         in_window: bool,
         kind: Kind,
+        pos: u64,
     ) -> Decision {
         let (db, id) = key;
         if kind != Kind::User && rec.client.is_some() {
@@ -2953,6 +3044,20 @@ impl Machine {
                 }
                 _ => raise = true,
             }
+        }
+        // R1 rule 9: the remote 4-tuple of a TCP line (not the server's
+        // internal attachments, which have none).
+        let mut addr = None;
+        if kind == Kind::User
+            && let Some(att) = rec.att
+            && let Protocol::Tcp(ip, port) = att.protocol
+        {
+            let ep = crate::peer::canonical_endpoint(ip, port);
+            let tag = self.hash(&ep.to_string());
+            if self.tcp_breach(tag, ep, token, pos) {
+                ambiguous = true;
+            }
+            addr = Some(tag);
         }
         // R1 rule 11: caps before anything is kept (review H-A).
         if !self.admit(db) {
@@ -3027,6 +3132,7 @@ impl Machine {
                 sweep_step: 0,
                 own: own && !in_window && !ambiguous,
                 trigger_wait: None,
+                addr,
             },
         );
         if ambiguous {
@@ -3112,6 +3218,7 @@ impl Machine {
                     sweep_step: 0,
                     own: false,
                     trigger_wait: None,
+                    addr: None,
                 },
             );
         }

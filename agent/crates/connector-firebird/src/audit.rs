@@ -824,6 +824,7 @@ pub(crate) async fn stream(
     account: &str,
     series: Series,
     sink: &EventSink,
+    server_port: Option<u16>,
 ) -> Result<(), ConnectorError> {
     let id = cfg.target_id().to_owned();
     let (s, mut cats, run, mut generation, _) = settings(&state, &id, account, series);
@@ -874,6 +875,9 @@ pub(crate) async fn stream(
         batch: None,
         stop: None,
         sample: None,
+        server_port,
+        eofs: std::collections::VecDeque::new(),
+        last_eof: None,
     };
     loop {
         // A new check: new names, classes, run.
@@ -1210,7 +1214,20 @@ struct Runner {
     stop: Option<Stop>,
     /// R5 item 4: the run whose start time is sampled after each read.
     sample: Option<Run>,
+    /// R1 rule 9: the server's port (the table of its connections is read
+    /// for fresh attaches); `None` (tests): the socket condition is not
+    /// evaluated.
+    server_port: Option<u16>,
+    /// R1 rule 9 (security review L11): the end-of-file offsets the reads
+    /// that reached the end of the log saw, with their agent time, for 10 s.
+    eofs: std::collections::VecDeque<(Instant, (u64, u64), u64)>,
+    /// The file and end of the last line a read returned.
+    last_eof: Option<((u64, u64), u64)>,
 }
+
+/// R1 rule 9 (security review L11): a record written within this much
+/// agent time is "read within 10 s of being written".
+const FRESH: Duration = Duration::from_secs(10);
 
 /// One line of a poll, with the files of the lines the tailer skipped
 /// for their size just before it.
@@ -1228,6 +1245,8 @@ struct Batch {
     more: bool,
     /// Its events carry no position (a log reset in that poll).
     unkeyed: bool,
+    /// R1 rule 9: what this read observed.
+    tcp: Option<crate::stream::TcpView>,
 }
 
 /// R1 rule 2: a stop before a record of a new pid.
@@ -1264,12 +1283,14 @@ impl Runner {
             return Ok(false);
         };
         m.unkeyed = batch.unkeyed;
+        m.set_tcp_view(batch.tcp.clone());
         if self.hand_lines(m, now, cats, out) {
             // Stopped before a record (R1 rule 2): the rest waits.
             m.unkeyed = false;
             return Ok(false);
         }
         self.batch = None;
+        m.set_tcp_view(None);
         for f in batch.trailing {
             if Some(f) == self.file {
                 self.asm.lose_line();
@@ -1397,12 +1418,72 @@ impl Runner {
                 skipped,
             });
         }
+        let tcp = self.tcp_view(polled.more);
         self.batch = Some(Batch {
             trailing,
             more: polled.more,
             unkeyed: reset,
+            tcp,
         });
         Ok(())
+    }
+
+    /// R1 rule 9: the freshness of this read's records (past the end of
+    /// file a read less than 10 s ago saw), the tokens it detaches, and,
+    /// when one of its attaches is fresh, the server's connections read
+    /// now (after the read: every attach of it was written before).
+    fn tcp_view(&mut self, more: bool) -> Option<crate::stream::TcpView> {
+        let now = Instant::now();
+        self.eofs.retain(|(t, _, _)| now.duration_since(*t) < FRESH);
+        let file = self
+            .backlog
+            .front()
+            .map(|l| l.pos.file)
+            .or_else(|| self.tailer.open_file());
+        let fresh_from = self
+            .eofs
+            .iter()
+            .filter(|(_, f, _)| Some(*f) == file)
+            .map(|(_, _, o)| *o)
+            .min();
+        let mut view = crate::stream::TcpView {
+            file: file.unwrap_or_default(),
+            fresh_from,
+            ..Default::default()
+        };
+        let mut need = false;
+        for l in &self.backlog {
+            let line = l.bytes.strip_suffix(b"\n").unwrap_or(&l.bytes);
+            let Some(h) = header(line) else {
+                continue;
+            };
+            match h.event {
+                crate::trace_log::Event::DetachDatabase => {
+                    view.detached
+                        .entry(h.token())
+                        .or_default()
+                        .push(l.pos.start);
+                }
+                crate::trace_log::Event::AttachDatabase => {
+                    need |=
+                        Some(l.pos.file) == file && fresh_from.is_some_and(|f| l.pos.start >= f);
+                }
+                _ => {}
+            }
+        }
+        if let Some(last) = self.backlog.back() {
+            self.last_eof = Some((last.pos.file, last.pos.end));
+        }
+        // A read that reached the end of the log: its end is an
+        // observation of the file's end now.
+        if !more && let Some((f, o)) = self.last_eof {
+            self.eofs.push_back((now, f, o));
+        }
+        let port = self.server_port?;
+        if need {
+            view.clients = crate::peer::server_clients(port);
+        }
+        Some(view)
     }
 
     /// Hands the backlog's lines to the assembler and the machine; `true`
@@ -1674,6 +1755,9 @@ mod tests {
             batch: None,
             stop: None,
             sample: None,
+            server_port: None,
+            eofs: std::collections::VecDeque::new(),
+            last_eof: None,
         }
     }
 
@@ -1996,6 +2080,135 @@ mod tests {
             "paused"
         );
         assert!(q.window_for_tests(t0 + Duration::from_secs(111)).is_none());
+    }
+
+    /// R1 rule 9 against a real server (`dev/firebird/it.sh`): an isql
+    /// session held attached while its records (`FIREBIRD_IT_TCP_LOG`) are
+    /// read as a live stream reads them (fresh: past an end of file seen
+    /// less than 10 s before) is corroborated by the server's connection
+    /// table; a forged attach naming a port with no connection is
+    /// ambiguous. Then the measurement of security review N7: the client
+    /// end of a `service_mgr` backup's own TCP attachment (`FIREBIRD_IT_SVC_LOG`)
+    /// in the connection tables sampled during and 1 s after the backup
+    /// (`FIREBIRD_IT_SVC_SAMPLES`, raw `/proc/net/tcp*` copies separated by
+    /// `==` lines; no secret).
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn it_tcp_corroboration() {
+        let (Ok(tail), Ok(port)) = (
+            std::env::var("FIREBIRD_IT_TCP_LOG"),
+            std::env::var("FIREBIRD_PORT"),
+        ) else {
+            return;
+        };
+        let port: u16 = port.parse().unwrap();
+        let bytes = std::fs::read(&tail).unwrap();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let pid: u32 = text
+            .lines()
+            .find_map(|l| crate::trace_log::header(l.as_bytes()))
+            .map(|h| h.pid)
+            .unwrap();
+        let mut s = test_settings();
+        s.databases.push(DeclaredNames {
+            label: "crm".to_owned(),
+            resolved: Some("/var/lib/firebird/data/crm.fdb".to_owned()),
+            alias: None,
+            excluded: false,
+            attach: "/var/lib/firebird/data/crm.fdb".to_owned(),
+            read_at: None,
+        });
+        let dir = temp("it-tcp");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        r.server_port = Some(port);
+        let mut m = Machine::new(s, Arc::new(crate::own::Ledger::default()));
+        m.confirm_run(Run {
+            pid,
+            start: Some(1),
+        });
+        let classes = Classes::default();
+        let _ = poll_all(&mut r, &mut m, &classes);
+        // An end of file observed: what comes next is fresh.
+        append(
+            &log,
+            &format!("2026-10-30T15:22:38.4210 ({pid}:0x1) TRACE_INIT\n\tSESSION_1 x\n\n"),
+        );
+        let _ = poll_all(&mut r, &mut m, &classes);
+        append(&log, &text);
+        let _ = poll_all(&mut r, &mut m, &classes);
+        let c = m.counts;
+        eprintln!(
+            "[measure] rule 9 (held session): corroborated {}, no socket {}, reused {}, not \
+             evaluated {}",
+            c.tcp_corroborated, c.tcp_no_socket, c.tcp_reused, c.tcp_not_evaluated
+        );
+        assert!(c.tcp_corroborated >= 1, "{c:?}");
+        assert_eq!((c.tcp_no_socket, c.tcp_reused), (0, 0), "{:?}", m.why);
+        append(
+            &log,
+            &format!(
+                "2026-10-30T15:22:38.4210 ({pid}:0x7f0000000f01) ATTACH_DATABASE\n\t\
+                 /var/lib/firebird/data/app.fdb (ATT_999999, APP:NONE, UTF8, TCPv4:127.0.0.1/1)\n\t\
+                 /usr/bin/app:28\n\n2026-10-30T15:22:38.4210 ({pid}:0x2) TRACE_INIT\n\tSESSION_1 x\n\n"
+            ),
+        );
+        let _ = poll_all(&mut r, &mut m, &classes);
+        assert_eq!(
+            m.counts.tcp_no_socket, 1,
+            "a forged port with no connection"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // N7: the services backup's own attachment.
+        let (Ok(svc), Ok(samples)) = (
+            std::env::var("FIREBIRD_IT_SVC_LOG"),
+            std::env::var("FIREBIRD_IT_SVC_SAMPLES"),
+        ) else {
+            return;
+        };
+        let svc = std::fs::read_to_string(svc).unwrap();
+        let samples = std::fs::read_to_string(samples).unwrap();
+        let lines: Vec<&str> = svc.lines().collect();
+        let mut ports = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.ends_with(") ATTACH_DATABASE") {
+                continue;
+            }
+            let att = lines.get(i + 1).copied().unwrap_or("");
+            let client = lines
+                .get(i + 2)
+                .is_some_and(|n| n.starts_with('\t') && !n.is_empty());
+            if let Some(p) = att
+                .rsplit_once("TCPv4:127.0.0.1/")
+                .and_then(|(_, p)| p.trim_end_matches(')').parse::<u16>().ok())
+                && !client
+            {
+                ports.push(p);
+            }
+        }
+        let chunks: Vec<&str> = samples.split("==\n").collect();
+        let found = |p: u16, chunk: &str| {
+            let mut out = std::collections::HashSet::new();
+            crate::peer::client_endpoints(chunk.lines().map(str::to_owned), port, None, &mut out);
+            out.contains(&std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+        };
+        for p in &ports {
+            let during = chunks[..chunks.len().saturating_sub(1)]
+                .iter()
+                .filter(|c| found(*p, c))
+                .count();
+            let after = chunks.last().is_some_and(|c| found(*p, c));
+            eprintln!(
+                "[measure] N7 service_mgr backup attachment: in {during} of {} samples during \
+                 the backup, in the sample 1 s after: {after}",
+                chunks.len().saturating_sub(1)
+            );
+        }
+        eprintln!(
+            "[measure] N7 service_mgr backup attachments (TCP, no client line): {}",
+            ports.len()
+        );
     }
 
     /// R1 rule 2 against a real server (`dev/firebird/it.sh`): the main
@@ -2747,6 +2960,9 @@ mod tests {
             batch: None,
             stop: None,
             sample: None,
+            server_port: None,
+            eofs: std::collections::VecDeque::new(),
+            last_eof: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());

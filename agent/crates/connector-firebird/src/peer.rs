@@ -172,6 +172,82 @@ pub(crate) fn lookup(_server: SocketAddr, _client: SocketAddr, _deadline: Instan
     }
 }
 
+/// R1 rule 9 (ADR-0060): the client endpoints of the server's TCP
+/// connections, from `/proc/net/tcp` and `/proc/net/tcp6`: for every row in
+/// any state but `LISTEN` whose local port is the server's, its remote
+/// end, and for every row whose remote port is the server's (the client
+/// side of a connection on this host, which outlives a close in
+/// `TIME_WAIT`), its local end. Bounded by lines and by `deadline`; `None`
+/// when a bound was reached (the condition is then not evaluated).
+pub(crate) fn client_endpoints(
+    lines: impl Iterator<Item = String>,
+    server_port: u16,
+    deadline: Option<Instant>,
+    into: &mut std::collections::HashSet<SocketAddr>,
+) -> bool {
+    for (i, line) in lines.enumerate() {
+        if i >= MAX_LINES || (i % 4096 == 0 && deadline.is_some_and(|d| Instant::now() > d)) {
+            return false;
+        }
+        if line.len() > MAX_LINE_BYTES || into.len() >= MAX_LINES {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let (Some(_sl), Some(local), Some(remote), Some(state)) =
+            (cols.next(), cols.next(), cols.next(), cols.next())
+        else {
+            continue;
+        };
+        if state == "0A" {
+            continue;
+        }
+        let (Some(local), Some(remote)) = (parse_endpoint(local), parse_endpoint(remote)) else {
+            continue;
+        };
+        if local.port() == server_port {
+            into.insert(remote);
+        }
+        if remote.port() == server_port {
+            into.insert(local);
+        }
+    }
+    true
+}
+
+/// [`client_endpoints`] of the host's tables, bounded by [`LOOKUP_TIME`].
+#[cfg(target_os = "linux")]
+pub(crate) fn server_clients(server_port: u16) -> Option<std::collections::HashSet<SocketAddr>> {
+    let deadline = Instant::now() + LOOKUP_TIME;
+    let mut out = std::collections::HashSet::new();
+    let mut read = false;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        read = true;
+        let lines = BufReader::new(file)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .map(|l| String::from_utf8_lossy(&l).into_owned());
+        if !client_endpoints(lines.skip(1), server_port, Some(deadline), &mut out) {
+            return None;
+        }
+    }
+    read.then_some(out)
+}
+
+/// Off Linux there is no table: not evaluated.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn server_clients(_server_port: u16) -> Option<std::collections::HashSet<SocketAddr>> {
+    None
+}
+
+/// The canonical form of a printed client address (IPv4-mapped IPv6 as
+/// IPv4), as [`client_endpoints`] keeps them.
+pub(crate) fn canonical_endpoint(ip: IpAddr, port: u16) -> SocketAddr {
+    SocketAddr::new(canonical(ip), port)
+}
+
 /// Lookups of one connection, when one sees no row or two.
 const LOOKUPS: u32 = 3;
 /// The wait between two lookups.
@@ -277,6 +353,26 @@ mod tests {
         assert_eq!((out.matches, out.uid), (1, Some(84)));
         assert_eq!(out.verdict(84), Ok(()));
         assert_eq!(out.verdict(85), Err(Detail::PeerUidMismatch));
+    }
+
+    /// R1 rule 9: the client ends of the server's connections, from either
+    /// side's row, in any state but `LISTEN`; other ports ignored.
+    #[test]
+    fn the_clients_of_the_server_port() {
+        let lo = le_hex(Ipv4Addr::LOCALHOST);
+        let rows = table(&[
+            row(&format!("{lo}:0BEA"), "00000000:0000", "0A", 84),
+            row(&format!("{lo}:0BEA"), &format!("{lo}:9C43"), "01", 84),
+            row(&format!("{lo}:9C44"), &format!("{lo}:0BEA"), "06", 0),
+            row(&format!("{lo}:1F90"), &format!("{lo}:9C45"), "01", 1000),
+        ]);
+        let mut out = std::collections::HashSet::new();
+        assert!(client_endpoints(rows.into_iter(), 3050, None, &mut out));
+        let ep = |p| SocketAddr::from((Ipv4Addr::LOCALHOST, p));
+        assert!(out.contains(&ep(40003)));
+        assert!(out.contains(&ep(40004)), "the client side, TIME_WAIT");
+        assert!(!out.contains(&ep(40005)), "another port's connection");
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
