@@ -72,7 +72,32 @@ def _driver():
 
     lib = os.environ.get("FB_CLIENT_LIBRARY", "/opt/firebird/lib/libfbclient.so")
     driver.driver_config.fb_client_library.value = lib
+    _serialize_xpb(driver)
     return driver
+
+
+_XPB_LOCK = threading.Lock()
+
+
+def _serialize_xpb(driver) -> None:
+    """firebird-driver 2.1 builds parameter blocks through the client's IUtil interface, which keeps
+    one status object per process: concurrent connects race there (`AttributeError` in
+    `DPB.get_buffer`, seen under 256 concurrent attaches on 4.0.7 and 5.0.4). Only the building of
+    the parameter blocks (DPB, TPB) is serialized, a few microseconds each: the attaches themselves
+    stay concurrent."""
+    from firebird.driver import core  # noqa: PLC0415
+
+    for cls in (core.DPB, core.TPB):
+        orig = cls.get_buffer
+        if getattr(orig, "_serialized", False):
+            continue
+
+        def wrapped(self, *args, _orig=orig, **kw):
+            with _XPB_LOCK:
+                return _orig(self, *args, **kw)
+
+        wrapped._serialized = True
+        cls.get_buffer = wrapped
 
 
 _DB_LOCK = threading.Lock()
@@ -239,47 +264,73 @@ def cmd_workload(a) -> int:
 # --------------------------------------------------------------------------------------- 8g burst
 
 
-def cmd_burst(a) -> int:
+def _burst_proc(a, pw: str, threads: int, barrier, out) -> None:
+    """One process of a burst: `threads` attaches, each released by the burst-wide barrier."""
     drv = _driver()
-    pw = read_password(a.password_file)
-    barrier = threading.Barrier(a.n)
-    ok = [False] * a.n
-    connect_ms = [0.0] * a.n
-    errors: dict[str, int] = {}
+    res = {"ok": 0, "ms": [], "errors": {}}
     lock = threading.Lock()
 
-    def one(k: int) -> None:
+    def one() -> None:
         try:
             barrier.wait(timeout=60)
-        except threading.BrokenBarrierError:
+        except Exception:  # noqa: BLE001 - a broken barrier: not attempted
             return
         s = time.monotonic()
         try:
             con = _connect(drv, a.dsn, a.user, pw)
         except Exception as e:  # noqa: BLE001
             with lock:
-                errors[_err_code(e)] = errors.get(_err_code(e), 0) + 1
+                res["errors"][_err_code(e)] = res["errors"].get(_err_code(e), 0) + 1
             return
-        connect_ms[k] = (time.monotonic() - s) * 1000.0
-        ok[k] = True
+        with lock:
+            res["ok"] += 1
+            res["ms"].append((time.monotonic() - s) * 1000.0)
         time.sleep(a.hold)
         try:
             con.close()
         except Exception:  # noqa: BLE001
             pass
 
-    threads = [threading.Thread(target=one, args=(k,)) for k in range(a.n)]
-    t0 = time.time()
-    for t in threads:
+    ts = [threading.Thread(target=one) for _ in range(threads)]
+    for t in ts:
         t.start()
-    for t in threads:
+    for t in ts:
         t.join()
-    c = [connect_ms[k] for k in range(a.n) if ok[k]]
-    emit({"kind": "fb_burst_client", "attempted": a.n, "connected": sum(ok), "errors": errors,
+    res["retries"] = CLIENT_RETRIES["n"]
+    out.put(res)
+
+
+def cmd_burst(a) -> int:
+    """Measurement 8g: `n` attaches at once. firebird-driver 2.1 is not safe for hundreds of
+    concurrent connects in one process (`AttributeError` while it builds the DPB, seen on both
+    versions), so the attaches are spread over `procs` processes of n / procs threads, all released
+    by one cross-process barrier."""
+    import multiprocessing as mp  # noqa: PLC0415
+
+    pw = read_password(a.password_file)
+    procs = max(1, min(a.procs, a.n))
+    per = [a.n // procs + (1 if k < a.n % procs else 0) for k in range(procs)]
+    ctx = mp.get_context("fork")
+    barrier = ctx.Barrier(a.n)
+    out = ctx.Queue()
+    ps = [ctx.Process(target=_burst_proc, args=(a, pw, k, barrier, out)) for k in per]
+    t0 = time.time()
+    for p in ps:
+        p.start()
+    results = [out.get(timeout=300) for _ in ps]
+    for p in ps:
+        p.join(timeout=60)
+    ok = sum(r["ok"] for r in results)
+    c = [x for r in results for x in r["ms"]]
+    errors: dict[str, int] = {}
+    for r in results:
+        for k, v in r["errors"].items():
+            errors[k] = errors.get(k, 0) + v
+    emit({"kind": "fb_burst_client", "attempted": a.n, "connected": ok, "errors": errors, "processes": procs,
           "connect_p95_ms": round(percentile(c, 95.0), 1) if c else None,
-          "connect_max_ms": round(max(c), 1) if c else None, "client_retries": CLIENT_RETRIES["n"],
-          "t0": t0, "t1": time.time()})
-    return 0 if sum(ok) == a.n else 1
+          "connect_max_ms": round(max(c), 1) if c else None,
+          "client_retries": sum(r["retries"] for r in results), "t0": t0, "t1": time.time()})
+    return 0 if ok == a.n else 1
 
 
 # --------------------------------------------------------------------------------------- 3m
@@ -667,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
     b = client("burst")
     b.add_argument("--n", type=int, default=256)
     b.add_argument("--hold", type=float, default=1.0)
+    b.add_argument("--procs", type=int, default=32)
     r = client("perrow")
     r.add_argument("--what", choices=sorted(PERROW_SQL), required=True)
     r.add_argument("--rows", type=int, required=True)

@@ -355,7 +355,8 @@ jobs:
     needs: unit
     if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'firebird')
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # About 90 minutes with the defaults (local run at a 180 s soak and 60 s flood phases: 52 min).
+    timeout-minutes: 120
     env:
       LOAD_LOG_DIR: ${{ github.workspace }}/load-firebird-logs
       LOAD_RESULTS_DIR: ${{ github.workspace }}/load-firebird-results
@@ -377,7 +378,7 @@ jobs:
           uname -r
       - name: Run e2e/load/firebird.sh
         # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
-        run: timeout 5100 e2e/load/firebird.sh
+        run: timeout 6900 e2e/load/firebird.sh
       # Counters, timings, sizes and latencies only: no statement text, no value, no secret (the trace
       # log is read in place by fbload.py and never copied; firebird.sh redacts every generated secret
       # from its outputs on exit, whatever the result).

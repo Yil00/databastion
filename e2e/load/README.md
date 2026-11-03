@@ -658,7 +658,7 @@ network and pid namespaces with every capability dropped, the host's identity fi
 `e2e/docker-compose.yml`, `e2e/docker-compose.firebird.yml`, the run's `hostid.yml` and
 [`docker-compose.firebird.yml`](docker-compose.firebird.yml) here (project
 `databastion-load-firebird`). The CI job is `load-firebird` in
-[`load.yml`](../../.github/workflows/load.yml) (90 min budget, artifact `load-firebird-results`).
+[`load.yml`](../../.github/workflows/load.yml) (120 min budget, artifact `load-firebird-results`).
 
 The database `crm` is created from the run's own seed, never the dev seed, so it holds no
 ground-truth value: [`seed.py`](seed.py) `firebird` (part `load`) or `firebird-schema` (part
