@@ -1000,25 +1000,75 @@ enum End {
 /// Whether the word `w` at `i` (at a `FROM` list's depth, outside any
 /// `CASE`) ends the list (second re-review H1 of #408: only clause forms
 /// end it; a word that can also stand in a join condition is a doubt).
+/// Words that are not reserved on Firebird 4.0 and 5.0 (`RETURNING`,
+/// `WINDOW`, `OFFSET`, `OPTIMIZE`) can be column names (third re-review L1
+/// of #408: `ON A.RETURNING = 1, T`), so they end the list only after no
+/// `.` and when the next tokens fit the clause; otherwise they are a
+/// doubt.
 fn ends_from_list(toks: &[Tok], i: usize, w: &str) -> End {
     let prev = |n: &str| is_word(toks.get(i.wrapping_sub(1)), n);
-    let next = |n: &str| is_word(toks.get(i + 1), n);
-    match w {
-        "WHERE" | "HAVING" | "UNION" | "PLAN" | "WINDOW" | "RETURNING" | "INTO" | "SELECT" => {
+    let next = |k: usize, n: &str| is_word(toks.get(i + k), n);
+    let qualified = matches!(toks.get(i.wrapping_sub(1)), Some(Tok::Punct('.')));
+    let name_at = |k: usize| match toks.get(i + k) {
+        Some(Tok::Quoted(_)) => true,
+        Some(Tok::Word(n)) => !is_clause_word(n) && !EXPRESSION_WORDS.contains(&n.as_str()),
+        _ => false,
+    };
+    let clause = |fits: bool| {
+        if fits && !qualified {
             End::Yes
+        } else {
+            End::Doubt
         }
-        "GROUP" | "ORDER" if next("BY") => End::Yes,
-        "ROWS" | "FETCH" | "OFFSET" => End::Yes,
-        // `NEXT VALUE FOR g` stands in expressions; `FOR UPDATE`, and
-        // `OPTIMIZE FOR {FIRST | ALL} ROWS`, end the list.
+    };
+    match w {
+        "WHERE" | "HAVING" | "UNION" | "PLAN" | "INTO" | "SELECT" => End::Yes,
+        "GROUP" | "ORDER" if next(1, "BY") => End::Yes,
+        "ROWS" | "FETCH" => End::Yes,
+        // `RETURNING <name> | *`.
+        "RETURNING" => clause(name_at(1) || matches!(toks.get(i + 1), Some(Tok::Punct('*')))),
+        // `WINDOW <name> AS (…)`.
+        "WINDOW" => clause(name_at(1) && next(2, "AS")),
+        // `OFFSET <n | ?> {ROW | ROWS}`.
+        "OFFSET" => clause(
+            matches!(toks.get(i + 1), Some(Tok::Number(_) | Tok::Param(_)))
+                && (next(2, "ROW") || next(2, "ROWS")),
+        ),
+        // `OPTIMIZE FOR {FIRST | ALL} ROWS`.
+        "OPTIMIZE" => clause(next(1, "FOR") && (next(2, "FIRST") || next(2, "ALL"))),
+        // `NEXT VALUE FOR g` stands in expressions; `FOR UPDATE` ends
+        // the list.
         "FOR" if prev("VALUE") => End::No,
-        "FOR" if next("UPDATE") || prev("OPTIMIZE") => End::Yes,
-        "OPTIMIZE" if next("FOR") => End::Yes,
-        "WITH" if next("LOCK") => End::Yes,
+        "FOR" if next(1, "UPDATE") => End::Yes,
+        "WITH" if next(1, "LOCK") => End::Yes,
         "GROUP" | "ORDER" | "FOR" | "WITH" | "WHEN" | "EXCEPT" | "INTERSECT" => End::Doubt,
         _ => End::No,
     }
 }
+
+/// Words that follow an operand in a condition (so the word before them
+/// is a column, not a clause keyword).
+const EXPRESSION_WORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "NOT",
+    "IS",
+    "IN",
+    "BETWEEN",
+    "LIKE",
+    "CONTAINING",
+    "STARTING",
+    "SIMILAR",
+    "COLLATE",
+    "ESCAPE",
+    "THEN",
+    "ELSE",
+    "END",
+    "WHEN",
+    "AT",
+    "FROM",
+    "DISTINCT",
+];
 
 fn is_clause_word(w: &str) -> bool {
     matches!(
@@ -1240,6 +1290,19 @@ mod tests {
             ("SELECT X FROM A, B ROWS 5", &["A", "B"]),
             ("SELECT X FROM A PLAN (A NATURAL)", &["A"]),
             ("SELECT X FROM A ORDER BY X, Y", &["A"]),
+            ("DELETE FROM A WHERE X = 1 RETURNING X, Y", &["A"]),
+            ("DELETE FROM A RETURNING X, Y", &["A"]),
+            ("DELETE FROM A RETURNING *", &["A"]),
+            ("SELECT X FROM A, B OFFSET 2 ROWS", &["A", "B"]),
+            (
+                "SELECT X FROM A, B OFFSET ? ROWS FETCH NEXT 2 ROWS ONLY",
+                &["A", "B"],
+            ),
+            (
+                "SELECT SUM(X) OVER W FROM A, B WINDOW W AS (ORDER BY X)",
+                &["A", "B"],
+            ),
+            ("SELECT X FROM A, B OPTIMIZE FOR ALL ROWS", &["A", "B"]),
         ] {
             let r = a(t);
             assert_eq!(rels(t), want, "{t}");
@@ -1253,6 +1316,16 @@ mod tests {
             "SELECT * FROM A JOIN B ON A.X = B.X WHEN, C",
             "SELECT * FROM A, B FOR X",
             "SELECT * FROM A, B WITH X",
+            // Third re-review L1 of #408: unreserved clause words used as
+            // column names.
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.RETURNING = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.WINDOW = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.OFFSET = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.OPTIMIZE = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON RETURNING = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON B.X = RETURNING AND 1 = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON B.X = OFFSET, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON B.X = WINDOW, EXT_EXPORT E",
         ] {
             assert!(a(t).relations_unread, "{t}");
         }

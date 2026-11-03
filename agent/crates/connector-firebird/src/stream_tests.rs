@@ -3495,3 +3495,68 @@ fn external_tables_after_join_conditions_are_marked() {
         assert!(remote || text.contains("LATERAL"), "{text}");
     }
 }
+
+/// Third re-review L1 of #408: an unreserved clause word used as a column
+/// in a join condition (`A.RETURNING`, `A.WINDOW`, `A.OFFSET`, an
+/// unqualified `RETURNING`) does not end the `FROM` list silently: the
+/// text counts as not read, so the record is always reported, also for a
+/// view the catalog does not know yet (with the complete set, and while
+/// the set is invalidated) and for an external-file table.
+#[test]
+fn unreserved_clause_words_as_columns_are_not_read_silently() {
+    let a = "24:0x7f0000000100";
+    let user = [
+        ("T1", RelClass::Table),
+        ("CUSTOMERS", RelClass::Table),
+        ("EXT_EXPORT", RelClass::External),
+    ]
+    .into_iter()
+    .map(|(n, c)| (n.to_owned(), c))
+    .collect();
+    let cat =
+        super::audit::Classes::for_tests(user, crate::views::compute(every_class_reads(false)));
+    let cats: [&dyn Catalog; 1] = [&cat];
+    for (invalidated, last) in [
+        (false, "V_NEW V"),
+        (true, "V_NEW V"),
+        (false, "EXT_EXPORT E"),
+    ] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        feed(&mut m, &cats, &attach(a, 3, APP), 0);
+        if invalidated {
+            // A DDL text that names none of the relations.
+            feed(
+                &mut m,
+                &cats,
+                &stmt(a, 3, 4, "APP", "CREATE SEQUENCE S_NEW", 0, &[]),
+                500,
+            );
+            assert!(m.views_invalid_for_tests(0));
+        }
+        let blocks: &[(&str, u64)] = &[("T1", 2), ("CUSTOMERS", 2)];
+        for (i, cond) in [
+            "A.RETURNING = 1",
+            "A.WINDOW = 1",
+            "A.OFFSET = 1",
+            "RETURNING = 1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let text = format!("SELECT * FROM T1 A JOIN CUSTOMERS B ON {cond}, {last}");
+            let out = feed(
+                &mut m,
+                &cats,
+                &stmt(a, 3, 10 + i as u64, "APP", &text, 2, blocks),
+                1000 + 1000 * i as u64,
+            );
+            assert!(
+                !out.is_empty()
+                    && out.iter().all(|(_, e)| e.always_report())
+                    && names(&out).contains(&"*".to_owned()),
+                "invalidated {invalidated}: {text}: {:?}",
+                names(&out)
+            );
+        }
+    }
+}
