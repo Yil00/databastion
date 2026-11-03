@@ -130,6 +130,11 @@ pub struct FirebirdAnalysis {
     /// built-in aggregate functions and constants, with no `GROUP BY` and
     /// no set operation.
     pub aggregate_only: bool,
+    /// A relation list holds a construct whose names are not read: a run
+    /// of `(` after `FROM`, `JOIN` or a list `,` that is followed by
+    /// neither a name nor a derived table's `SELECT` / `WITH`. Fail
+    /// closed: the event names `*` and is always reported.
+    pub relations_unread: bool,
     /// A top-level `SELECT` without `WHERE`, `GROUP BY` / `HAVING`, an
     /// aggregate in its select list, or a row limit (`FIRST`, `ROWS`,
     /// `FETCH FIRST|NEXT`) of at most [`FULL_READ_LIMIT`] rows.
@@ -788,6 +793,31 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
     // The word that opened each enclosing parenthesis: `FROM` inside
     // `EXTRACT(… FROM …)`, `SUBSTRING`, `TRIM`, `OVERLAY` is no relation.
     let mut openers: Vec<Option<&str>> = Vec::new();
+    // The parenthesis depths at which a `FROM` list is open (security
+    // re-review H1 of #408): a `,` at that depth introduces a relation
+    // (`FROM (A JOIN B ON …), C`, `FROM (SELECT …) X, C`), until a clause
+    // word at that depth or the `)` that closes it.
+    let mut from_depths: Vec<usize> = Vec::new();
+    // The parenthesis depths of the open `CASE` expressions (second
+    // re-review H1 of #408): no word inside a `CASE` ends a `FROM` list
+    // (`ON CASE WHEN … END = 1, T`).
+    let mut cases: Vec<usize> = Vec::new();
+    // MERGE's source (`MERGE INTO t [[AS] a] USING <table primary>`):
+    // the first `USING` at depth 0 reads a parenthesized joined table as
+    // `JOIN` does (`JOIN … USING (cols)` names columns).
+    let merge_using = if is_word(toks.first(), "MERGE") {
+        let mut d = 0usize;
+        toks.iter().position(|t| {
+            match t {
+                Tok::Punct('(') => d += 1,
+                Tok::Punct(')') => d = d.saturating_sub(1),
+                _ => {}
+            }
+            d == 0 && matches!(t, Tok::Word(w) if w == "USING")
+        })
+    } else {
+        None
+    };
     let mut i = 0usize;
     while i < toks.len() {
         let t = &toks[i];
@@ -798,6 +828,31 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
             }),
             Tok::Punct(')') => {
                 openers.pop();
+                while from_depths.last().is_some_and(|d| *d > openers.len()) {
+                    from_depths.pop();
+                }
+                while cases.last().is_some_and(|d| *d > openers.len()) {
+                    cases.pop();
+                }
+            }
+            Tok::Word(w) if w == "CASE" => cases.push(openers.len()),
+            Tok::Word(w) if w == "END" && cases.last() == Some(&openers.len()) => {
+                cases.pop();
+            }
+            Tok::Word(w)
+                if from_depths.last() == Some(&openers.len())
+                    && cases.last() != Some(&openers.len()) =>
+            {
+                match ends_from_list(toks, i, w) {
+                    End::No => {}
+                    End::Yes => {
+                        from_depths.pop();
+                    }
+                    End::Doubt => {
+                        a.relations_unread = true;
+                        from_depths.pop();
+                    }
+                }
             }
             _ => {}
         }
@@ -815,8 +870,17 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
                     || (w == "UPDATE" && i == 0 && !is_word(toks.get(1), "OR"))
                     || (w == "PROCEDURE" && is_word(toks.get(i.wrapping_sub(1)), "EXECUTE"))
             }
+            Tok::Punct(',') => from_depths.last() == Some(&openers.len()),
             _ => false,
         };
+        let from_list = matches!(t, Tok::Punct(',')) || is_word(Some(t), "FROM");
+        // `(` runs are read through after `FROM`, `JOIN`, a list `,` and
+        // MERGE's source `USING` only (`JOIN … USING (A, B)` names
+        // columns).
+        let joins = from_list || is_word(Some(t), "JOIN") || merge_using == Some(i);
+        if is_word(Some(t), "FROM") && introduces && !ddl {
+            from_depths.push(openers.len());
+        }
         // A function call: a word followed by `(` outside the contexts
         // above. `pkg.f(` and `schema`-like qualified calls are unknown.
         if let (Tok::Word(w), Some(Tok::Punct('('))) = (t, toks.get(i + 1)) {
@@ -845,6 +909,28 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
         // A relation list: names separated by commas (FROM a, b).
         let mut j = i + 1;
         loop {
+            // A parenthesized join (H1 of #408): `FROM (A JOIN B ON …)`,
+            // `FROM ((A) …)`, `FROM (A), B` (the `,` after the `)` is read
+            // at the list's depth). A run of `(` that opens no derived table is
+            // skipped and the names inside are read (the `JOIN`s inside
+            // introduce theirs); a derived table's `SELECT` / `WITH` is
+            // read by its own `FROM`; anything else is not read (fail
+            // closed).
+            let mut k = j;
+            while joins && matches!(toks.get(k), Some(Tok::Punct('('))) {
+                k += 1;
+            }
+            if k > j {
+                match toks.get(k) {
+                    Some(Tok::Word(w)) if w == "SELECT" || w == "WITH" => break,
+                    Some(Tok::Word(w)) if !is_clause_word(w) => j = k,
+                    Some(Tok::Quoted(_)) => j = k,
+                    _ => {
+                        a.relations_unread = true;
+                        break;
+                    }
+                }
+            }
             match toks.get(j) {
                 Some(Tok::Word(w)) if !is_clause_word(w) => {
                     let called = matches!(toks.get(j + 1), Some(Tok::Punct('(')));
@@ -880,7 +966,7 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
             {
                 j += 1;
             }
-            if matches!(toks.get(j), Some(Tok::Punct(','))) && is_word(toks.get(i), "FROM") {
+            if matches!(toks.get(j), Some(Tok::Punct(','))) && from_list {
                 j += 1;
                 continue;
             }
@@ -901,6 +987,88 @@ fn is_name_position(toks: &[Tok], i: usize) -> bool {
         Some(Tok::Word(p)) if matches!(p.as_str(), "INTO" | "TABLE" | "PROCEDURE" | "FROM" | "JOIN" | "USING" | "UPDATE")
     )
 }
+
+/// Whether the word at `i` ends a `FROM` list at its own depth.
+enum End {
+    No,
+    Yes,
+    /// A word that may end the list or stand inside a join condition:
+    /// the list ends and the text counts as not read (fail closed).
+    Doubt,
+}
+
+/// Whether the word `w` at `i` (at a `FROM` list's depth, outside any
+/// `CASE`) ends the list (second re-review H1 of #408: only clause forms
+/// end it; a word that can also stand in a join condition is a doubt).
+/// Words that are not reserved on Firebird 4.0 and 5.0 (`RETURNING`,
+/// `WINDOW`, `OFFSET`, `OPTIMIZE`) can be column names (third re-review L1
+/// of #408: `ON A.RETURNING = 1, T`), so they end the list only after no
+/// `.` and when the next tokens fit the clause; otherwise they are a
+/// doubt.
+fn ends_from_list(toks: &[Tok], i: usize, w: &str) -> End {
+    let prev = |n: &str| is_word(toks.get(i.wrapping_sub(1)), n);
+    let next = |k: usize, n: &str| is_word(toks.get(i + k), n);
+    let qualified = matches!(toks.get(i.wrapping_sub(1)), Some(Tok::Punct('.')));
+    let name_at = |k: usize| match toks.get(i + k) {
+        Some(Tok::Quoted(_)) => true,
+        Some(Tok::Word(n)) => !is_clause_word(n) && !EXPRESSION_WORDS.contains(&n.as_str()),
+        _ => false,
+    };
+    let clause = |fits: bool| {
+        if fits && !qualified {
+            End::Yes
+        } else {
+            End::Doubt
+        }
+    };
+    match w {
+        "WHERE" | "HAVING" | "UNION" | "PLAN" | "INTO" | "SELECT" => End::Yes,
+        "GROUP" | "ORDER" if next(1, "BY") => End::Yes,
+        "ROWS" | "FETCH" => End::Yes,
+        // `RETURNING <name> | *`.
+        "RETURNING" => clause(name_at(1) || matches!(toks.get(i + 1), Some(Tok::Punct('*')))),
+        // `WINDOW <name> AS (…)`.
+        "WINDOW" => clause(name_at(1) && next(2, "AS")),
+        // `OFFSET <n | ?> {ROW | ROWS}`.
+        "OFFSET" => clause(
+            matches!(toks.get(i + 1), Some(Tok::Number(_) | Tok::Param(_)))
+                && (next(2, "ROW") || next(2, "ROWS")),
+        ),
+        // `OPTIMIZE FOR {FIRST | ALL} ROWS`.
+        "OPTIMIZE" => clause(next(1, "FOR") && (next(2, "FIRST") || next(2, "ALL"))),
+        // `NEXT VALUE FOR g` stands in expressions; `FOR UPDATE` ends
+        // the list.
+        "FOR" if prev("VALUE") => End::No,
+        "FOR" if next(1, "UPDATE") => End::Yes,
+        "WITH" if next(1, "LOCK") => End::Yes,
+        "GROUP" | "ORDER" | "FOR" | "WITH" | "WHEN" | "EXCEPT" | "INTERSECT" => End::Doubt,
+        _ => End::No,
+    }
+}
+
+/// Words that follow an operand in a condition (so the word before them
+/// is a column, not a clause keyword).
+const EXPRESSION_WORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "NOT",
+    "IS",
+    "IN",
+    "BETWEEN",
+    "LIKE",
+    "CONTAINING",
+    "STARTING",
+    "SIMILAR",
+    "COLLATE",
+    "ESCAPE",
+    "THEN",
+    "ELSE",
+    "END",
+    "WHEN",
+    "AT",
+    "FROM",
+    "DISTINCT",
+];
 
 fn is_clause_word(w: &str) -> bool {
     matches!(
@@ -1038,6 +1206,129 @@ mod tests {
 
     fn a(t: &str) -> FirebirdAnalysis {
         analyze_firebird(t)
+    }
+
+    fn rels(t: &str) -> Vec<String> {
+        let mut v = a(t).relations;
+        v.sort();
+        v
+    }
+
+    /// Security re-review H1 of #408: relation names inside parenthesized
+    /// joins are read, nested forms included; a derived table's names come
+    /// from its own `FROM`; a `,` after a parenthesized part continues the
+    /// list; a run of `(` followed by anything else is not read (fail
+    /// closed).
+    #[test]
+    fn parenthesized_joins_are_read() {
+        for (t, want) in [
+            (
+                "SELECT * FROM (MON$STATEMENTS S JOIN T_PLAIN T ON 1=1)",
+                &["MON$STATEMENTS", "T_PLAIN"][..],
+            ),
+            (
+                "SELECT * FROM ((A JOIN B ON A.X = B.X) JOIN C ON C.Y = B.Y)",
+                &["A", "B", "C"],
+            ),
+            ("SELECT * FROM (A), B", &["A", "B"]),
+            ("SELECT * FROM ((A)), B WHERE A.X = B.X", &["A", "B"]),
+            ("SELECT * FROM (SELECT X FROM A) D", &["A"]),
+            (
+                "SELECT * FROM ((SELECT X FROM A) X JOIN MON$ATTACHMENTS M ON 1=1)",
+                &["A", "MON$ATTACHMENTS"],
+            ),
+            ("SELECT * FROM (SELECT X FROM A) D, B", &["A", "B"]),
+            ("SELECT * FROM (A JOIN B ON A.X = B.X), C", &["A", "B", "C"]),
+            ("SELECT * FROM A JOIN B ON A.X = B.X, C", &["A", "B", "C"]),
+            ("SELECT * FROM (\"Q\" JOIN B ON 1=1)", &["B", "Q"]),
+            (
+                "SELECT * FROM A LEFT JOIN (B JOIN C ON 1=1) ON 1=1",
+                &["A", "B", "C"],
+            ),
+            // Not relations: a scalar subquery's columns, a `USING` column
+            // list, an `IN` list, the select list after a set operation.
+            ("SELECT (SELECT ID FROM A), B, C FROM D", &["A", "D"]),
+            ("SELECT * FROM A JOIN B USING (X, Y)", &["A", "B"]),
+            ("SELECT X FROM A WHERE Y IN (1, 2), Z", &["A"]),
+            ("SELECT X FROM A GROUP BY X, Y ORDER BY X, Y", &["A"]),
+            ("SELECT X FROM A UNION SELECT Y, Z FROM B", &["A", "B"]),
+            ("SELECT EXTRACT(YEAR FROM (D)), E FROM A", &["A"]),
+            (
+                "WITH C1 AS (SELECT X FROM A), C2 AS (SELECT Y FROM B) SELECT * FROM C1, C2",
+                &["A", "B"],
+            ),
+            // Second re-review H1 of #408: words of a join condition do
+            // not end the list; MERGE's source reads a joined table.
+            (
+                "SELECT * FROM T1 A JOIN CUSTOMERS B ON CASE WHEN 1 = 1 THEN 1 END = 1, EXT_EXPORT E",
+                &["CUSTOMERS", "EXT_EXPORT", "T1"],
+            ),
+            (
+                "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.X = NEXT VALUE FOR G, EXT_EXPORT E",
+                &["CUSTOMERS", "EXT_EXPORT", "T1"],
+            ),
+            (
+                "MERGE INTO T1 USING (EXT_EXPORT E JOIN CUSTOMERS B ON 1 = 1) S ON 1 = 0 WHEN MATCHED THEN UPDATE SET X = 1",
+                &["CUSTOMERS", "EXT_EXPORT", "T1"],
+            ),
+            (
+                "MERGE INTO T1 AS T USING ((EXT_EXPORT E)) S ON 1 = 0 WHEN MATCHED THEN DELETE",
+                &["EXT_EXPORT", "T1"],
+            ),
+            (
+                "SELECT * FROM A JOIN B ON CASE WHEN EXISTS (SELECT 1 FROM C UNION SELECT 1 FROM D) THEN 1 ELSE CASE WHEN 1 = 1 THEN 2 END END = 1, E",
+                &["A", "B", "C", "D", "E"],
+            ),
+            (
+                "SELECT SUM(X) OVER (ORDER BY Y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM A, B",
+                &["A", "B"],
+            ),
+            // Clause forms end the list: their names are not relations.
+            ("SELECT X FROM A FOR UPDATE OF X, Y", &["A"]),
+            ("SELECT X FROM A WITH LOCK", &["A"]),
+            ("SELECT X FROM A, B OPTIMIZE FOR FIRST ROWS", &["A", "B"]),
+            ("SELECT X FROM A, B ROWS 5", &["A", "B"]),
+            ("SELECT X FROM A PLAN (A NATURAL)", &["A"]),
+            ("SELECT X FROM A ORDER BY X, Y", &["A"]),
+            ("DELETE FROM A WHERE X = 1 RETURNING X, Y", &["A"]),
+            ("DELETE FROM A RETURNING X, Y", &["A"]),
+            ("DELETE FROM A RETURNING *", &["A"]),
+            ("SELECT X FROM A, B OFFSET 2 ROWS", &["A", "B"]),
+            (
+                "SELECT X FROM A, B OFFSET ? ROWS FETCH NEXT 2 ROWS ONLY",
+                &["A", "B"],
+            ),
+            (
+                "SELECT SUM(X) OVER W FROM A, B WINDOW W AS (ORDER BY X)",
+                &["A", "B"],
+            ),
+            ("SELECT X FROM A, B OPTIMIZE FOR ALL ROWS", &["A", "B"]),
+        ] {
+            let r = a(t);
+            assert_eq!(rels(t), want, "{t}");
+            assert!(!r.relations_unread, "{t}");
+        }
+        // A word that may end the list or stand in a condition: not read.
+        for t in [
+            "SELECT * FROM (1)",
+            "SELECT * FROM ((?))",
+            "SELECT * FROM A, (:X)",
+            "SELECT * FROM A JOIN B ON A.X = B.X WHEN, C",
+            "SELECT * FROM A, B FOR X",
+            "SELECT * FROM A, B WITH X",
+            // Third re-review L1 of #408: unreserved clause words used as
+            // column names.
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.RETURNING = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.WINDOW = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.OFFSET = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.OPTIMIZE = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON RETURNING = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON B.X = RETURNING AND 1 = 1, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON B.X = OFFSET, EXT_EXPORT E",
+            "SELECT * FROM T1 A JOIN CUSTOMERS B ON B.X = WINDOW, EXT_EXPORT E",
+        ] {
+            assert!(a(t).relations_unread, "{t}");
+        }
     }
 
     #[test]

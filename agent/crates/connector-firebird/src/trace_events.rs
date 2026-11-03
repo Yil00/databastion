@@ -108,8 +108,17 @@ pub(crate) trait Catalog {
     fn dependent_token(&self, name: &str) -> bool {
         self.always_view(name)
     }
-    /// A table with a computed column at the last read (R41 item 8).
-    fn computed(&self, _relation: &str) -> bool {
+    /// A table that counts as dependent while the set is cut or
+    /// invalidated (R41 items 2 and 8, the implementation note of
+    /// 2026-10-31): a computed column, a domain check, a check constraint
+    /// or an expression index at the last read; every table when that is
+    /// not known.
+    fn marked(&self, _relation: &str) -> bool {
+        false
+    }
+    /// A procedure, function, package or trigger name of the last routines
+    /// read.
+    fn known_routine(&self, _name: &str) -> bool {
         false
     }
     /// The database's linger in seconds, as the last check read it (R30
@@ -215,6 +224,12 @@ fn block_objects(d: &mut Draft, block: &[(&str, Counters)], cat: &dyn Catalog) -
 }
 
 fn text_objects(d: &mut Draft, a: &FirebirdAnalysis, cat: &dyn Catalog) {
+    // A relation list the analysis could not read (security re-review H1
+    // of #408): any relation may stand there.
+    if a.relations_unread {
+        d.star = true;
+        d.always = true;
+    }
     for name in &a.relations {
         if let Some(always) = keep(name, cat) {
             d.object(name);
