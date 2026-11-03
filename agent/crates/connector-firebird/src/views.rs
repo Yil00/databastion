@@ -68,7 +68,15 @@ pub(crate) struct ViewDeps {
     pub(crate) marked: HashSet<String>,
     /// The field sources and the routines were both read, and every
     /// computed-column dependency row mapped to a table (`marked` is
-    /// meaningful; otherwise every table counts).
+    /// meaningful; otherwise every table counts). The four reads are
+    /// separate statements of one read-committed transaction (decision 4),
+    /// not one snapshot (security re-review L2 of #408): a DDL committed
+    /// between two of them may show in one read only. That is covered by
+    /// R41 item 8, not by this flag: the stream sees the DDL record, and
+    /// the sets stay invalidated until a check whose catalog read started
+    /// (`DbFacts::read_at`, taken before these reads) after the DDL
+    /// transaction ended; and a name created since a read is unknown to
+    /// it, so dependent at object positions (item 3).
     pub(crate) marked_known: bool,
     /// The reads were complete and within the bounds.
     pub(crate) complete: bool,
@@ -379,7 +387,13 @@ async fn rows<T>(
 /// Reads the dependent set on the agent's attachment (R41). A failed or
 /// cut read gives the incomplete set (logged); a fatal error ends the
 /// check.
-pub(crate) async fn read(s: &mut Session, deadline: Instant) -> Result<ViewDeps, FbError> {
+/// `major` is the server's (4 or 5, from `check::prepare`): 5.0 reads
+/// partial indexes too ([`sql::ROUTINES_5`]).
+pub(crate) async fn read(
+    s: &mut Session,
+    major: u32,
+    deadline: Instant,
+) -> Result<ViewDeps, FbError> {
     let o = Col::Octets(252);
     let views = rows(s, sql::VIEW_RELATIONS, &[o, o, Col::Int], deadline, |row| {
         Some((name(row.first())?, name(row.get(1))?, row.get(2)?.as_int()?))
@@ -411,7 +425,11 @@ pub(crate) async fn read(s: &mut Session, deadline: Instant) -> Result<ViewDeps,
     .await?;
     let routines = rows(
         s,
-        sql::ROUTINES,
+        if major >= 5 {
+            sql::ROUTINES_5
+        } else {
+            sql::ROUTINES
+        },
         &[o, o, Col::Int, o, Col::Int],
         deadline,
         |row| {

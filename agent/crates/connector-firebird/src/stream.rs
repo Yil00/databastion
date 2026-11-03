@@ -97,6 +97,7 @@ mod stream_ckpt;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::trace_events::always_listed;
 use databastion_classifiers::masking::MaskedEvent;
 use databastion_classifiers::query::firebird::{FirebirdKind, analyze_firebird};
 
@@ -2086,7 +2087,12 @@ impl Machine {
                 } else {
                     crate::idents::idents(text)
                 };
+                // Security re-review H1 of #408, the safety net: a token
+                // naming a relation of the always-reported lists marks the
+                // record, whatever position the analysis gave it (the
+                // dependent set leaves those relations out).
                 if ids.cut
+                    || ids.names.iter().any(|n| always_listed(n))
                     || ids.names.iter().any(|n| cat.dependent_token(n))
                     || ids.packaged.iter().any(|(p, _)| cat.dependent_token(p))
                 {
@@ -2096,10 +2102,11 @@ impl Machine {
                     return true;
                 }
                 let a = analyze_firebird(text);
-                a.relations
-                    .iter()
-                    .chain(&a.procedures)
-                    .any(|n| cat.always_view(n))
+                a.relations_unread
+                    || a.relations
+                        .iter()
+                        .chain(&a.procedures)
+                        .any(|n| cat.always_view(n))
             }
             Body::Routine { name, .. } => cat.always_view(name.name),
             _ => false,
@@ -2589,12 +2596,33 @@ impl Catalog for Invalidated<'_> {
             || (self.all && !matches!(class, RelClass::System | RelClass::Virtual))
     }
 
+    /// Security re-review M1 of #408: while invalidated, a token naming a
+    /// view, a routine, package or trigger of the last read, a marked
+    /// table, a name of the interval's DDL, or (after an unparsable DDL)
+    /// any known relation, as the object positions do.
     fn dependent_token(&self, name: &str) -> bool {
-        self.inner.dependent_token(name)
-            || (self.invalid
-                && self
-                    .named
-                    .is_some_and(|n| n.contains(name.trim_end_matches(' '))))
+        use crate::trace_events::RelClass;
+        if self.inner.dependent_token(name) {
+            return true;
+        }
+        if !self.invalid {
+            return false;
+        }
+        let r = name.trim_end_matches(' ');
+        let class = self.inner.class(r);
+        class == RelClass::View
+            || self.inner.known_routine(r)
+            || self.inner.marked(r)
+            || self.named.is_some_and(|n| n.contains(r))
+            || (self.all
+                && matches!(
+                    class,
+                    RelClass::Table | RelClass::Gtt | RelClass::External | RelClass::View
+                ))
+    }
+
+    fn known_routine(&self, name: &str) -> bool {
+        self.inner.known_routine(name)
     }
 
     fn marked(&self, relation: &str) -> bool {

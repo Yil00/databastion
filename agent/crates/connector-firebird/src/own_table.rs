@@ -248,6 +248,21 @@ const STATEMENT_ROWS: &[Row] = &[
         loading: NONE,
         bound: limit(crate::views::MAX_ROWS),
     },
+    // The same union on 5.0, partial indexes included (L1 of #408).
+    Row {
+        text: sql::ROUTINES_5,
+        may: &[
+            "RDB$PROCEDURES",
+            "RDB$FUNCTIONS",
+            "RDB$PACKAGES",
+            "RDB$TRIGGERS",
+            "RDB$INDICES",
+        ],
+        must: NONE,
+        must_with_rows: NONE,
+        loading: NONE,
+        bound: limit(crate::views::MAX_ROWS),
+    },
     // R30 item 3: one row of `RDB$DATABASE`.
     own_row(sql::LINGER, DB),
     // R1 rule 5: one row of `MON$DATABASE`, block-less or the `MON$`

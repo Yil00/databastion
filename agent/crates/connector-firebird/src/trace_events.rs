@@ -116,6 +116,11 @@ pub(crate) trait Catalog {
     fn marked(&self, _relation: &str) -> bool {
         false
     }
+    /// A procedure, function, package or trigger name of the last routines
+    /// read.
+    fn known_routine(&self, _name: &str) -> bool {
+        false
+    }
     /// The database's linger in seconds, as the last check read it (R30
     /// item 3); `None` when not known.
     fn linger(&self) -> Option<u32> {
@@ -219,6 +224,12 @@ fn block_objects(d: &mut Draft, block: &[(&str, Counters)], cat: &dyn Catalog) -
 }
 
 fn text_objects(d: &mut Draft, a: &FirebirdAnalysis, cat: &dyn Catalog) {
+    // A relation list the analysis could not read (security re-review H1
+    // of #408): any relation may stand there.
+    if a.relations_unread {
+        d.star = true;
+        d.always = true;
+    }
     for name in &a.relations {
         if let Some(always) = keep(name, cat) {
             d.object(name);

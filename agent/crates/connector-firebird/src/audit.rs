@@ -265,9 +265,24 @@ impl Catalog for Classes {
         ) && (!self.deps.marked_known || self.deps.marked.contains(r))
     }
 
-    /// R41 item 6: any identifier token equal to a dependent object's name.
+    /// R41 item 6: any identifier token equal to a dependent object's name;
+    /// with an incomplete read (item 2, security re-review M1 of #408),
+    /// any token naming a view, a routine, package or trigger, or a marked
+    /// table, as the object positions do (no unknown-name rule: keywords
+    /// and columns are tokens).
     fn dependent_token(&self, name: &str) -> bool {
-        self.deps.dependent.contains(name.trim_end_matches(' '))
+        let r = name.trim_end_matches(' ');
+        if self.deps.dependent.contains(r) {
+            return true;
+        }
+        if self.complete && self.deps.complete {
+            return false;
+        }
+        self.class(r) == RelClass::View || self.deps.routines.contains(r) || self.marked(r)
+    }
+
+    fn known_routine(&self, name: &str) -> bool {
+        self.deps.routines.contains(name.trim_end_matches(' '))
     }
 
     fn linger(&self) -> Option<u32> {

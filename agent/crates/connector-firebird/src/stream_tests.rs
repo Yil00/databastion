@@ -3362,3 +3362,82 @@ fn a_domain_ddl_makes_every_relation_dependent() {
     let out = feed(&mut m, &cats, &read(6), 2000);
     assert!(marked(&out), "{:?}", names(&out));
 }
+
+/// Security re-review M1 of #408: on the cut and the invalidated paths, an
+/// identifier token (here a column alias, which the analysis does not
+/// read as a relation) naming a view, a routine or a marked table marks
+/// the record, as it does an object of the complete set; with the
+/// complete set and no invalidation, it does not.
+#[test]
+fn tokens_on_the_cut_and_invalidated_paths() {
+    let a = "24:0x7f0000000100";
+    for (cut, invalidated) in [(false, false), (true, false), (false, true)] {
+        let cat = every_class_catalog(cut);
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        feed(&mut m, &cats, &attach(a, 3, APP), 0);
+        if invalidated {
+            feed(
+                &mut m,
+                &cats,
+                &stmt(a, 3, 4, "APP", "CREATE SEQUENCE S_NEW", 0, &[]),
+                500,
+            );
+        }
+        for (i, token) in ["V_X", "P_OK", "PKG", "TR_OK", "T_CHK", "T_IX"]
+            .iter()
+            .enumerate()
+        {
+            let text = format!("SELECT ID AS {token} FROM T_PLAIN WHERE ID > 0");
+            let out = feed(
+                &mut m,
+                &cats,
+                &stmt(a, 3, 10 + i as u64, "APP", &text, 2, &[("T_PLAIN", 2)]),
+                1000 + 1000 * i as u64,
+            );
+            let marked = !out.is_empty() && out.iter().all(|(_, e)| e.always_report());
+            let want = cut || invalidated || *token == "T_IX";
+            assert_eq!(
+                marked,
+                want,
+                "cut {cut} invalidated {invalidated}: {text}: {:?}",
+                names(&out)
+            );
+        }
+    }
+}
+
+/// Security re-review H1 of #408: a parenthesized join over an
+/// always-reported relation (which writes no block) is marked, and so are
+/// a text whose relation list is not read and a text naming such a
+/// relation where the analysis reads no relation.
+#[test]
+fn parenthesized_joins_over_always_reported_relations_are_marked() {
+    let a = "24:0x7f0000000100";
+    let cat = every_class_catalog(false);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    for (i, text) in [
+        "SELECT * FROM (MON$STATEMENTS S JOIN T_PLAIN T ON 1=1)",
+        "SELECT * FROM ((SELECT ID FROM T_PLAIN) X JOIN MON$STATEMENTS M ON 1=1)",
+        "SELECT * FROM (T_PLAIN), (?)",
+        // The analysis stops at `LATERAL`: the token safety net.
+        "SELECT * FROM T_PLAIN CROSS JOIN LATERAL MON$STATEMENTS",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let out = feed(
+            &mut m,
+            &cats,
+            &stmt(a, 3, 10 + i as u64, "APP", text, 2, &[("T_PLAIN", 2)]),
+            1000 + 1000 * i as u64,
+        );
+        assert!(
+            !out.is_empty() && out.iter().all(|(_, e)| e.always_report()),
+            "{text}: {:?}",
+            names(&out)
+        );
+    }
+}
