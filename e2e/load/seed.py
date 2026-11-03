@@ -31,6 +31,13 @@ Usage:
   seed.py orm      --tables N --rows N --dialect D  ORM-style statements (ADR-0053 decision 6), one per
                                                     line, for D = pg, mariadb or tsql (see
                                                     orm_statements)
+  seed.py firebird --tables N --rows N              isql script of the Firebird load database `crm` (dev/firebird/seed.sh,
+                                                    embedded SYSDBA): load tables, the 3m objects, the roles
+  seed.py firebird-workload --tables N --rows N     fbload.py workload statements (point reads of the hot tables)
+  seed.py firebird-schema-cut --procedures N         DDL adding about 60 dependency rows per procedure
+  seed.py firebird-schema [--scale F]               isql script of the 10 000-object schema (FbSchema)
+  seed.py firebird-schema-workload [--scale F]      JSON: per principal, the workload statements of that schema
+  seed.py firebird-schema-counts [--scale F]        JSON: the schema's objects by kind
   seed.py redis    --rows N                         Lua script for EVAL (Valkey / Redis): the keys
                                                     ARGV[1]..ARGV[2] of the scaled keyspace
   (--workload-tables N, default 40: the workload reads the first N tables of the plan)
@@ -39,7 +46,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -560,6 +569,330 @@ return n
 """
 
 
+# ------------------------------------------------------------------------------------ Firebird
+# The Firebird load run (firebird.sh): the database `crm` is created from this SQL by the dev
+# service's own seed step (dev/firebird/seed.sh: the image's isql, an embedded connection as SYSDBA,
+# before the server starts), so its statements never reach the trace log the agent reads. No dev
+# seed value is in it: every value is synthetic (see the module docstring).
+FB_LOOKUP_ROWS = 100
+FB_SRC_ROWS = 200_000
+# The workload's and the measurement steps' accounts (created by firebird.sh's init script, granted
+# here through roles, GRANT DEFAULT): the Audit workload, the attach bursts (8g), the per-row
+# statements and the open transactions (3m), and the categories of the 10 000-object schema.
+FB_LOAD_USERS = ("LOAD_APP", "LOAD_BURST", "LOAD_ROW", "LOAD_TX")
+FB_SCHEMA_USERS = ("LOAD_PLAIN", "LOAD_EXPR", "LOAD_CHECK", "LOAD_COMP", "LOAD_VIEW", "LOAD_PROC")
+
+
+def fb_name(t: Table) -> str:
+    return f"LOAD_T{t.tag}"
+
+
+def _fb_decode(expr: str, values: tuple[str, ...]) -> str:
+    """Firebird DECODE over string literals, 0-based on `expr` (an integer expression)."""
+    pairs = ", ".join(f"{i}, '{v}'" for i, v in enumerate(values[:-1]))
+    return f"DECODE({expr}, {pairs}, '{values[-1]}')"
+
+
+def _fb_vars(dml: str) -> str:
+    """The PSQL variables G, B and S of a DML statement inside EXECUTE BLOCK, prefixed with `:` (a
+    DML statement of a PSQL block names its variables so), outside string literals."""
+    parts = dml.split("'")
+    for k in range(0, len(parts), 2):
+        parts[k] = re.sub(r"(?<![:A-Z_$])\b([GBS])\b(?![A-Z_$(])", r":\1", parts[k])
+    return "'".join(parts)
+
+
+def fb_iban_mod_parts() -> int:
+    """10^15 mod 97: the 29-digit number `bban || '152700'` is split into its first 14 and last 15
+    digits, both BIGINT, so its mod 97 needs no type wider than BIGINT (as fr_iban computes)."""
+    return 10 ** 15 % 97
+
+
+def firebird_sql(tables: list[Table]) -> str:
+    """isql script (SET TERM, autoddl): the load tables with their rows (EXECUTE BLOCK loops, the same
+    values as row_values), the objects of measurement 3m (a lookup table, a 200 000-row source, a sink
+    whose BEFORE INSERT triggers are block-less (an id from a sequence) and block-ful (a lookup read),
+    a function that reads the lookup table), and the roles: DATABASTION_READER for the agent's
+    Discovery (the dev seed's role name, ADR-0060 decision 4) and LOAD_READER for the workload."""
+    nf, nl, nd = len(FIRST_NAMES), len(LAST_NAMES), len(MAIL_DOMAINS)
+    types = {"email": "VARCHAR(128)", "phone": "VARCHAR(32)", "iban": "VARCHAR(34)",
+             "amount": "DECIMAL(12,2)", "quantity": "INTEGER"}
+    p = fb_iban_mod_parts()
+    out = ["SET TERM ^ ;"]
+    for t in tables:
+        cols = ", ".join(f"{c.upper()} {types[c]}" for c in t.columns)
+        out.append(f"CREATE TABLE {fb_name(t)} (ID BIGINT NOT NULL PRIMARY KEY, CREATED_AT TIMESTAMP NOT NULL, "
+                   f"STATUS VARCHAR(16) NOT NULL, NOTE VARCHAR(80), {cols})^")
+    out.append("COMMIT^")
+    for t in tables:
+        exprs = {
+            "email": (f"{_fb_decode(f'MOD(G, {nf})', FIRST_NAMES)} || '.' || "
+                      f"{_fb_decode(f'MOD(G / {nf}, {nl})', LAST_NAMES)} || (G / {nf * nl}) || '@' || "
+                      f"{_fb_decode(f'MOD(G + {t.index}, {nd})', MAIL_DOMAINS)}"),
+            "phone": f"'+33 6 39 98 {t.index % 100:02d} ' || LPAD(MOD(G, 100), 2, '0')",
+            "iban": "'FR' || LPAD(98 - MOD(MOD(CAST(SUBSTRING(S FROM 1 FOR 14) AS BIGINT), 97) * "
+                    f"{p} + MOD(CAST(SUBSTRING(S FROM 15 FOR 15) AS BIGINT), 97), 97), 2, '0') || B",
+            "amount": "CAST(MOD(G, 100000) / 100.00 AS DECIMAL(12,2))",
+            "quantity": "MOD(G, 50) + 1",
+        }
+        cols = ", ".join(c.upper() for c in t.columns)
+        vals = ", ".join(exprs[c] for c in t.columns)
+        out.append(
+            "EXECUTE BLOCK AS DECLARE G BIGINT = 1; DECLARE B VARCHAR(23); DECLARE S VARCHAR(29); BEGIN "
+            f"WHILE (G <= {t.rows}) DO BEGIN "
+            f"B = '{BANK_CODE}' || LPAD({t.index}, 5, '0') || LPAD(G, 11, '0') || LPAD(MOD(G, 97), 2, '0'); "
+            "S = B || '152700'; "
+            + _fb_vars(f"INSERT INTO {fb_name(t)} (ID, CREATED_AT, STATUS, NOTE, {cols}) VALUES (G, "
+                       "DATEADD(MINUTE, G, TIMESTAMP '2024-01-01 00:00:00'), "
+                       f"{_fb_decode(f'MOD(G, {len(STATUSES)})', STATUSES)}, 'order ' || G || ' batch ' || MOD(G, 97), "
+                       f"{vals}); ") +
+            "G = G + 1; END END^")
+        out.append("COMMIT^")
+    out += [
+        "CREATE TABLE LOAD_LOOKUP (K INTEGER NOT NULL PRIMARY KEY, V VARCHAR(20))^",
+        "CREATE TABLE LOAD_SRC (ID INTEGER NOT NULL PRIMARY KEY, K INTEGER NOT NULL)^",
+        "CREATE TABLE LOAD_SINK (ID BIGINT, SRC INTEGER, V VARCHAR(20))^",
+        "CREATE SEQUENCE LOAD_SINK_SEQ^",
+        "COMMIT^",
+        # Block-less: sets an id, reads no relation (R25: no per-table block).
+        "CREATE TRIGGER LOAD_SINK_BI FOR LOAD_SINK ACTIVE BEFORE INSERT POSITION 0 AS BEGIN "
+        "NEW.ID = NEXT VALUE FOR LOAD_SINK_SEQ; END^",
+        # Block-ful: reads LOAD_LOOKUP for every row.
+        "CREATE TRIGGER LOAD_SINK_LK FOR LOAD_SINK ACTIVE BEFORE INSERT POSITION 1 AS BEGIN "
+        "SELECT V FROM LOAD_LOOKUP WHERE K = NEW.SRC INTO NEW.V; END^",
+        "CREATE FUNCTION LOAD_FN_LOOKUP (KEY_IN INTEGER) RETURNS VARCHAR(20) AS DECLARE R VARCHAR(20); BEGIN "
+        "SELECT V FROM LOAD_LOOKUP WHERE K = :KEY_IN INTO R; RETURN R; END^",
+        "COMMIT^",
+        f"EXECUTE BLOCK AS DECLARE I INTEGER = 1; BEGIN WHILE (I <= {FB_LOOKUP_ROWS}) DO BEGIN "
+        "INSERT INTO LOAD_LOOKUP VALUES (:I, 'lookup ' || :I); I = I + 1; END END^",
+        f"EXECUTE BLOCK AS DECLARE I INTEGER = 1; BEGIN WHILE (I <= {FB_SRC_ROWS}) DO BEGIN "
+        f"INSERT INTO LOAD_SRC VALUES (:I, MOD(:I, {FB_LOOKUP_ROWS}) + 1); I = I + 1; END END^",
+        "COMMIT^",
+        "CREATE ROLE DATABASTION_READER^",
+        "CREATE ROLE LOAD_READER^",
+        "COMMIT^",
+    ]
+    for t in tables:
+        out.append(f"GRANT SELECT ON TABLE {fb_name(t)} TO ROLE DATABASTION_READER^")
+        out.append(f"GRANT SELECT ON TABLE {fb_name(t)} TO ROLE LOAD_READER^")
+    for rel in ("LOAD_LOOKUP", "LOAD_SRC", "LOAD_SINK"):
+        out.append(f"GRANT SELECT ON TABLE {rel} TO ROLE DATABASTION_READER^")
+        out.append(f"GRANT SELECT ON TABLE {rel} TO ROLE LOAD_READER^")
+    out += [
+        "GRANT INSERT ON TABLE LOAD_SINK TO ROLE LOAD_READER^",
+        "GRANT USAGE ON SEQUENCE LOAD_SINK_SEQ TO ROLE LOAD_READER^",
+        "GRANT EXECUTE ON FUNCTION LOAD_FN_LOOKUP TO ROLE LOAD_READER^",
+        "GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT^",
+    ]
+    out += [f"GRANT DEFAULT LOAD_READER TO USER {u}^" for u in FB_LOAD_USERS]
+    out += ["COMMIT^", "SET TERM ; ^",
+            f"SELECT COUNT(*) || ' tables' FROM RDB$RELATIONS WHERE RDB$RELATION_NAME STARTING WITH 'LOAD_T' "
+            "AND RDB$VIEW_BLR IS NULL;"]
+    return "\n".join(out) + "\n"
+
+
+@dataclass(frozen=True)
+class FbSchema:
+    """The 10 000-object schema of the RELEASE.md gate (ADR-0060 R41 items 2 and 9), in the
+    proportions of a large ERP-style database (counts at scale 1; every count is multiplied by
+    `scale`): tables of six columns, a third of them with an id trigger and its sequence, some with
+    computed columns, check constraints or expression indexes; views joining two tables; procedures
+    and functions reading one to three tables; packages of three procedures; and a few monitoring
+    routines and views over MON$ relations (statement-text and attachment lists, the dependent set's
+    roots)."""
+    tables: int = 2000
+    computed_tables: int = 300  # 2 computed columns each
+    check_tables: int = 400  # 3 check constraints each
+    expr_index_tables: int = 200  # 300 expression indexes over them
+    expr_indexes: int = 300
+    trigger_tables: int = 1000  # a BEFORE INSERT id trigger and a BEFORE UPDATE trigger each
+    views: int = 1500
+    procedures: int = 3000
+    functions: int = 400
+    packages: int = 100  # 3 procedures each
+    monitoring: int = 25  # 20 procedures and 5 views over MON$STATEMENTS / MON$ATTACHMENTS
+    workload_tables: int = 20  # per category: tables (or views, procedures) the workload reads, 100 rows
+
+    def scaled(self, scale: float) -> "FbSchema":
+        if not 0.1 <= scale <= 4.0:
+            raise ValueError("scale must be within 0.1 and 4")
+        f = {k: max(1, int(round(getattr(self, k) * scale))) for k in self.__dataclass_fields__
+             if k not in ("workload_tables",)}
+        f["workload_tables"] = self.workload_tables
+        s = FbSchema(**f)
+        if s.computed_tables + s.check_tables + s.expr_index_tables + 4 * s.workload_tables > s.tables:
+            raise ValueError("too few tables for the special kinds")
+        return s
+
+    def object_counts(self) -> dict[str, int]:
+        """The objects of the schema by kind (the RELEASE.md gate counts these)."""
+        return {"tables": self.tables, "views": self.views + 5 * (self.monitoring // 25 or 1),
+                "procedures": self.procedures + 20 * (self.monitoring // 25 or 1),
+                "packaged_procedures": 3 * self.packages, "packages": self.packages,
+                "functions": self.functions, "triggers": 2 * self.trigger_tables,
+                "computed_columns": 2 * self.computed_tables, "check_constraints": 3 * self.check_tables,
+                "expression_indexes": self.expr_indexes, "sequences": self.trigger_tables}
+
+
+def fb_schema_kinds(s: FbSchema) -> dict[str, range]:
+    """Table index ranges (1-based) of each kind: computed-column tables first, then check-constraint
+    tables, then expression-index tables, then plain tables; the id triggers on the first
+    `trigger_tables` plain-or-not tables (every kind, as in an application schema)."""
+    a = 1
+    out = {}
+    for kind, n in (("computed", s.computed_tables), ("check", s.check_tables),
+                    ("expr", s.expr_index_tables)):
+        out[kind] = range(a, a + n)
+        a += n
+    out["plain"] = range(a, s.tables + 1)
+    return out
+
+
+def fb_schema_sql(s: FbSchema) -> str:
+    """isql script of the 10 000-object schema (see FbSchema). Workload objects of each category (the
+    first `workload_tables` of each kind, views and procedures) get 100 rows; every table, view and
+    procedure is granted to the role LOAD_SCHEMA_READER (GRANT DEFAULT to FB_SCHEMA_USERS), the plain
+    tables also to DATABASTION_READER."""
+    kinds = fb_schema_kinds(s)
+    t = lambda i: f"ERP_T{i:05d}"  # noqa: E731
+    out = ["SET TERM ^ ;"]
+    for i in range(1, s.tables + 1):
+        extra = ""
+        if i in kinds["computed"]:
+            extra = (", GROSS COMPUTED BY (AMOUNT * 1.2), LABEL COMPUTED BY (UPPER(NAME) || '-' || CODE)")
+        out.append(f"CREATE TABLE {t(i)} (ID INTEGER NOT NULL PRIMARY KEY, CODE VARCHAR(20), NAME VARCHAR(60), "
+                   f"AMOUNT DECIMAL(12,2), STATUS SMALLINT, REF_ID INTEGER{extra})^")
+        if i in kinds["check"]:
+            out.append(f"ALTER TABLE {t(i)} ADD CONSTRAINT CK_{i:05d}_A CHECK (AMOUNT >= 0), "
+                       f"ADD CONSTRAINT CK_{i:05d}_S CHECK (STATUS BETWEEN 0 AND 9), "
+                       f"ADD CONSTRAINT CK_{i:05d}_C CHECK (CODE <> '')^")
+    out.append("COMMIT^")
+    exr = list(kinds["expr"])
+    for k in range(s.expr_indexes):
+        i = exr[k % len(exr)]
+        expr = "UPPER(NAME)" if k < len(exr) else "COALESCE(REF_ID, 0) + ID"
+        out.append(f"CREATE INDEX IX_EXPR_{k:05d} ON {t(i)} COMPUTED BY ({expr})^")
+    for i in range(1, s.trigger_tables + 1):
+        out.append(f"CREATE SEQUENCE SQ_{i:05d}^")
+    out.append("COMMIT^")
+    for i in range(1, s.trigger_tables + 1):
+        out.append(f"CREATE TRIGGER TR_{i:05d}_BI FOR {t(i)} ACTIVE BEFORE INSERT POSITION 0 AS BEGIN "
+                   f"IF (NEW.ID IS NULL) THEN NEW.ID = NEXT VALUE FOR SQ_{i:05d}; END^")
+        out.append(f"CREATE TRIGGER TR_{i:05d}_BU FOR {t(i)} ACTIVE BEFORE UPDATE POSITION 0 AS BEGIN "
+                   "IF (NEW.STATUS IS NULL) THEN NEW.STATUS = OLD.STATUS; END^")
+    out.append("COMMIT^")
+    n = s.tables
+    for v in range(1, s.views + 1):
+        a, b = (v * 7) % n + 1, (v * 13 + 5) % n + 1
+        out.append(f"CREATE VIEW ERP_V{v:05d} (ID, NAME, AMOUNT, CODE) AS SELECT A.ID, A.NAME, B.AMOUNT, B.CODE "
+                   f"FROM {t(a)} A LEFT JOIN {t(b)} B ON B.REF_ID = A.ID^")
+    out.append("COMMIT^")
+    for p in range(1, s.procedures + 1):
+        a, b, c = (p * 3) % n + 1, (p * 11 + 1) % n + 1, (p * 17 + 2) % n + 1
+        body = f"SELECT COUNT(*), COALESCE(SUM(AMOUNT), 0) FROM {t(a)} WHERE REF_ID = :K OR :K IS NULL INTO :N, :S;"
+        if p % 3 == 0:
+            body += f" SELECT :N + COUNT(*) FROM {t(b)} WHERE STATUS = 1 INTO :N;"
+        if p % 5 == 0:
+            body += f" SELECT :S + COALESCE(MAX(AMOUNT), 0) FROM {t(c)} WHERE CODE = 'x' INTO :S;"
+        out.append(f"CREATE PROCEDURE ERP_P{p:05d} (K INTEGER) RETURNS (N INTEGER, S DECIMAL(18,2)) AS BEGIN "
+                   f"{body} SUSPEND; END^")
+        if p % 500 == 0:
+            out.append("COMMIT^")
+    out.append("COMMIT^")
+    for f in range(1, s.functions + 1):
+        a = (f * 19 + 3) % n + 1
+        out.append(f"CREATE FUNCTION ERP_F{f:05d} (K INTEGER) RETURNS DECIMAL(18,2) AS DECLARE R DECIMAL(18,2); BEGIN "
+                   f"SELECT COALESCE(SUM(AMOUNT), 0) FROM {t(a)} WHERE REF_ID = :K INTO R; RETURN R; END^")
+    out.append("COMMIT^")
+    for k in range(1, s.packages + 1):
+        heads = " ".join(f"PROCEDURE R{j} (K INTEGER) RETURNS (N INTEGER);" for j in range(1, 4))
+        bodies = " ".join(
+            f"PROCEDURE R{j} (K INTEGER) RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM "
+            f"{t((k * 23 + j) % n + 1)} WHERE REF_ID = :K INTO :N; SUSPEND; END" for j in range(1, 4))
+        out.append(f"CREATE PACKAGE ERP_PK{k:04d} AS BEGIN {heads} END^")
+        out.append(f"CREATE PACKAGE BODY ERP_PK{k:04d} AS BEGIN {bodies} END^")
+    out.append("COMMIT^")
+    groups = s.monitoring // 25 or 1
+    for g in range(groups):
+        for m in range(1, 21):
+            rel = "MON$STATEMENTS" if m % 2 else "MON$ATTACHMENTS"
+            out.append(f"CREATE PROCEDURE ERP_MON_P{g:02d}{m:02d} RETURNS (N INTEGER) AS BEGIN "
+                       f"SELECT COUNT(*) FROM {rel} INTO :N; SUSPEND; END^")
+        for m in range(1, 6):
+            out.append(f"CREATE VIEW ERP_MON_V{g:02d}{m:02d} (N) AS SELECT COUNT(*) FROM MON$ATTACHMENTS^")
+    out.append("COMMIT^")
+    # Workload rows: the first workload_tables tables of each kind, and the tables the first views
+    # and procedures read (100 rows each).
+    w = s.workload_tables
+    rows_on = set()
+    for kind in ("computed", "check", "expr", "plain"):
+        rows_on.update(list(kinds[kind])[:w])
+    for v in range(1, w + 1):
+        rows_on.update({(v * 7) % n + 1, (v * 13 + 5) % n + 1})
+    for p in range(1, w + 1):
+        rows_on.add((p * 3) % n + 1)
+    for i in sorted(rows_on):
+        out.append(f"EXECUTE BLOCK AS DECLARE R INTEGER = 1; BEGIN WHILE (R <= 100) DO BEGIN "
+                   f"INSERT INTO {t(i)} (ID, CODE, NAME, AMOUNT, STATUS, REF_ID) VALUES "
+                   f"(:R, 'c' || :R, 'name ' || :R, :R * 1.5, MOD(:R, 9), MOD(:R, 10) + 1); R = R + 1; END END^")
+    out += ["COMMIT^", "CREATE ROLE LOAD_SCHEMA_READER^", "CREATE ROLE DATABASTION_READER^", "COMMIT^"]
+    for i in range(1, s.tables + 1):
+        out.append(f"GRANT SELECT ON TABLE {t(i)} TO ROLE LOAD_SCHEMA_READER^")
+        if i in kinds["plain"] and i < kinds["plain"].start + w:
+            out.append(f"GRANT SELECT ON TABLE {t(i)} TO ROLE DATABASTION_READER^")
+    for v in range(1, s.views + 1):
+        out.append(f"GRANT SELECT ON ERP_V{v:05d} TO ROLE LOAD_SCHEMA_READER^")
+    for p in range(1, s.procedures + 1):
+        out.append(f"GRANT EXECUTE ON PROCEDURE ERP_P{p:05d} TO ROLE LOAD_SCHEMA_READER^")
+    out.append("GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT^")
+    out += [f"GRANT DEFAULT LOAD_SCHEMA_READER TO USER {u}^" for u in FB_SCHEMA_USERS]
+    out += ["COMMIT^", "SET TERM ; ^",
+            "SELECT 'objects ' || (SELECT COUNT(*) FROM RDB$RELATIONS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0) || ' relations, '"
+            " || (SELECT COUNT(*) FROM RDB$PROCEDURES WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0) || ' procedures, '"
+            " || (SELECT COUNT(*) FROM RDB$TRIGGERS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0) || ' triggers, '"
+            " || (SELECT COUNT(*) FROM RDB$DEPENDENCIES) || ' dependency rows' FROM RDB$DATABASE;"]
+    return "\n".join(out) + "\n"
+
+
+def fb_schema_workload(s: FbSchema) -> dict[str, list[str]]:
+    """Per category principal (FB_SCHEMA_USERS), the statements of its workload: point reads of its
+    tables, views or procedures (`?` is the id parameter, 1..100)."""
+    kinds = fb_schema_kinds(s)
+    w = s.workload_tables
+    t = lambda i: f"ERP_T{i:05d}"  # noqa: E731
+    pick = lambda kind: list(kinds[kind])[:w]  # noqa: E731
+    return {
+        "LOAD_PLAIN": [f"SELECT NAME FROM {t(i)} WHERE ID = ?" for i in pick("plain")],
+        "LOAD_EXPR": [f"SELECT NAME FROM {t(i)} WHERE ID = ?" for i in pick("expr")],
+        "LOAD_CHECK": [f"SELECT NAME FROM {t(i)} WHERE ID = ?" for i in pick("check")],
+        "LOAD_COMP": [f"SELECT NAME FROM {t(i)} WHERE ID = ?" for i in pick("computed")],
+        "LOAD_VIEW": [f"SELECT NAME FROM ERP_V{v:05d} WHERE ID = ?" for v in range(1, w + 1)],
+        "LOAD_PROC": [f"SELECT N FROM ERP_P{p:05d}(?)" for p in range(1, w + 1)],
+    }
+
+
+def fb_workload_tsv(tables: list[Table]) -> str:
+    """fbload.py workload statements of the load run: a point read of each workload table
+    (`<max id>\t<SQL>`, the id a parameter)."""
+    return "".join(f"{t.rows}\tSELECT NOTE FROM {fb_name(t)} WHERE ID = ?\n" for t in tables)
+
+
+def fb_schema_cut_ddl(s: FbSchema, procedures: int, start: int = 1) -> str:
+    """The schema run's cut step (ADR-0060 R41 item 2: at most 65 536 dependency rows): `procedures`
+    procedures LOAD_CUT_Pnnnnn, each reading five columns of ten tables (about 60 dependency rows
+    each), one statement per block separated by a `--` line (fbload.py ddl, each committed)."""
+    if procedures < 1:
+        raise ValueError("procedures must be positive")
+    n = s.tables
+    out = []
+    for p in range(start, start + procedures):
+        sel = " ".join(
+            f"SELECT :N + COUNT(*) FROM ERP_T{(p * 31 + j * 97) % n + 1:05d} WHERE CODE = 'x' AND NAME = 'y' "
+            "AND AMOUNT = 1 AND STATUS = 1 AND REF_ID = 1 INTO :N;" for j in range(10))
+        out.append(f"CREATE PROCEDURE LOAD_CUT_P{p:05d} RETURNS (N INTEGER) AS BEGIN N = 0; {sel} SUSPEND; END")
+    return "\n--\n".join(out) + "\n"
+
+
 # ------------------------------------------------------------------------------------ workloads
 def workload_tables(tables: list[Table], n: int) -> list[Table]:
     if not 1 <= n <= MAX_WORKLOAD_TABLES:
@@ -601,9 +934,13 @@ end
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("what", choices=["plan", "pg", "mariadb", "mongo", "pgbench", "sysbench", "sqlserver",
-                                    "tsql", "redis", "orm"])
+                                    "tsql", "redis", "orm", "firebird", "firebird-schema",
+                                    "firebird-schema-workload", "firebird-schema-counts",
+                                    "firebird-schema-cut", "firebird-workload"])
     p.add_argument("--tables", type=int, default=None)
-    p.add_argument("--rows", type=int, required=True)
+    p.add_argument("--rows", type=int, default=None)
+    p.add_argument("--procedures", type=int, default=0, help="firebird-schema-cut: procedures to add")
+    p.add_argument("--scale", type=float, default=1.0, help="firebird-schema*: multiplies every object count")
     p.add_argument("--out", help="output directory (pgbench)")
     p.add_argument("--dialect", choices=ORM_DIALECTS, help="orm: the SQL dialect")
     p.add_argument("--no-generate-series", action="store_true",
@@ -614,6 +951,28 @@ def main(argv: list[str] | None = None) -> int:
     if a.what == "redis":
         sys.stdout.write(redis_lua())
         return 0
+    if a.what.startswith("firebird-schema"):
+        try:
+            sch = FbSchema().scaled(a.scale)
+        except ValueError as e:
+            print(f"seed.py: {e}", file=sys.stderr)
+            return 2
+        if a.what == "firebird-schema":
+            sys.stdout.write(fb_schema_sql(sch))
+        elif a.what == "firebird-schema-cut":
+            try:
+                sys.stdout.write(fb_schema_cut_ddl(sch, a.procedures))
+            except ValueError as e:
+                print(f"seed.py: {e}", file=sys.stderr)
+                return 2
+        elif a.what == "firebird-schema-workload":
+            print(json.dumps(fb_schema_workload(sch), separators=(",", ":")))
+        else:
+            print(json.dumps(sch.object_counts(), separators=(",", ":")))
+        return 0
+    if a.rows is None:
+        print("seed.py: --rows is required", file=sys.stderr)
+        return 2
     if a.tables is None:
         print("seed.py: --tables is required", file=sys.stderr)
         return 2
@@ -634,6 +993,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(mongo_js(tables))
     elif a.what == "sysbench":
         sys.stdout.write(sysbench_lua(hot))
+    elif a.what == "firebird":
+        sys.stdout.write(firebird_sql(tables))
+    elif a.what == "firebird-workload":
+        sys.stdout.write(fb_workload_tsv(hot))
     elif a.what == "sqlserver":
         sys.stdout.write(sqlserver_sql(tables, series=not a.no_generate_series))
     elif a.what == "tsql":

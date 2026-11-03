@@ -715,7 +715,8 @@ def host_busy(samples: list[dict], t0: float, t1: float) -> float | None:
     return 100.0 * (h[-1][1] - h[0][1]) / (h[-1][2] - h[0][2])
 
 
-def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict], lim: Limits) -> tuple[dict, Checks]:
+def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict], lim: Limits,
+                 state: list[dict] | None = None) -> tuple[dict, Checks]:
     ck = Checks()
     rep: dict = {"version": 1, "limits": lim.__dict__.copy()}
     cfg = one_fact(facts, "config")
@@ -1006,9 +1007,252 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
     if lost is not None:
         ck.add("agent.log_no_lost_batches", lost.get("lost") == 0, lost.get("lost"), "0 lines")
     rep["agent"] = agent
+    fb = firebird_section(facts, state or [], ck)
+    if fb is not None:
+        rep["firebird"] = fb
     rep["checks"] = ck.items
     rep["pass"] = ck.passed
     return rep, ck
+
+
+# ------------------------------------------------------------------------------------ Firebird
+
+# ADR-0060 bounds the Firebird section checks against (the implementation notes of 2026-11-01, R7,
+# R25, R41 item 2, check()'s statement timeout and budget).
+FB_CHECKPOINT_CAP = 14 * 2**20
+FB_LEDGER_CAP = 2 * 2**20
+FB_ATTACH_INVERSION_IDS = 256
+FB_ATTACH_LATE_S = 10.0
+FB_CHECK_STATEMENT_MS = 3000
+FB_CHECK_TOTAL_MS = 9000
+FB_DEPENDENCY_ROWS = 65536
+FB_SCHEMA_OBJECTS = 10000
+
+
+def fb_state_kind(name: str) -> str:
+    if name.endswith(".firebird_audit_trace.checkpoint"):
+        return "checkpoint"
+    if name.endswith(".firebird_ledger.counters"):
+        return "ledger"
+    return "other_audit_state"
+
+
+def fb_state_io(samples: list[dict]) -> dict:
+    """The checkpoint and ledger I/O from fbload.py state samples (every 0.5 s: size, inode and mtime
+    of each file under the state volume's audit/): per kind, the writes seen (a new inode or mtime
+    after the first sample; the files are written whole and atomically, so a write's bytes are the
+    file's size then), the bytes written, the write rate, the largest gap between two writes and the
+    sizes over the run. Writes closer than the sampling interval count once (a lower bound)."""
+    out: dict[str, dict] = {}
+    prev: dict[str, tuple[int, int]] = {}
+    first_t = last_t = None
+    for s in sorted(samples, key=lambda x: x.get("t", 0)):
+        t = s.get("t")
+        if t is None:
+            continue
+        first_t = t if first_t is None else first_t
+        last_t = t
+        for name, v in (s.get("audit") or {}).items():
+            if not isinstance(v, list) or len(v) != 3:
+                continue
+            size, ino, mtime = v
+            k = fb_state_kind(name)
+            o = out.setdefault(k, {"files": set(), "writes": 0, "bytes_written": 0, "sizes": [], "write_times": []})
+            o["files"].add(name)
+            o["sizes"].append(size)
+            key = (ino, mtime)
+            if name in prev and prev[name] != key:
+                o["writes"] += 1
+                o["bytes_written"] += size
+                o["write_times"].append(t)
+            prev[name] = key
+    span = (last_t - first_t) if first_t is not None and last_t is not None else None
+    res: dict = {"span_s": _r(span, 1)}
+    for k, o in sorted(out.items()):
+        wt = o["write_times"]
+        gaps = [b - a for a, b in zip(wt, wt[1:])]
+        res[k] = {"files": len(o["files"]), "writes": o["writes"], "bytes_written": o["bytes_written"],
+                  "writes_per_s": _r(o["writes"] / span, 3) if span else None,
+                  "bytes_per_s": _r(o["bytes_written"] / span, 1) if span else None,
+                  "min_write_gap_s": _r(min(gaps), 2) if gaps else None,
+                  "size_min": min(o["sizes"]) if o["sizes"] else None, "size_max": max(o["sizes"]) if o["sizes"] else None,
+                  "size_last": o["sizes"][-1] if o["sizes"] else None}
+    return res
+
+
+def firebird_section(facts: list[dict], state: list[dict], ck: Checks) -> dict | None:
+    """The Firebird load run's own measurements (firebird.sh): the level reached, the agent's own
+    records, the checkpoint and ledger I/O, 8g, 3m and the 10 000-object schema."""
+    cfg = one_fact(facts, "config") or {}
+    if cfg.get("harness") != "firebird":
+        return None
+    parts = str(cfg.get("parts") or "")
+    fb: dict = {"version": cfg.get("firebird_version")}
+    if "load" in parts.split(","):
+        lv = one_fact(facts, "fb_level") or {}
+        fb["level"] = lv
+        ck.add("firebird.audit_level_partial", lv.get("level") == "partial" if lv else None, lv.get("level"),
+               "partial", "the agent in its container reaches Partial (host_identity, e2e-firebird layout) before the soak")
+        own = one_fact(facts, "fb_own_events")
+        fb["own_events"] = own
+        ck.add("firebird.own_records_not_reported", None if own is None else own.get("events") == 0,
+               None if own is None else own.get("events"), "0 events",
+               "events under the agent's account DATABASTION_AGENT over the run (its checks, catalog reads, Discovery)")
+        src = one_fact(facts, "source", target="fb-load")
+        wl = one_fact(facts, "workload", target="fb-load", phase="on")
+        if src and wl:
+            ck.add("firebird.trace_holds_every_statement", src.get("statements") == wl.get("issued"),
+                   src.get("statements"), f"== {wl.get('issued')} issued",
+                   "LOAD_APP statement records in the trace log over the soak (the source side of events_accounted)")
+        io = fb_state_io(state)
+        fb["state_io"] = io
+        cp, lg = io.get("checkpoint"), io.get("ledger")
+        ck.add("firebird.checkpoint_written", None if not state else bool(cp and cp["writes"] > 0),
+               None if not cp else cp["writes"], "> 0 writes", "the parser checkpoint is written under load")
+        ck.add("firebird.checkpoint_size", None if not cp else cp["size_max"] <= FB_CHECKPOINT_CAP,
+               None if not cp else cp["size_max"], f"<= {FB_CHECKPOINT_CAP}", "bytes (implementation note of 2026-11-01)")
+        ck.add("firebird.checkpoint_write_rate", None if not cp or cp["writes_per_s"] is None else cp["writes_per_s"] <= 1.0,
+               None if not cp else cp["writes_per_s"], "<= 1 / s", "at most one checkpoint write per second")
+        ck.add("firebird.ledger_size", None if not lg else lg["size_max"] <= FB_LEDGER_CAP,
+               None if not lg else lg["size_max"], f"<= {FB_LEDGER_CAP}", "bytes (implementation note of 2026-11-01)")
+        # 8g
+        b = one_fact(facts, "fb_bursts")
+        if b is not None:
+            bursts = b.get("bursts") or []
+            fb["attach_bursts"] = b
+            opened = [x for x in bursts if x.get("opened_database")]
+            ck.add("firebird.8g_bursts_seen", len(bursts) == cfg.get("bursts") and all(
+                x.get("attaches") == cfg.get("burst_size") for x in bursts),
+                [x.get("attaches") for x in bursts], f"{cfg.get('bursts')} x {cfg.get('burst_size')} attaches",
+                "every burst's attach records found in the trace log")
+            ck.add("firebird.8g_bursts_opened_database", len(opened) >= 1, len(opened), ">= 1",
+                   "bursts that opened the database (no attachment live at their first attach)")
+            inv = max((x.get("max_inversion") or 0 for x in bursts), default=None)
+            late = max((x.get("latest_late_s") or 0 for x in bursts), default=None)
+            ck.add("firebird.8g_max_inversion_ids", None if inv is None else inv <= FB_ATTACH_INVERSION_IDS,
+                   inv, f"<= {FB_ATTACH_INVERSION_IDS}", "R7 count bound, over every burst")
+            ck.add("firebird.8g_latest_late_record_s", None if late is None else late <= FB_ATTACH_LATE_S,
+                   late, f"<= {FB_ATTACH_LATE_S}", "R7 time bound (header times), over every burst")
+            a0, a1 = b.get("ambiguous_before"), b.get("ambiguous_after")
+            ck.add("firebird.8g_no_ambiguous_record", None if a0 is None or a1 is None else a1 == a0,
+                   {"before": a0, "after": a1}, "unchanged", "the agent accepts the bursts' out-of-order attaches")
+        # 3m
+        sc = facts_of(facts, "fb_3m")
+        if sc:
+            fb["3m"] = sc
+            for s in sc:
+                name = s.get("scenario")
+                ev = s.get("events") or {}
+                want = s.get("statements_expected") or 0
+                ck.add(f"firebird.3m.{name}.reported", (ev.get("statements") or 0) >= want,
+                       {"statements": ev.get("statements"), "star": ev.get("star_statements")}, f">= {want}",
+                       "every statement of the step in the principal's events (nothing hidden)")
+                within = "within" in name or (name.startswith("perrow_") and
+                                              ((s.get("client") or {}).get("duration_s") or 99) < FB_ATTACH_LATE_S)
+                delta = None if s.get("ambiguous_after") is None or s.get("ambiguous_before") is None \
+                    else s["ambiguous_after"] - s["ambiguous_before"]
+                if within:
+                    ck.add(f"firebird.3m.{name}.no_ambiguous_record", None if delta is None else delta == 0, delta, "0",
+                           "within R25's bounds: no ambiguous record")
+                else:
+                    ck.skip(f"firebird.3m.{name}.ambiguous_records", delta, "measured",
+                            "past a bound of R25 (or a restart): reported, fail closed (loud) as the ADR allows")
+        rs = one_fact(facts, "fb_restart")
+        if rs is not None:
+            fb["restart"] = rs
+    if "schema" in parts.split(","):
+        sch = one_fact(facts, "fb_schema") or {}
+        fb["schema"] = sch
+        ck.add("firebird.schema_objects", None if not sch else sch.get("objects", 0) >= FB_SCHEMA_OBJECTS,
+               sch.get("objects"), f">= {FB_SCHEMA_OBJECTS}", "RELEASE.md gate: a schema of at least 10 000 objects")
+        reads = {r.get("phase"): r for r in facts_of(facts, "fb_schema_read")}
+        fb["schema_reads"] = reads
+        c = reads.get("complete")
+        if c is not None:
+            rows = (c.get("dependencies") or {}).get("rows_max")
+            ck.add("firebird.schema_read_complete", c.get("cut_warnings") == 0 and (c.get("checks") or 0) >= 1
+                   and rows is not None, {"cut_warnings": c.get("cut_warnings"), "dependency_rows": rows},
+                   "0 cut warnings", "the dependent-set read of the >= 10 000-object schema is complete (R41 item 2)")
+            worst = max(((c.get(k) or {}).get("ms_max") or 0 for k in ("view_relations", "dependencies",
+                                                                        "field_sources", "routines")), default=None)
+            ck.add("firebird.schema_read_under_statement_timeout", None if worst is None else worst < FB_CHECK_STATEMENT_MS,
+                   worst, f"< {FB_CHECK_STATEMENT_MS} ms", "the slowest of the four reads (server-side time) against check()'s 3 s")
+            tot = (c.get("sum_per_check_ms") or {}).get("max")
+            ck.add("firebird.schema_read_within_check_budget", None if tot is None else tot < FB_CHECK_TOTAL_MS,
+                   tot, f"< {FB_CHECK_TOTAL_MS} ms", "the four reads of one check together against check()'s 9 s budget")
+        cut = reads.get("cut")
+        if cut is not None:
+            ck.add("firebird.schema_cut_detected", (cut.get("cut_warnings") or 0) >= 1, cut.get("cut_warnings"), ">= 1",
+                   f"past {FB_DEPENDENCY_ROWS} dependency rows the agent logs the cut (the flood phase 'cut' measures it)")
+        fl = facts_of(facts, "fb_flood")
+        if fl:
+            table: dict = {}
+            for f in fl:
+                ev = f.get("events") or {}
+                issued = f.get("issued") or 0
+                table.setdefault(f.get("phase"), {})[f.get("user")] = {
+                    "issued": issued, "statements": ev.get("statements"), "events": ev.get("events"),
+                    "star_statements": ev.get("star_statements"), "star_events": ev.get("star_events"),
+                    "star_share": _r((ev.get("star_statements") or 0) / issued, 3) if issued else None}
+                ck.add(f"firebird.flood.{f.get('phase')}.{f.get('user')}.reported",
+                       issued > 0 and (ev.get("statements") or 0) >= issued,
+                       {"issued": issued, "statements": ev.get("statements")}, ">= issued",
+                       "every statement of the category in the principal's events")
+            fb["flood"] = table
+    return fb
+
+
+def render_firebird(fb: dict, fmt) -> list[str]:
+    """The Firebird section of results.md (firebird.sh)."""
+    out = ["", f"## 4. Firebird {fmt(fb.get('version'))}", ""]
+    if fb.get("level"):
+        out.append(f"- Audit level before the soak: {fmt(fb['level'])}")
+    if fb.get("own_events") is not None:
+        out.append(f"- Events under the agent's account: {fmt(fb['own_events'])}")
+    io = fb.get("state_io")
+    if io:
+        out += ["", f"Checkpoint and ledger I/O over {fmt(io.get('span_s'))} s (samples every 0.5 s; writes closer "
+                "than that count once):", "",
+                "| File | Files | Writes | Bytes written | Writes / s | Bytes / s | Min gap (s) | Size min / max / last |",
+                "|---|---|---|---|---|---|---|---|"]
+        for k, v in sorted(io.items()):
+            if isinstance(v, dict):
+                out.append(f"| {k} | {fmt(v.get('files'))} | {fmt(v.get('writes'))} | {fmt(v.get('bytes_written'))} | "
+                           f"{fmt(v.get('writes_per_s'))} | {fmt(v.get('bytes_per_s'))} | {fmt(v.get('min_write_gap_s'))} | "
+                           f"{fmt(v.get('size_min'))} / {fmt(v.get('size_max'))} / {fmt(v.get('size_last'))} |")
+    b = fb.get("attach_bursts")
+    if b:
+        out += ["", f"8g attach bursts (ambiguous records before / after: {fmt(b.get('ambiguous_before'))} / "
+                f"{fmt(b.get('ambiguous_after'))}; level after: {fmt(b.get('level_after'))}):", "",
+                "| Burst | Attaches | Opened the database | Late records | Largest inversion (ids) | Latest late record (s) |",
+                "|---|---|---|---|---|---|"]
+        for i, x in enumerate(b.get("bursts") or [], 1):
+            out.append(f"| {i} | {fmt(x.get('attaches'))} | {fmt(x.get('opened_database'))} | {fmt(x.get('late_records'))} | "
+                       f"{fmt(x.get('max_inversion'))} | {fmt(x.get('latest_late_s'))} |")
+    if fb.get("3m"):
+        out += ["", "3m: per-row statements and pending groups:", "",
+                "| Step | Client | Expected statements | Reported statements | Of which `*` | Ambiguous before / after | Level after |",
+                "|---|---|---|---|---|---|---|"]
+        for s in fb["3m"]:
+            c = {k: v for k, v in (s.get("client") or {}).items() if k not in ("kind", "t0", "t1")}
+            ev = s.get("events") or {}
+            out.append(f"| {s.get('scenario')} | {fmt(c)} | {fmt(s.get('statements_expected'))} | {fmt(ev.get('statements'))} | "
+                       f"{fmt(ev.get('star_statements'))} | {fmt(s.get('ambiguous_before'))} / {fmt(s.get('ambiguous_after'))} | "
+                       f"{fmt(s.get('level_after'))} |")
+    if fb.get("restart"):
+        out.append(f"- Agent restart during pending groups: {fmt(fb['restart'])}")
+    if fb.get("schema"):
+        out += ["", f"Schema: {fmt({k: v for k, v in fb['schema'].items() if k != 'kind'})}", ""]
+    for ph, r in sorted((fb.get("schema_reads") or {}).items()):
+        out.append(f"- Dependent-set read ({ph}): {fmt({k: v for k, v in r.items() if k not in ('kind', 'phase')})}")
+    if fb.get("flood"):
+        out += ["", "Always-reported (`*`) statements per category principal and phase:", "",
+                "| Phase | Principal | Issued | Reported | `*` statements | `*` share |", "|---|---|---|---|---|---|"]
+        for ph, users in fb["flood"].items():
+            for u, v in sorted(users.items()):
+                out.append(f"| {ph} | {u} | {fmt(v.get('issued'))} | {fmt(v.get('statements'))} | "
+                           f"{fmt(v.get('star_statements'))} | {fmt(v.get('star_share'))} |")
+    return out
 
 
 def render_markdown(rep: dict) -> str:
@@ -1080,6 +1324,9 @@ def render_markdown(rep: dict) -> str:
     for k in ("cpu_cores_audit_off", "cpu_cores_audit_on", "cpu_ms_per_1000_statements", "rss_mb_audit_on",
               "rss_mb_peak", "rss_mb_hwm", "rss_growth", "cpu_growth", "spool", "metrics"):
         out.append(f"- `{k}`: {fmt(ag.get(k))}")
+    fb = rep.get("firebird")
+    if fb:
+        out += render_firebird(fb, fmt)
     out += ["", "## Checks", "", "| Check | Result | Value | Limit | Note |", "|---|---|---|---|---|"]
     for c in rep.get("checks") or []:
         res = "skipped" if c.get("skipped") else {True: "pass", False: "**FAIL**", None: "**no data**"}[c["pass"]]
@@ -1093,7 +1340,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     samples.sort(key=lambda s: s.get("t", 0))
     heartbeats = load_jsonl([args.heartbeats]) if args.heartbeats else []
     lim = Limits.from_env(dict(os.environ))
-    rep, ck = build_report(facts, samples, heartbeats, lim)
+    state = load_jsonl([args.state_samples]) if getattr(args, "state_samples", None) else []
+    rep, ck = build_report(facts, samples, heartbeats, lim, state)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "results.json"), "w", encoding="utf-8") as f:
         json.dump(rep, f, indent=2, sort_keys=True)
@@ -1708,6 +1956,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--samples", nargs="+", required=True)
     r.add_argument("--heartbeats")
     r.add_argument("--out", required=True)
+    r.add_argument("--state-samples", dest="state_samples",
+                   help="firebird.sh: fbload.py state samples of the agent's state volume")
     a = p.parse_args(argv)
     return {"sample": cmd_sample, "pgbench": cmd_pgbench, "sysbench": cmd_sysbench, "quiet": cmd_quiet,
             "report": cmd_report, "census": cmd_census, "census-sql": cmd_census_sql,
