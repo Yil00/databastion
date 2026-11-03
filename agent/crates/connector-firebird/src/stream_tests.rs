@@ -3441,3 +3441,57 @@ fn parenthesized_joins_over_always_reported_relations_are_marked() {
         );
     }
 }
+
+/// Second re-review H1 of #408: an external-file table (block-blind, R28:
+/// its read writes no block) named after a join condition holding `CASE
+/// WHEN` or `NEXT VALUE FOR`, or inside MERGE's parenthesized source, is
+/// read from the text and always reported; a token naming one marks the
+/// record wherever it stands (the safety net).
+#[test]
+fn external_tables_after_join_conditions_are_marked() {
+    let a = "24:0x7f0000000100";
+    let user = [
+        ("T1", RelClass::Table),
+        ("CUSTOMERS", RelClass::Table),
+        ("EXT_EXPORT", RelClass::External),
+    ]
+    .into_iter()
+    .map(|(n, c)| (n.to_owned(), c))
+    .collect();
+    let cat =
+        super::audit::Classes::for_tests(user, crate::views::compute(every_class_reads(false)));
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let blocks: &[(&str, u64)] = &[("T1", 2), ("CUSTOMERS", 2)];
+    for (i, text) in [
+        "SELECT * FROM T1 A JOIN CUSTOMERS B ON CASE WHEN 1 = 1 THEN 1 END = 1, EXT_EXPORT E",
+        "SELECT * FROM T1 A JOIN CUSTOMERS B ON A.X = NEXT VALUE FOR G, EXT_EXPORT E",
+        "MERGE INTO T1 USING (EXT_EXPORT E JOIN CUSTOMERS B ON 1 = 1) S ON 1 = 0 WHEN MATCHED THEN UPDATE SET X = 1",
+        "SELECT * FROM T1 CROSS JOIN LATERAL EXT_EXPORT",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let out = feed(
+            &mut m,
+            &cats,
+            &stmt(a, 3, 10 + i as u64, "APP", text, 2, blocks),
+            1000 + 1000 * i as u64,
+        );
+        assert!(
+            !out.is_empty()
+                && out.iter().all(|(_, e)| e.always_report())
+                && names(&out).contains(&"*".to_owned()),
+            "{text}: {:?}",
+            names(&out)
+        );
+        // Read from the text (not only the safety net): the external
+        // table's remote-data signal.
+        let remote = out.iter().any(|(_, e)| {
+            e.signals()
+                .contains(&databastion_classifiers::masking::Signal::RemoteDataAccess)
+        });
+        assert!(remote || text.contains("LATERAL"), "{text}");
+    }
+}

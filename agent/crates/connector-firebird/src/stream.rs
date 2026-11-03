@@ -2091,8 +2091,16 @@ impl Machine {
                 // naming a relation of the always-reported lists marks the
                 // record, whatever position the analysis gave it (the
                 // dependent set leaves those relations out).
+                // Second re-review H1 of #408: so does a token naming an
+                // external-file table (block-blind, R28: no block can show
+                // its read). No view is block-blind (R28 item 3 is not
+                // implemented), so there is no view to add.
                 if ids.cut
                     || ids.names.iter().any(|n| always_listed(n))
+                    || ids
+                        .names
+                        .iter()
+                        .any(|n| cat.class(n) == crate::trace_events::RelClass::External)
                     || ids.names.iter().any(|n| cat.dependent_token(n))
                     || ids.packaged.iter().any(|(p, _)| cat.dependent_token(p))
                 {
