@@ -729,9 +729,41 @@ views over `MON$STATEMENTS` / `MON$ATTACHMENTS` (the dependent set's roots); abo
 | `LOAD_FIREBIRD_PARTS` | `load,schema` | `load`, `schema` or both |
 | `LOAD_FB_TABLES`, `LOAD_FB_ROWS` | 200, 500 000 | the load seed |
 | `LOAD_FB_RATE` | 300 | workload statements per second |
-| `LOAD_FB_BURSTS`, `LOAD_FB_BURST_SIZE` | 5, 256 | 8g |
+| `LOAD_FB_BURSTS`, `LOAD_FB_BURST_SIZE` | 5, 256 | 8g (the burst size up to 1024; workflow input `firebird_burst_size`) |
 | `LOAD_FB_SCHEMA_SCALE` | 1 | the schema's object counts multiplied (0.1 to 4) |
 | `LOAD_FB_SCHEMA_RATE`, `LOAD_FB_SCHEMA_PHASE_S` | 10, 120 | the flood workload, per principal |
+
+**Status: local runs only, 2026-11-03** (not CI: a 4-CPU VM with cgroup v1, the stand-in
+`firebird-audit-init` image locally; 180 s soak, 60 s flood phases, 3 bursts; the CI run with the
+defaults is still to do). Every check passed but `firebird.8g_bursts_seen` (a client-side driver race
+lost part of some bursts; fixed since, and a second 4.0.7 run had 6 of 6 full bursts) and, on the first run, the stream's
+first open before the first check, now declared as expected:
+
+| | 5.0.4 | 4.0.7 |
+|---|---|---|
+| Discovery impact (203 tables, 500 000 rows) | 0.538 % (217 s scan) | 0.531 % (188 s scan) |
+| Audit: statements / in the trace / events | 54 000 / 54 000 / 54 000 | 54 000 / 54 000 / 54 000 |
+| p95 off / on (ms), drain (s) | 2.61 / 2.40, 63.6 | 1.96 / 1.94, 63.6 |
+| Agent CPU (core, Audit on), peak RSS (MiB) | 0.0137, 73.5 | 0.0126, 66.2 |
+| Events under the agent's account | 0 | 0 |
+| Checkpoint: writes, bytes written, peak size, over ~1 450 s | 67, 5.2 MB, 624 KB | 57, 4.3 MB, 623 KB |
+| Ledger: writes, bytes written, peak size | 114, 13.9 MB, 162 KB | 104, 12.6 MB, 159 KB |
+| 8g: largest inversion, latest late record (bursts that opened the database) | 18 ids, 0.114 s | 256 ids, 0.998 s (a second run, 6 full bursts: 26, 13, 243, 241, 16, 256 ids) |
+| 8g: ambiguous records | 0 | 0 |
+| 3m: statements reported / expected; ambiguous records | all; 0 (every step, the 260 x 16 step too) | all, the restart step 31 for 16 (re-sent after the restore); 0 |
+| Schema: objects, dependency rows | 11 430, 33 525 | 11 430, 33 525 |
+| Dependent-set read: slowest read, four reads per check (server-side) | 70 ms, 136 ms (complete) | 67 ms, 148 ms (complete) |
+| Cut set (65 601 rows fetched): slowest read, cut warnings | 161 ms, 3 of 3 checks | 164 ms, 3 of 3 checks |
+
+On 4.0.7 the inversion grows with the burst, as R7 measured: in half the bursts the late records
+are almost the whole burst (237 to **256** ids for 256 attaches, about 1 s late), so a 256-attach
+burst reaches R7's count bound exactly (accepted: no ambiguous record) and a larger one would pass
+it; the workflow input `firebird_burst_size` probes past the bound. The always-reported share per principal
+(600 statements each per phase): expression-index tables 100 % with the complete and the
+invalidated set, **0 % with a cut set**; check-constraint tables 0 % (their check triggers depend on
+no always-reported relation); views, procedures and computed-column tables 0 %, 100 % with a cut
+set; an invalidating `CREATE VIEW` (4.0.7) made about 80 statements per principal always reported,
+plain tables included, for 7.8 s after its commit.
 
 Not covered here (the ADR's 3m list): a restart while an external-source binding's events are held
 and long caller transactions with a local external data source (R29); the Garbage Collector's end

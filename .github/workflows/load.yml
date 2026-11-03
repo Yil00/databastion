@@ -61,6 +61,10 @@ on:
         type: choice
         options: ["load,schema", load, schema]
         default: "load,schema"
+      firebird_burst_size:
+        description: "load-firebird: concurrent attaches per 8g burst (256: ADR-0060 R7's measurement; up to 1024 to probe past its bound, the 8g checks then fail by design)"
+        required: false
+        default: "256"
   pull_request:
     branches: [main, dev]
     types: [opened, synchronize, reopened, labeled]
@@ -364,6 +368,7 @@ jobs:
       # Validated by firebird.sh (never interpolated into a script).
       LOAD_FIREBIRD_VERSION: ${{ inputs.firebird_version || '5.0.4' }}
       LOAD_FIREBIRD_PARTS: ${{ inputs.firebird_parts || 'load,schema' }}
+      LOAD_FB_BURST_SIZE: ${{ inputs.firebird_burst_size || '256' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
