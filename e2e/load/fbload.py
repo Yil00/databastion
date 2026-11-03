@@ -291,7 +291,9 @@ PERROW_SQL = {
     # Per row: the block-ful function LOAD_FN_LOOKUP (reads LOAD_LOOKUP).
     "select": "SELECT LOAD_FN_LOOKUP(K) FROM LOAD_SRC WHERE ID <= ?",
 }
-OPENTX_SQL = "SELECT LOAD_FN_LOOKUP(K) FROM LOAD_SRC WHERE ID <= 20000"
+# 200 rows: the server evaluates the function for whole prefetch batches, so a larger cursor writes
+# thousands of nested records per open cursor (a 6.4 GB trace log with 20 000 rows locally).
+OPENTX_SQL = "SELECT LOAD_FN_LOOKUP(K) FROM LOAD_SRC WHERE ID <= 200"
 
 
 def cmd_perrow(a) -> int:
@@ -450,7 +452,8 @@ def records(lines, start_offset: int = 0):
     cur: Record | None = None
     off = start_offset
     for line in lines:
-        m = HEADER_RE.match(line)
+        # Cheap prefilters first: a header starts with a digit, the attachment line with a tab.
+        m = HEADER_RE.match(line) if line[:1].isdigit() and b") " in line else None
         if m:
             if cur is not None:
                 cur.size = off - cur.offset
@@ -458,19 +461,22 @@ def records(lines, start_offset: int = 0):
             cur = Record(parse_ts(m.group(1)), int(m.group(2)), m.group(3).decode(), m.group(4).decode().strip(),
                          offset=off)
         elif cur is not None:
-            if cur.att is None:
+            if cur.att is None and line[:1] == b"\t" and b"(ATT_" in line:
                 a = ATTACH_RE.match(line)
                 if a:
                     cur.db, cur.att, cur.user = a.group(1), int(a.group(2)), a.group(3)
-            f = FETCHED_RE.match(line)
-            if f:
-                cur.fetched = int(f.group(1))
-            p = PERF_RE.match(line)
-            if p and cur.ms is None:
-                cur.ms = int(p.group(1))
-            for k, mark in CATALOG_MARKS.items():
-                if mark in line and k not in cur.marks:
-                    cur.marks += (k,)
+            elif b"records fetched" in line:
+                f = FETCHED_RE.match(line)
+                if f:
+                    cur.fetched = int(f.group(1))
+            elif cur.ms is None and b" ms" in line:
+                p = PERF_RE.match(line)
+                if p:
+                    cur.ms = int(p.group(1))
+            elif b"FROM RDB$" in line:
+                for k, mark in CATALOG_MARKS.items():
+                    if mark in line and k not in cur.marks:
+                        cur.marks += (k,)
         off += len(line)
     if cur is not None:
         cur.size = off - cur.offset

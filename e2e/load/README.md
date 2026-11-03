@@ -694,7 +694,7 @@ copied out. `fbload.py state` samples the agent's state volume read-only (sizes,
    10 s, at least one burst that opened the database, the agent's ambiguous-record count
    (`audit.log_records_ambiguous`) unchanged.
 5. **3m** (R25): with `LOAD_APP` at `LOAD_FB_RATE` next to them, per-row statements of 10 000 and
-   50 000 rows as `LOAD_ROW` (`INSERT … SELECT` into `LOAD_SINK`, whose triggers are block-less and
+   50 000 rows (and an `INSERT` of 200 000) as `LOAD_ROW` (`INSERT … SELECT` into `LOAD_SINK`, whose triggers are block-less and
    block-ful per row; `SELECT LOAD_FN_LOOKUP(K)`, a block-ful function per row); then, as `LOAD_TX`,
    open cursors over a per-row function in many transactions, partly fetched and held: 8 x 8 (within
    the budget), 2 x 24 (past 16 transactions per binding), 4 x 4 held 15 s (block-ful-only groups past

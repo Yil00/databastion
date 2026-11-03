@@ -569,7 +569,7 @@ if part load; then
   fact --arg name "drain_${TARGET}" --argjson t0 "$DRAIN_T0" --argjson t1 "$(now_s)" '{kind: "window", name: $name, t0: $t0, t1: $t1}'
   fact --arg target "$TARGET" --argjson want "$want" --argjson got "$got" \
     --argjson samples "[$(IFS=,; printf '%s' "${drain_samples[*]}")]" \
-    '{kind: "drain", target: $target, want: $want, stored: $got, samples: $samples, stored_at_workload_end: $samples[0][1]}'
+    '{kind: "fb_drain", target: $target, want: $want, stored: $got, samples: $samples, stored_at_workload_end: $samples[0][1]}'
   console_sql "SELECT json_build_object('kind', 'events', 'target', '${TARGET}',
       'received', coalesce(sum(aggregated_count), 0), 'events', count(*),
       'lag_p95_s', round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from received_at - coalesce(ts_last, ts))::float8)::numeric, 1),
@@ -649,7 +649,7 @@ if part load; then
   FBC_TIMEOUT=900 fbc workload --user LOAD_APP --password-file "$CLIENT_PW" --statements /databastion/in/workload.tsv \
     --rate "$LOAD_FB_RATE" --duration 240 --sessions "$LOAD_CLIENTS" >"$W/out/3m-side.json" 2>&1 &
   side_pid=$!
-  for spec in insert:10000 select:10000 insert:50000 select:50000; do
+  for spec in insert:10000 select:10000 insert:50000 select:50000 insert:200000; do
     scenario "perrow_${spec%%:*}_${spec#*:}" LOAD_ROW 1 perrow --what "${spec%%:*}" --rows "${spec#*:}"
   done
   wait "$side_pid" || log "WARNING: the concurrent LOAD_APP workload of the per-row steps failed"
@@ -682,6 +682,8 @@ if part schema; then
   if part load; then
     log "schema: the server again, from fresh volumes, with the 10 000-object schema"
     timeout 120 docker compose "${COMPOSE_ARGS[@]}" stop -t 30 agent >/dev/null 2>&1 || true
+    # Part 1's agent log (its container is recreated below): agent-load.log, redacted with the others.
+    compose logs --no-color --timestamps agent >"$LOAD_LOG_DIR/agent-load.log" 2>&1 || true
     timeout 120 docker compose "${COMPOSE_ARGS[@]}" rm -sf agent firebird firebird-audit-init >/dev/null 2>&1 || true
     for v in firebird-root firebird-data firebird-audit; do
       docker volume rm "${PROJECT}_${v}" >/dev/null 2>&1 || fail "cannot remove the volume ${v}"
@@ -734,8 +736,9 @@ if part schema; then
     log "schema read ($1): $(tail -n 1 "$FACTS" | jq -c 'del(.kind)')"
   }
   # flood_phase NAME: the six category principals at LOAD_FB_SCHEMA_RATE each for LOAD_FB_SCHEMA_PHASE_S.
+  # flood_phase NAME [ACTION]: ACTION (a function) runs 10 s into the workload.
   flood_phase() {
-    local name="$1" u t0 t1 out ev amb st pid
+    local name="$1" action="${2:-}" u t0 t1 out ev amb st pid
     local -a pids=()
     st="$(status_json)"
     amb="$(ambiguous_of "$st")"
@@ -746,6 +749,7 @@ if part schema; then
         --rate "$LOAD_FB_SCHEMA_RATE" --duration "$LOAD_FB_SCHEMA_PHASE_S" --sessions 1
       pids+=("$!")
     done
+    if [ -n "$action" ]; then sleep 10; "$action"; fi
     for pid in "${pids[@]}"; do wait "$pid" || log "WARNING: a flood client of phase ${name} failed"; done
     t1="$(now_s)"
     for u in $(jq -r 'keys[]' "$W/schema-workload.json"); do
@@ -763,11 +767,24 @@ if part schema; then
   phase_done schema-complete
   # (b) An invalidated set: a DDL statement (a view) committed; the sets stay invalidated until a check
   # whose catalog read started after its commit (R41 item 8; an early check is asked).
-  log "schema: invalidating the dependent set (CREATE VIEW as SYSDBA)"
   printf 'CREATE VIEW LOAD_INVALIDATE_V (ID) AS SELECT ID FROM ERP_T00001\n' >"$W/load/client/invalidate.sql"
   chmod 0644 "$W/load/client/invalidate.sql"
-  fbc ddl --user SYSDBA --password-file "$SYSDBA_PW" --file /databastion/in/invalidate.sql >/dev/null || fail "the invalidating DDL failed"
-  flood_phase invalidated
+  invalidate() {
+    log "schema: invalidating the dependent set during the workload (CREATE VIEW as SYSDBA, committed)"
+    INV_T="$(now_s)"
+    fbc ddl --user SYSDBA --password-file "$SYSDBA_PW" --file /databastion/in/invalidate.sql >/dev/null || fail "the invalidating DDL failed"
+    INV_T1="$(now_s)"
+  }
+  flood_phase invalidated invalidate
+  # How long the set stayed invalidated: the `*` events of the view and procedure readers after the
+  # DDL (their reads are always reported only while it lasts).
+  console_sql "SELECT json_build_object('kind', 'fb_invalidation', 'ddl_t0', ${INV_T}, 'ddl_t1', ${INV_T1},
+      'star_first_s', round((extract(epoch from min(ts)) - ${INV_T1})::numeric, 1),
+      'star_last_s', round((extract(epoch from max(coalesce(ts_last, ts))) - ${INV_T1})::numeric, 1),
+      'star_statements', coalesce(sum(aggregated_count), 0))
+    FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${TARGET}' AND db_user IN ('LOAD_VIEW', 'LOAD_PROC', 'LOAD_COMP')
+      AND objects @> '[{\"object\": \"*\"}]'::jsonb AND ts >= to_timestamp(${INV_T}) - interval '2 seconds'" >>"$FACTS"
+  log "schema invalidation: $(tail -n 1 "$FACTS" | jq -c 'del(.kind)')"
   phase_done schema-invalidated
   # (c) A cut set: procedures added past the 65 536 dependency rows of the read.
   dep="$(FBC_TIMEOUT=60 fbc sql --user SYSDBA --password-file "$SYSDBA_PW" --statement 'SELECT COUNT(*) FROM RDB$DEPENDENCIES')"
@@ -787,6 +804,19 @@ if part schema; then
 fi
 
 # ------------------------------------------------------------------------------ report
+# Review N11 of lot 1: Audit stays blocked until a check of the agent process gives its verdict, so
+# the stream's first open after an agent start fails once (permission_denied, retried after 10 s).
+# Counted for the last agent process (the heartbeat counters are per process): those failures before
+# its first "Firebird checked" line are expected; any other fails agent.audit_stream_failures_total.
+timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color --no-log-prefix agent 2>/dev/null \
+  | sed -n 's/^[^{]*//p' >"$W/out/agent-last.jsonl" || true
+expected="$(jq -sr '(map(.fields.message == "databastion-agent starting") | rindex(true) // 0) as $s | .[$s:]
+    | (map(.fields.message == "Firebird checked") | index(true) // length) as $c
+    | [.[:$c][] | select(.fields.message == "audit stream failed; restarting" and .fields.code == "permission_denied")] | length' \
+  "$W/out/agent-last.jsonl" 2>/dev/null || echo 0)"
+rm -f -- "$W/out/agent-last.jsonl"
+fact --argjson n "${expected:-0}" '{kind: "expected_stream_failures", n: $n,
+  why: "the first stream open of the last agent process before its first check (Audit blocked until a check verdict, lot 1 review N11)"}'
 sleep 5
 stop_background
 log "computing the results"

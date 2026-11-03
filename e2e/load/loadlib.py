@@ -998,11 +998,16 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
            "0 batches in a heartbeat after the drain")
     ck.add("agent.no_dropped_batches", last_spool.get("dropped_batches", 0) == 0 and last_spool.get("dropped_items", 0) == 0,
            {"batches": last_spool.get("dropped_batches", 0), "items": last_spool.get("dropped_items", 0)}, "0")
+    # A harness may declare stream failures its target's design makes expected (firebird.sh: the
+    # first open after an agent start, before the first check); only those are accepted, with a note.
+    exp = one_fact(facts, "expected_stream_failures") or {}
     for k in ("events_lost_total", "findings_lost_total", "audit_stream_failures_total",
               "audit_records_skipped_total", "audit_record_panics_total", "connector_panics_total",
               "batches_rejected_total"):
         v = metrics.get(k)
-        ck.add(f"agent.{k}", v is not None and v == 0, v, "0")
+        allowed = int(exp.get("n") or 0) if k == "audit_stream_failures_total" else 0
+        ck.add(f"agent.{k}", v is not None and v <= allowed, v, f"<= {allowed}" if allowed else "0",
+               exp.get("why", "") if allowed else "")
     lost = one_fact(facts, "agent_log")
     if lost is not None:
         ck.add("agent.log_no_lost_batches", lost.get("lost") == 0, lost.get("lost"), "0 lines")
@@ -1184,6 +1189,9 @@ def firebird_section(facts: list[dict], state: list[dict], ck: Checks) -> dict |
         if cut is not None:
             ck.add("firebird.schema_cut_detected", (cut.get("cut_warnings") or 0) >= 1, cut.get("cut_warnings"), ">= 1",
                    f"past {FB_DEPENDENCY_ROWS} dependency rows the agent logs the cut (the flood phase 'cut' measures it)")
+        inv = one_fact(facts, "fb_invalidation")
+        if inv is not None:
+            fb["invalidation"] = {k: v for k, v in inv.items() if k != "kind"}
         fl = facts_of(facts, "fb_flood")
         if fl:
             table: dict = {}
@@ -1245,6 +1253,9 @@ def render_firebird(fb: dict, fmt) -> list[str]:
         out += ["", f"Schema: {fmt({k: v for k, v in fb['schema'].items() if k != 'kind'})}", ""]
     for ph, r in sorted((fb.get("schema_reads") or {}).items()):
         out.append(f"- Dependent-set read ({ph}): {fmt({k: v for k, v in r.items() if k not in ('kind', 'phase')})}")
+    if fb.get("invalidation"):
+        out.append(f"- Invalidated set (`*` reads of the view, procedure and computed-column readers after the DDL): "
+                   f"{fmt(fb['invalidation'])}")
     if fb.get("flood"):
         out += ["", "Always-reported (`*`) statements per category principal and phase:", "",
                 "| Phase | Principal | Issued | Reported | `*` statements | `*` share |", "|---|---|---|---|---|---|"]
