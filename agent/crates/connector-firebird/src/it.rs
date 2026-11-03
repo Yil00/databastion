@@ -1093,7 +1093,7 @@ async fn the_lot_3_texts_and_the_ledger() {
     )
     .await
     .unwrap();
-    crate::check::prepare(&mut s, false, deadline)
+    let (_, major) = crate::check::prepare(&mut s, false, deadline)
         .await
         .unwrap();
     let rows = s
@@ -1125,7 +1125,7 @@ async fn the_lot_3_texts_and_the_ledger() {
     // R12 item 5: the two view-dependency texts run for the minimal
     // account, complete (no view of the seed depends on an
     // always-reported relation).
-    let deps = crate::views::read(&mut s, deadline).await.unwrap();
+    let deps = crate::views::read(&mut s, major, deadline).await.unwrap();
     assert!(deps.complete, "{deps:?}");
     assert!(deps.dependent.is_empty());
     let ledger = crate::own::ledger_for(endpoint.addr);
@@ -1303,10 +1303,10 @@ async fn own_reads_for_the_matrix() {
     )
     .await
     .unwrap();
-    crate::check::prepare(&mut s, false, deadline)
+    let (_, major) = crate::check::prepare(&mut s, false, deadline)
         .await
         .unwrap();
-    crate::views::read(&mut s, deadline).await.unwrap();
+    crate::views::read(&mut s, major, deadline).await.unwrap();
     // R30 item 3 (R20: its row of the own-statement table).
     crate::check::read_db_state(&mut s, deadline).await.unwrap();
     // R22 item 6, R35: a row-limit cut whose extra request reaches the end
@@ -1549,7 +1549,7 @@ async fn the_dependent_set_on_the_server() {
     )
     .await
     .unwrap();
-    crate::check::prepare(&mut s, false, deadline)
+    let (_, major) = crate::check::prepare(&mut s, false, deadline)
         .await
         .unwrap();
     // The rows the mapping relies on (catalog identifiers only).
@@ -1604,7 +1604,7 @@ async fn the_dependent_set_on_the_server() {
     );
     assert!(field_tables.contains("T_COMP"), "{field_tables:?}");
     let start = std::time::Instant::now();
-    let deps = crate::views::read(&mut s, deadline).await.unwrap();
+    let deps = crate::views::read(&mut s, major, deadline).await.unwrap();
     eprintln!(
         "[measure] dependent set read in {} ms: complete {}, {} dependent, computed {:?}",
         start.elapsed().as_millis(),
@@ -1631,6 +1631,21 @@ async fn the_dependent_set_on_the_server() {
             "{name}: {:?}",
             deps.dependent
         );
+    }
+    // The tables that count as dependent while the set is cut or
+    // invalidated (R41 items 2 and 8, the implementation note of
+    // 2026-10-31), from the field sources and the routines read.
+    assert!(deps.marked_known);
+    for name in ["T", "T_COMP", "T_CHK", "T_DOM"] {
+        assert!(deps.marked.contains(name), "{name}: {:?}", deps.marked);
+    }
+    // Security re-review L1 of #408: a partial index (5.0 only) counts as
+    // an expression index does.
+    if major >= 5 {
+        assert!(deps.marked.contains("T_PART"), "{:?}", deps.marked);
+        assert!(deps.dependent.contains("T_PART"), "{:?}", deps.dependent);
+    } else {
+        assert!(!deps.marked.contains("T_PART"));
     }
     eprintln!(
         "[measure] check constraint table dependent {}, domain check table dependent {}",

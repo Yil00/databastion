@@ -97,6 +97,7 @@ mod stream_ckpt;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::trace_events::always_listed;
 use databastion_classifiers::masking::MaskedEvent;
 use databastion_classifiers::query::firebird::{FirebirdKind, analyze_firebird};
 
@@ -2020,11 +2021,16 @@ impl Machine {
                         // (the analysis takes no relation from a DDL text,
                         // so `ALTER TABLE T ADD C COMPUTED BY (…)` names
                         // `T` this way); past the bound, or a text that does
-                        // not lex whole, every relation.
+                        // not lex whole, every relation. A text naming a
+                        // domain (`ALTER DOMAIN D ADD CHECK (…)`) names no
+                        // table that uses it, so every relation too (the
+                        // implementation note of 2026-10-31: domain-check
+                        // tables are dependent).
                         let ids = crate::idents::idents(text);
                         let tokens = ids.names.len() + ids.packaged.len();
+                        let domain = ids.names.iter().any(|n| n == "DOMAIN");
                         let named = self.ddl_named.entry(db).or_default();
-                        if a.parses() && !ids.cut && named.len() + tokens <= 4096 {
+                        if a.parses() && !ids.cut && !domain && named.len() + tokens <= 4096 {
                             named.extend(ids.names);
                             named.extend(ids.packaged.into_iter().map(|(p, _)| p));
                         } else {
@@ -2081,7 +2087,20 @@ impl Machine {
                 } else {
                     crate::idents::idents(text)
                 };
+                // Security re-review H1 of #408, the safety net: a token
+                // naming a relation of the always-reported lists marks the
+                // record, whatever position the analysis gave it (the
+                // dependent set leaves those relations out).
+                // Second re-review H1 of #408: so does a token naming an
+                // external-file table (block-blind, R28: no block can show
+                // its read). No view is block-blind (R28 item 3 is not
+                // implemented), so there is no view to add.
                 if ids.cut
+                    || ids.names.iter().any(|n| always_listed(n))
+                    || ids
+                        .names
+                        .iter()
+                        .any(|n| cat.class(n) == crate::trace_events::RelClass::External)
                     || ids.names.iter().any(|n| cat.dependent_token(n))
                     || ids.packaged.iter().any(|(p, _)| cat.dependent_token(p))
                 {
@@ -2091,10 +2110,11 @@ impl Machine {
                     return true;
                 }
                 let a = analyze_firebird(text);
-                a.relations
-                    .iter()
-                    .chain(&a.procedures)
-                    .any(|n| cat.always_view(n))
+                a.relations_unread
+                    || a.relations
+                        .iter()
+                        .chain(&a.procedures)
+                        .any(|n| cat.always_view(n))
             }
             Body::Routine { name, .. } => cat.always_view(name.name),
             _ => false,
@@ -2551,9 +2571,11 @@ impl Machine {
 
 /// A database's catalog while its sets are invalidated (R28 item 4, R41
 /// item 8): every view, routine, package, trigger and unknown name, every
-/// table with a computed column at the last read, every name a DDL text of
-/// the interval named, and every relation after an unparsable or
-/// ambiguous DDL record count as dependent.
+/// table with a computed column, a domain check, a check constraint or an
+/// expression index at the last read (every table when not known), every
+/// name a DDL text of the interval named, and every relation after an
+/// unparsable or ambiguous DDL record, or a DDL text naming a domain,
+/// count as dependent.
 struct Invalidated<'a> {
     inner: &'a dyn Catalog,
     invalid: bool,
@@ -2577,21 +2599,42 @@ impl Catalog for Invalidated<'_> {
         let r = relation.trim_end_matches(' ');
         let class = self.inner.class(r);
         matches!(class, RelClass::View | RelClass::Unknown)
-            || self.inner.computed(r)
+            || self.inner.marked(r)
             || self.named.is_some_and(|n| n.contains(r))
             || (self.all && !matches!(class, RelClass::System | RelClass::Virtual))
     }
 
+    /// Security re-review M1 of #408: while invalidated, a token naming a
+    /// view, a routine, package or trigger of the last read, a marked
+    /// table, a name of the interval's DDL, or (after an unparsable DDL)
+    /// any known relation, as the object positions do.
     fn dependent_token(&self, name: &str) -> bool {
-        self.inner.dependent_token(name)
-            || (self.invalid
-                && self
-                    .named
-                    .is_some_and(|n| n.contains(name.trim_end_matches(' '))))
+        use crate::trace_events::RelClass;
+        if self.inner.dependent_token(name) {
+            return true;
+        }
+        if !self.invalid {
+            return false;
+        }
+        let r = name.trim_end_matches(' ');
+        let class = self.inner.class(r);
+        class == RelClass::View
+            || self.inner.known_routine(r)
+            || self.inner.marked(r)
+            || self.named.is_some_and(|n| n.contains(r))
+            || (self.all
+                && matches!(
+                    class,
+                    RelClass::Table | RelClass::Gtt | RelClass::External | RelClass::View
+                ))
     }
 
-    fn computed(&self, relation: &str) -> bool {
-        self.inner.computed(relation)
+    fn known_routine(&self, name: &str) -> bool {
+        self.inner.known_routine(name)
+    }
+
+    fn marked(&self, relation: &str) -> bool {
+        self.inner.marked(relation)
     }
 
     fn linger(&self) -> Option<u32> {

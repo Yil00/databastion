@@ -287,8 +287,14 @@ async fn run(
         }
         let mut deps = crate::views::ViewDeps::default();
         let mut db_state = DbState::default();
-        if audit_cfg.is_some() && matches!(result, Ok(Attached::Checked { .. })) {
-            deps = match crate::views::read(&mut s, deadline).await {
+        if audit_cfg.is_some()
+            && let Ok(Attached::Checked { version, .. }) = &result
+        {
+            // Checked: `prepare` accepted the version, so it has a major
+            // (5 otherwise: on 4.0 its read fails, and the set is
+            // incomplete, fail closed).
+            let major = major_of(version).unwrap_or(5);
+            deps = match crate::views::read(&mut s, major, deadline).await {
                 Ok(d) => d,
                 Err(e) => {
                     s.close().await;

@@ -452,6 +452,19 @@ SQL
 else
   echo "[measure] expression index over a virtual relation: refused" >&2
 fi
+# Security re-review L1 of #408: on 5.0, a partial index whose condition reads a virtual relation
+# (accepted on 5.0.4, its dependency recorded with dependent type 37 only); 4.0 has no partial index.
+if [ "$MAJOR" = 5 ]; then
+  {
+    cat "$WORK/root.pw"
+    cat <<'SQL'
+CREATE TABLE T_PART (ID INTEGER);
+CREATE INDEX IX_PART ON T_PART (ID) WHERE ID > (SELECT COUNT(*) FROM MON$STATEMENTS);
+COMMIT;
+SQL
+  } | as_sysdba /opt/firebird/bin/isql -q -b -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/deps.fdb" \
+    >/dev/null
+fi
 
 # ADR-0060 R30 item 3 (R60): a database with a linger, outside the trace and the dev seed, for
 # check()'s RDB$LINGER read (it::the_linger_on_the_server).
