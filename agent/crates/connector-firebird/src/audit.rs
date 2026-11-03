@@ -103,6 +103,18 @@ pub(crate) struct Classes {
 }
 
 impl Classes {
+    /// Test support: a complete catalog read of `user` with `deps`.
+    #[cfg(test)]
+    pub(crate) fn for_tests(user: HashMap<String, RelClass>, deps: crate::views::ViewDeps) -> Self {
+        Self {
+            user,
+            complete: true,
+            deps,
+            linger: None,
+            restore: None,
+        }
+    }
+
     pub(crate) fn from_catalog(c: &catalog::Catalog, deps: crate::views::ViewDeps) -> Self {
         let Some(rels) = &c.relations else {
             return Self {
@@ -155,7 +167,8 @@ impl Classes {
     /// relations classed as external-file tables (the block-blind set of
     /// R28) and as views; the dependent set of R41 (dependent objects,
     /// tables with a computed column and whether the columns were read,
-    /// routine names, whether those reads were complete); the linger of R30
+    /// routine names, the tables marked while the set is incomplete and
+    /// whether they are known, whether those reads were complete); the linger of R30
     /// item 3 and the restore state of R1 rule 5 (`DB_GUID` and
     /// `MON$CREATION_DATE`: ADR-0060 R60, so that a database restored while
     /// the agent was stopped, from a backup with the same schema, is
@@ -185,6 +198,8 @@ impl Classes {
         set(&mut w, &mut self.deps.computed.iter());
         w.bool(self.deps.computed_known);
         set(&mut w, &mut self.deps.routines.iter());
+        set(&mut w, &mut self.deps.marked.iter());
+        w.bool(self.deps.marked_known);
         w.bool(self.deps.complete);
         w.opt_u64(self.linger.map(u64::from));
         w.bool(self.restore.is_some());
@@ -226,27 +241,28 @@ impl Catalog for Classes {
     /// set, or that the last complete catalog read does not know (item 3);
     /// with an incomplete read (failed, cut, past its bounds: item 2),
     /// every view, routine, package, trigger and unknown name, and every
-    /// table with a computed column (every table when the columns were not
-    /// read).
+    /// table with a computed column, a domain check, a check constraint or
+    /// an expression index (every table when those were not read): every
+    /// class the complete set can hold.
     fn always_view(&self, relation: &str) -> bool {
         let r = relation.trim_end_matches(' ');
         if !self.complete || !self.deps.complete {
             return match self.class(r) {
                 RelClass::View | RelClass::Unknown => true,
-                RelClass::Table | RelClass::Gtt => {
-                    !self.deps.computed_known || self.deps.computed.contains(r)
-                }
-                RelClass::External | RelClass::System | RelClass::Virtual => false,
+                RelClass::Table | RelClass::Gtt | RelClass::External => self.marked(r),
+                RelClass::System | RelClass::Virtual => false,
             };
         }
         self.deps.dependent.contains(r)
             || (self.class(r) == RelClass::Unknown && !self.deps.routines.contains(r))
     }
 
-    fn computed(&self, relation: &str) -> bool {
+    fn marked(&self, relation: &str) -> bool {
         let r = relation.trim_end_matches(' ');
-        matches!(self.class(r), RelClass::Table | RelClass::Gtt)
-            && (!self.deps.computed_known || self.deps.computed.contains(r))
+        matches!(
+            self.class(r),
+            RelClass::Table | RelClass::Gtt | RelClass::External
+        ) && (!self.deps.marked_known || self.deps.marked.contains(r))
     }
 
     /// R41 item 6: any identifier token equal to a dependent object's name.
@@ -3571,6 +3587,8 @@ mod tests {
                 routines: ["P_MON".to_owned(), "P_OK".to_owned()]
                     .into_iter()
                     .collect(),
+                marked: ["T_COMP".to_owned()].into_iter().collect(),
+                marked_known: true,
                 complete: true,
             },
             linger: None,
@@ -3612,12 +3630,22 @@ mod tests {
         assert!(!open.always_view("RDB$RELATIONS"));
         let open = Classes {
             deps: crate::views::ViewDeps {
-                computed_known: true,
-                computed: ["T_COMP".to_owned()].into_iter().collect(),
+                marked_known: true,
+                marked: ["T_COMP".to_owned()].into_iter().collect(),
                 ..crate::views::ViewDeps::default()
             },
             ..c.clone()
         };
         assert!(!open.always_view("RDB$CUSTOMER_ARCHIVE"));
+        assert!(open.always_view("T_COMP"));
+        // An external-file table is a table too (R41 item 2).
+        let mut ext = open.clone();
+        ext.user.insert("E_X".to_owned(), RelClass::External);
+        assert!(!ext.always_view("E_X"));
+        ext.deps.marked.insert("E_X".to_owned());
+        assert!(ext.always_view("E_X"));
+        ext.deps.marked_known = false;
+        assert!(ext.always_view("RDB$CUSTOMER_ARCHIVE"));
+        assert!(!ext.always_view("RDB$RELATIONS"));
     }
 }

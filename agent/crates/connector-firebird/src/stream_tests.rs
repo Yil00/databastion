@@ -3214,3 +3214,151 @@ fn an_external_source_across_a_file_end_is_never_emitted_without_a_caller() {
     assert!(!cust.is_empty(), "{:?}", names(&out));
     assert!(cust.iter().all(|(_, ev)| ev.always_report()), "never quiet");
 }
+
+/// The schema of the cut-set regression (the Firebird 10 000-object load
+/// measurement): a table with an expression index, a check constraint, a
+/// domain check and a computed column, a plain table, a view, a procedure,
+/// a package and a table trigger. Only the expression-index table is in
+/// the complete dependent set (its dependency is not recorded).
+fn every_class_reads(cut: bool) -> crate::views::Reads {
+    let d = |dep: &str, dt: i64, on: &str, ot: i64| (dep.to_owned(), dt, on.to_owned(), ot, None);
+    let r = |name: &str, kind: i64, rel: Option<&str>, system: i64| {
+        (name.to_owned(), None, kind, rel.map(str::to_owned), system)
+    };
+    crate::views::Reads {
+        views: Some(vec![("V_X".to_owned(), "T_PLAIN".to_owned(), 0)]),
+        deps: (!cut).then(|| vec![d("RDB$5", 3, "T_PLAIN", 0), d("P_OK", 5, "T_PLAIN", 0)]),
+        fields: Some(vec![
+            ("T_COMP".to_owned(), "RDB$5".to_owned(), true),
+            ("T_DOM".to_owned(), "D_POS".to_owned(), false),
+        ]),
+        routines: Some(vec![
+            r("P_OK", 5, None, 0),
+            r("PKG", 18, None, 0),
+            r("TR_OK", 2, Some("T_PLAIN"), 0),
+            r("CHECK_1", 2, Some("T_CHK"), 3),
+            r("IX_E", 6, Some("T_IX"), 0),
+        ]),
+    }
+}
+
+fn every_class_catalog(cut: bool) -> super::audit::Classes {
+    let user = [
+        ("T_IX", RelClass::Table),
+        ("T_CHK", RelClass::Table),
+        ("T_DOM", RelClass::Table),
+        ("T_COMP", RelClass::Table),
+        ("T_PLAIN", RelClass::Table),
+        ("V_X", RelClass::View),
+    ]
+    .into_iter()
+    .map(|(n, c)| (n.to_owned(), c))
+    .collect();
+    super::audit::Classes::for_tests(user, crate::views::compute(every_class_reads(cut)))
+}
+
+/// R41 items 2 and 8 with the implementation note of 2026-10-31 (the
+/// fail-open found by the 10 000-object load measurement): a cut or
+/// invalidated dependent set makes every class the complete set can hold
+/// dependent: tables with an expression index, a check constraint, a
+/// domain check or a computed column, views, procedures, packages and
+/// triggers; a plain table stays unmarked. With the complete set, only the
+/// expression-index table is.
+#[test]
+fn a_cut_or_invalidated_set_marks_every_dependent_class() {
+    let a = "24:0x7f0000000100";
+    let reads: [(&str, &[(&str, u64)]); 8] = [
+        ("SELECT ID FROM T_IX WHERE ID > 0", &[("T_IX", 2)]),
+        ("SELECT ID FROM T_CHK WHERE ID > 0", &[("T_CHK", 2)]),
+        ("SELECT ID FROM T_DOM WHERE ID > 0", &[("T_DOM", 2)]),
+        ("SELECT ID FROM T_COMP WHERE ID > 0", &[("T_COMP", 2)]),
+        ("SELECT ID FROM V_X WHERE ID > 0", &[("T_PLAIN", 2)]),
+        ("SELECT * FROM P_OK", &[("T_PLAIN", 2)]),
+        ("SELECT * FROM PKG.P_IN", &[("T_PLAIN", 2)]),
+        ("SELECT ID FROM T_PLAIN WHERE ID > 0", &[("T_PLAIN", 2)]),
+    ];
+    let mut wrong = Vec::new();
+    for (cut, invalidated) in [(false, false), (true, false), (false, true), (true, true)] {
+        let cat = every_class_catalog(cut);
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        feed(&mut m, &cats, &attach(a, 3, APP), 0);
+        if invalidated {
+            // A DDL text that names none of the tables.
+            feed(
+                &mut m,
+                &cats,
+                &stmt(a, 3, 4, "APP", "CREATE SEQUENCE S_NEW", 0, &[]),
+                500,
+            );
+            assert!(m.views_invalid_for_tests(0));
+        }
+        for (i, (text, block)) in reads.iter().enumerate() {
+            let tra = 10 + i as u64;
+            let out = feed(
+                &mut m,
+                &cats,
+                &stmt(a, 3, tra, "APP", text, 2, block),
+                1000 + 1000 * i as u64,
+            );
+            let marked = !out.is_empty()
+                && out.iter().all(|(_, e)| e.always_report())
+                && names(&out).contains(&"*".to_owned());
+            let want = if cut || invalidated {
+                !text.contains("FROM T_PLAIN")
+            } else {
+                text.contains("T_IX")
+            };
+            if marked != want {
+                wrong.push(format!(
+                    "cut {cut} invalidated {invalidated}: {text}: {:?}",
+                    names(&out)
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A DDL text naming a domain (`ALTER DOMAIN D ADD CHECK (…)`) names no
+/// table that uses the domain: every relation counts as dependent until
+/// the next check (domain-check tables are dependent, the implementation
+/// note of 2026-10-31).
+#[test]
+fn a_domain_ddl_makes_every_relation_dependent() {
+    let a = "24:0x7f0000000100";
+    let cat = every_class_catalog(false);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let read = |tra: u64| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            "SELECT ID FROM T_PLAIN WHERE ID > 0",
+            2,
+            &[("T_PLAIN", 2)],
+        )
+    };
+    let marked = |out: &[Emitted]| !out.is_empty() && out.iter().all(|(_, e)| e.always_report());
+    assert!(!marked(&feed(&mut m, &cats, &read(4), 500)));
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            a,
+            3,
+            5,
+            "APP",
+            "ALTER DOMAIN D_NEW ADD CHECK (VALUE > 0)",
+            0,
+            &[],
+        ),
+        1000,
+    );
+    assert!(m.all_relations_for_tests(0));
+    let out = feed(&mut m, &cats, &read(6), 2000);
+    assert!(marked(&out), "{:?}", names(&out));
+}

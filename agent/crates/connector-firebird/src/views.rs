@@ -25,8 +25,10 @@
 //!   failed or cut read, a name that is not UTF-8, a computed-column row
 //!   that maps to no table, or more dependent objects than the bound make
 //!   the set incomplete: every view, routine, package and trigger, every
-//!   table with a computed column, and every unknown name then count as
-//!   dependent ([`crate::audit::Classes`]).
+//!   table with a computed column, a domain check, a check constraint or
+//!   an expression index ([`ViewDeps::marked`]; every table when those
+//!   reads failed), and every unknown name then count as dependent
+//!   ([`crate::audit::Classes`]).
 //!
 //! No view is block-blind (R28 item 3 is not implemented): a block-less
 //! view read that returned rows stays ambiguous.
@@ -58,6 +60,16 @@ pub(crate) struct ViewDeps {
     /// Every routine, package and trigger name the read gave (a name in an
     /// object position unknown to the catalog is dependent, R41 item 3).
     pub(crate) routines: HashSet<String>,
+    /// The tables that count as dependent while the set is cut or
+    /// invalidated (R41 items 2 and 8, the implementation note of
+    /// 2026-10-31): a computed column or a domain check (the field
+    /// sources), a check constraint or an expression index (the routines
+    /// read, which lists them even when the dependency read is cut).
+    pub(crate) marked: HashSet<String>,
+    /// The field sources and the routines were both read, and every
+    /// computed-column dependency row mapped to a table (`marked` is
+    /// meaningful; otherwise every table counts).
+    pub(crate) marked_known: bool,
     /// The reads were complete and within the bounds.
     pub(crate) complete: bool,
 }
@@ -130,12 +142,29 @@ pub(crate) fn compute(r: Reads) -> ViewDeps {
         out.computed = fields.iter().filter(|f| f.2).map(|f| f.0.clone()).collect();
     }
     if let Some(routines) = &r.routines {
-        for (name, package, _, _, _) in routines {
+        for (name, package, kind, relation, system) in routines {
             out.routines.insert(name.clone());
             if let Some(p) = package {
                 out.routines.insert(p.clone());
             }
+            // A check-constraint trigger (system flag set) or an expression
+            // index: its table (system relations are never marked by the
+            // class rules that use this set).
+            match (*kind, relation) {
+                (2, Some(rel)) if *system != 0 => {
+                    out.marked.insert(rel.clone());
+                }
+                (6, Some(rel)) => {
+                    out.marked.insert(rel.clone());
+                }
+                _ => {}
+            }
         }
+    }
+    if let (Some(fields), Some(_)) = (&r.fields, &r.routines) {
+        // Computed columns and domain checks: every row of the read.
+        out.marked.extend(fields.iter().map(|f| f.0.clone()));
+        out.marked_known = true;
     }
     let (Some(views), Some(deps), Some(fields), Some(routines)) =
         (r.views, r.deps, r.fields, r.routines)
@@ -158,8 +187,10 @@ pub(crate) fn compute(r: Reads) -> ViewDeps {
         .map(|f| f.1.as_str())
         .collect();
     for (dependent, dtype, on, otype, package) in &deps {
-        // A computed column that maps to no table (R41 item 2).
+        // A computed column that maps to no table (R41 item 2): its table
+        // is not known, so every table counts.
         if *dtype == 3 && !computed_sources.contains(dependent.as_str()) {
+            out.marked_known = false;
             return out;
         }
         // `RDB$PACKAGE_NAME` is the depended-on object's package (measured
@@ -403,8 +434,9 @@ pub(crate) async fn read(s: &mut Session, deadline: Instant) -> Result<ViewDeps,
     });
     if !out.complete {
         tracing::warn!(
-            "Firebird dependent-set read cut or failed: every view, routine, package, trigger and \
-             computed-column table counts as dependent until the next complete read (ADR-0060 R41 \
+            "Firebird dependent-set read cut or failed: every view, routine, package and trigger, \
+             and every table with a computed column, a domain check, a check constraint or an \
+             expression index, counts as dependent until the next complete read (ADR-0060 R41 \
              item 2)"
         );
     }
@@ -594,6 +626,53 @@ mod tests {
         assert!(!compute(reads(many, vec![])).complete);
         let deps = compute(reads(vec![v("A", "B"), v("B", "A")], vec![]));
         assert!(deps.complete && deps.dependent.is_empty());
+    }
+
+    /// R41 item 2 with the implementation note of 2026-10-31: the tables
+    /// that count as dependent while the set is cut (computed columns,
+    /// domain checks, check constraints, expression indexes) come from the
+    /// field sources and the routines read, so a cut dependency read keeps
+    /// them; a cut routines or field read, or a computed column that maps
+    /// to no table, leaves them unknown (every table counts).
+    #[test]
+    fn marked_tables_survive_a_cut_dependency_read() {
+        let full = || Reads {
+            views: Some(Vec::new()),
+            deps: None,
+            fields: Some(vec![
+                ("T_COMP".to_owned(), "RDB$5".to_owned(), true),
+                ("T_DOM".to_owned(), "D_POS".to_owned(), false),
+            ]),
+            routines: Some(vec![
+                ("CHECK_1".to_owned(), None, 2, Some("T_CHK".to_owned()), 3),
+                ("TR_OK".to_owned(), None, 2, Some("T_PLAIN".to_owned()), 0),
+                ("IX_E".to_owned(), None, 6, Some("T_IX".to_owned()), 0),
+            ]),
+        };
+        let deps = compute(full());
+        assert!(!deps.complete && deps.marked_known);
+        let mut m: Vec<&str> = deps.marked.iter().map(String::as_str).collect();
+        m.sort_unstable();
+        assert_eq!(m, ["T_CHK", "T_COMP", "T_DOM", "T_IX"]);
+        assert!(
+            !compute(Reads {
+                routines: None,
+                ..full()
+            })
+            .marked_known
+        );
+        assert!(
+            !compute(Reads {
+                fields: None,
+                ..full()
+            })
+            .marked_known
+        );
+        let deps = compute(Reads {
+            deps: Some(vec![d("RDB$999", 3, "MON$STATEMENTS", 0)]),
+            ..full()
+        });
+        assert!(!deps.complete && !deps.marked_known);
     }
 
     /// Review M2: mutually recursive procedures share what either reaches,

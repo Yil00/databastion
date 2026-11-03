@@ -1332,6 +1332,8 @@ fn catalog(views: &[&str], dependent: &[&str], external: &[&str]) -> Classes {
             computed: Default::default(),
             computed_known: true,
             routines: Default::default(),
+            marked: Default::default(),
+            marked_known: true,
             complete: true,
         },
         linger: None,

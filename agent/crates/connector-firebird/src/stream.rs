@@ -2020,11 +2020,16 @@ impl Machine {
                         // (the analysis takes no relation from a DDL text,
                         // so `ALTER TABLE T ADD C COMPUTED BY (…)` names
                         // `T` this way); past the bound, or a text that does
-                        // not lex whole, every relation.
+                        // not lex whole, every relation. A text naming a
+                        // domain (`ALTER DOMAIN D ADD CHECK (…)`) names no
+                        // table that uses it, so every relation too (the
+                        // implementation note of 2026-10-31: domain-check
+                        // tables are dependent).
                         let ids = crate::idents::idents(text);
                         let tokens = ids.names.len() + ids.packaged.len();
+                        let domain = ids.names.iter().any(|n| n == "DOMAIN");
                         let named = self.ddl_named.entry(db).or_default();
-                        if a.parses() && !ids.cut && named.len() + tokens <= 4096 {
+                        if a.parses() && !ids.cut && !domain && named.len() + tokens <= 4096 {
                             named.extend(ids.names);
                             named.extend(ids.packaged.into_iter().map(|(p, _)| p));
                         } else {
@@ -2551,9 +2556,11 @@ impl Machine {
 
 /// A database's catalog while its sets are invalidated (R28 item 4, R41
 /// item 8): every view, routine, package, trigger and unknown name, every
-/// table with a computed column at the last read, every name a DDL text of
-/// the interval named, and every relation after an unparsable or
-/// ambiguous DDL record count as dependent.
+/// table with a computed column, a domain check, a check constraint or an
+/// expression index at the last read (every table when not known), every
+/// name a DDL text of the interval named, and every relation after an
+/// unparsable or ambiguous DDL record, or a DDL text naming a domain,
+/// count as dependent.
 struct Invalidated<'a> {
     inner: &'a dyn Catalog,
     invalid: bool,
@@ -2577,7 +2584,7 @@ impl Catalog for Invalidated<'_> {
         let r = relation.trim_end_matches(' ');
         let class = self.inner.class(r);
         matches!(class, RelClass::View | RelClass::Unknown)
-            || self.inner.computed(r)
+            || self.inner.marked(r)
             || self.named.is_some_and(|n| n.contains(r))
             || (self.all && !matches!(class, RelClass::System | RelClass::Virtual))
     }
@@ -2590,8 +2597,8 @@ impl Catalog for Invalidated<'_> {
                     .is_some_and(|n| n.contains(name.trim_end_matches(' '))))
     }
 
-    fn computed(&self, relation: &str) -> bool {
-        self.inner.computed(relation)
+    fn marked(&self, relation: &str) -> bool {
+        self.inner.marked(relation)
     }
 
     fn linger(&self) -> Option<u32> {

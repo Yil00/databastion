@@ -1632,6 +1632,13 @@ async fn the_dependent_set_on_the_server() {
             deps.dependent
         );
     }
+    // The tables that count as dependent while the set is cut or
+    // invalidated (R41 items 2 and 8, the implementation note of
+    // 2026-10-31), from the field sources and the routines read.
+    assert!(deps.marked_known);
+    for name in ["T", "T_COMP", "T_CHK", "T_DOM"] {
+        assert!(deps.marked.contains(name), "{name}: {:?}", deps.marked);
+    }
     eprintln!(
         "[measure] check constraint table dependent {}, domain check table dependent {}",
         deps.dependent.contains("T_CHK"),
