@@ -733,9 +733,14 @@ views over `MON$STATEMENTS` / `MON$ATTACHMENTS` (the dependent set's roots); abo
 | `LOAD_FB_SCHEMA_SCALE` | 1 | the schema's object counts multiplied (0.1 to 4) |
 | `LOAD_FB_SCHEMA_RATE`, `LOAD_FB_SCHEMA_PHASE_S` | 10, 120 | the flood workload, per principal |
 
-**Status: local runs only, 2026-11-03** (not CI: a 4-CPU VM with cgroup v1, the stand-in
-`firebird-audit-init` image locally; 180 s soak, 60 s flood phases, 3 bursts; the CI run with the
-defaults is still to do). Every check passed but `firebird.8g_bursts_seen` (a client-side driver race
+**CI runs (2026-11-03 and 2026-11-04), every check passed:** load runs 41714461890 (4.0.7),
+41723479359 (5.0.4) and 41731951122 (4.0.7, bursts of 512), and schema-only runs 41749337262 (5.0.4)
+and 41751673735 (4.0.7) after #408. The figures are in
+[docs/08](../../docs/08-engine-capabilities.md#load-and-database-impact-measured) and the ADR-0060
+implementation note of 2026-11-04.
+
+**Earlier local runs, 2026-11-03** (not CI: a 4-CPU VM with cgroup v1, the stand-in
+`firebird-audit-init` image locally; 180 s soak, 60 s flood phases, 3 bursts). Every check passed but `firebird.8g_bursts_seen` (a client-side driver race
 lost part of some bursts; fixed since, and a second 4.0.7 run had 6 of 6 full bursts) and, on the first run, the stream's
 first open before the first check, now declared as expected:
 
@@ -760,7 +765,7 @@ are almost the whole burst (237 to **256** ids for 256 attaches, about 1 s late)
 burst reaches R7's count bound exactly (accepted: no ambiguous record) and a larger one would pass
 it; the workflow input `firebird_burst_size` probes past the bound. The always-reported share per principal
 (600 statements each per phase): expression-index tables 100 % with the complete and the
-invalidated set, **0 % with a cut set**; check-constraint tables 0 % (their check triggers depend on
+invalidated set, **0 % with a cut set** (a fail-open, fixed by #408: 100 % in the CI schema runs); check-constraint tables 0 % (their check triggers depend on
 no always-reported relation); views, procedures and computed-column tables 0 %, 100 % with a cut
 set; an invalidating `CREATE VIEW` (4.0.7) made about 80 statements per principal always reported,
 plain tables included, for 7.8 s after its commit.
