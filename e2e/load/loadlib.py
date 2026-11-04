@@ -961,8 +961,13 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
     agent["rss_mb_peak"] = _r(max(all_rss), 1) if all_rss else None
     hwm = [v / 2**20 for _, v in series(samples, "agent", "hwm")]
     agent["rss_mb_hwm"] = _r(max(hwm), 1) if hwm else None
-    ck.add("agent.rss_peak_mb", None if agent["rss_mb_peak"] is None else agent["rss_mb_peak"] <= lim.agent_rss_mb,
-           agent["rss_mb_peak"], f"<= {lim.agent_rss_mb}")
+    if agent["rss_mb_peak"] is None and cfg and cfg.get("harness") == "firebird" \
+            and "load" not in str(cfg.get("parts") or "").split(","):
+        # A schema-only Firebird run samples no agent resources (the sampler runs with the load part).
+        ck.skip("agent.rss_peak_mb", None, f"<= {lim.agent_rss_mb}", "schema-only run: no resource samples")
+    else:
+        ck.add("agent.rss_peak_mb", None if agent["rss_mb_peak"] is None else agent["rss_mb_peak"] <= lim.agent_rss_mb,
+               agent["rss_mb_peak"], f"<= {lim.agent_rss_mb}")
     if cfg and cfg.get("stats_readers"):
         # ADR-0048: with the statistics readers, the agent's CPU and memory stay those of the release
         # run (within the runners' noise).
