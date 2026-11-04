@@ -928,7 +928,7 @@ R1 rule 2's SuperServer branch (a `TRACE_INIT` that carries the current pid trig
 - **count**: its id is at most **256** below the highest id;
 - **time**: it is read within **10 s of reading time** (as R1 rule 7 counts it: stops, back-pressure, parking and downtime not counted) of the record that first raised the highest id above its id.
 
-Otherwise it is ambiguous and taints its binding, as R1 rule 5 says. The bounds are the same for every version and mode: the measured worst case (30 ids, about 1 s) is well inside them, and one rule is easier to test than a table. The P10-D load run checks them (measurement 8g: bursts of 256 concurrent attaches that open the database on 4.0.7 and 5.0.4). If 8g exceeds them, the bounds are raised in an implementation note before the Audit lot ships, never removed.
+Otherwise it is ambiguous and taints its binding, as R1 rule 5 says. The bounds are the same for every version and mode: the measured worst case (30 ids, about 1 s) is well inside them, and one rule is easier to test than a table. The P10-D load run checks them (measurement 8g: bursts of 256 concurrent attaches that open the database on 4.0.7 and 5.0.4). If 8g exceeds them, the bounds are raised in an implementation note before the Audit lot ships, never removed. *Measured by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)): within the bounds, the largest inversion exactly 256 ids on 4.0.7; the bounds are unchanged.*
 
 R1 rule 5's other parts stay: the highest id is raised only by ids at or below the agent's latest own `CURRENT_CONNECTION` plus the margin (4 096), and an id above that bound is ambiguous.
 
@@ -1054,7 +1054,7 @@ Each measured before the pull request that relies on it; 3c, 3d, 3e, 7c and 8h b
 - **3d** (R8): the trailer shape and the `records fetched` bound of every text of `sql::STATEMENTS` per version and mode, `MON$SEC_DATABASE` included, with the metadata-loading set; recorded as the connector's closed table with a matrix test.
 - **3e** (R8 item 2): per version, whether procedure, function and trigger finish records of routines that read no table are block-less, and how they are folded.
 - **7c** (R8 item 3): per version, the outer per-table block and the trace records written when a PSQL function or procedure runs `EXECUTE STATEMENT` (local, and `ON EXTERNAL`), and when a UDR reads a table, if measurable.
-- **8g** (R7): in the P10-D load run, bursts of 256 concurrent attaches that open the database, on 4.0.7 and 5.0.4 SuperServer: the largest inversion and the latest late record stay within 256 ids and 10 s.
+- **8g** (R7): in the P10-D load run, bursts of 256 concurrent attaches that open the database, on 4.0.7 and 5.0.4 SuperServer: the largest inversion and the latest late record stay within 256 ids and 10 s. *Done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 - **8h** (R5, R6): the exact lines of `TRACE_INIT` / `TRACE_FINI` session records and of the Garbage Collector records per version, for the closed shapes; whether the Cache Writer ever writes a record; whether the Garbage Collector's `TRACE_INIT` always comes before the records of the opening attachments, also in a burst (R6 item 2, structural binding); whether an automatic sweep (`sweep interval`) runs in an internal attachment and with what shape.
 - Still open from earlier: `PLG$USERS` in a security database built with the legacy schema (R9 excludes such a database whatever the result), Classic under socket activation, the `sysdba_mapped` account on the matrix (obligation 15).
 
@@ -1405,7 +1405,7 @@ Each is measured before the pull request that relies on it; 3f, 3g, 3h and 7d be
 - **3g** (R14, R15): the trailer of BLR request finish records (`log_blr_requests`, `gbak`); DDL trigger records; the place of database-trigger records relative to their attachment's `ATTACH_DATABASE` and `DETACH_DATABASE` records; database triggers whose bodies read a table; the per-row case of R14 item 4 (`INSERT … SELECT` with a `BEFORE INSERT` id trigger, `SELECT F(x) FROM big`) on 4.0.7 and 5.0.4.
 - **3h** (R12, security review M1): whether a read of a view over a virtual relation, of an external-file table and of a global temporary table writes a block, on both versions.
 - **7d** (R18): the complete record sequence of a local external data source's `<internal>` attachment.
-- **8g** (R7, unchanged) in the P10-D load run, and with it **8i** (R16): the Garbage Collector's `COMMIT_TRANSACTION` and `TRACE_FINI` relative to an open's last `DETACH_DATABASE`, with and without a linger, and how often the lowest-id condition rejects a real Garbage Collector in out-of-order bursts (N6).
+- **8g** (R7, unchanged) in the P10-D load run, and with it **8i** (R16): the Garbage Collector's `COMMIT_TRANSACTION` and `TRACE_FINI` relative to an open's last `DETACH_DATABASE`, with and without a linger, and how often the lowest-id condition rejects a real Garbage Collector in out-of-order bursts (N6). *8g done by #409; 8i not driven by the load run ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 - Still open from earlier: `PLG$USERS` in a security database built with the legacy schema, Classic under socket activation, the `sysdba_mapped` account on the matrix (obligation 15).
 
 ### Protocol (P10-C)
@@ -1571,7 +1571,7 @@ R14 item 4 counts only block-less pending records, so block-ful ones would be he
    - **A state checkpoint at that position.** With the position, the agent persists a **checkpoint of the parser state as it was at that position**: bindings, run identity, watermarks, credits, follow-ups, poisoning and taint, open windows, and the pending groups that existed there (block-ful-only groups included). Held external-source events are **not** in it (third-pass N6): their records lie after the checkpoint position, so the re-read regenerates them. **Inputs that do not come from the log** (third-pass L10) are persisted with the checkpoint, each with the log position at which it was taken ("Log positions", refinement of 2026-10-26): the execution credits issued up to the time of persisting (the re-read consumes them again), their follow-ups, the process start-time and `databases.conf` samples (R5, R11 12c), and the results of `check()` (the run confirmation, confirmed restores, the external-file, block-blind and view-dependency sets of R12 and R28, the linger of R30). The re-read applies each of them where it falls in the log, as the first reading did. A restart restores the checkpoint and re-reads from the position, so every state change of the re-read records (a binding created or ended, a credit or follow-up consumed, a binding poisoned) is applied again from the same starting state, and none is applied twice. Without a held-back position, the checkpoint is taken at the read position, as R1 rule 11's persisted state is today.
    - **Deduplication by position** then concerns only the events already sent: the persisted state keeps the positions (file identity and offset) of the records past the held-back position whose events were emitted, and a re-read record at such a position emits nothing again. Its state changes are still applied (from the checkpoint). Past the bound of item 9, re-emitted events are sent again, an accepted over-reporting (duplicates, never losses), counted in the local detail.
    - **Durability order** (third-pass L11). A deduplication position is recorded only after every event of its record is durably in the spool, and it is recorded **atomically per record position**: either all the events of that record are marked sent, or none is. Shedding (item 9) acts on the live state and sends its outputs (the ended group's event, the ambiguous records of a shed binding); a checkpoint that no longer holds the shed group or binding is persisted only after those outputs are durably spooled. So a crash at any point re-reads into a state that either still holds what was shed or has its outputs already sent.
-8. **The bounds are checked** in the P10-D load run with per-row statements under concurrent sessions and many open transactions (measurement 3m); if they are exceeded, they are raised in an implementation note before the Audit lot ships, never removed.
+8. **The bounds are checked** in the P10-D load run with per-row statements under concurrent sessions and many open transactions (measurement 3m); if they are exceeded, they are raised in an implementation note before the Audit lot ships, never removed. *Done by #409, no bound raised ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 9. **R1 rule 11's persisted list and cap, extended** (security review L8). The persisted state of R1 rule 11 gains the checkpoint of item 7 (with its pending groups and held external-source events) and the deduplication positions, under **one combined cap**: R1 rule 11's 16 MiB global cap covers all of it. When the cap would be passed, the agent fails closed in this order: the oldest pending groups end as item 3 says, external-source bindings with held events are shed (their records become ambiguous, R29 item 2, so the held-back position can move past their `ATTACH_DATABASE`), then deduplication positions are dropped (re-emitted events become accepted over-reporting). Held events themselves are not persisted (item 7, N6): they count toward R29's in-memory bounds, not this cap. If the state still exceeds the cap after these three steps, R1 rule 11's rule applies (a new binding is not kept, and its records are ambiguous), and a checkpoint is **never written truncated** (third-pass L11): the last complete checkpoint stays until a complete one fits. The first version of this refinement said that R1 rule 11 "already persists" the group state; it did not, and this item replaces that claim.
 **Alternatives considered.** (a) Rely on the statement's block, which holds the sum: a forged statement finish could then drop the nested relations (N-1). (b) Per-binding queues instead of a global hold: the window that a non-folded block-less record opens applies to every binding's records after its position, so they must be held anyway. (c) A time bound alone: unbounded memory under a burst. (d) Keep raw records: 203 records already took 139 KiB; parameters would stay in memory longer. (e) A per-group budget only (the first version): many small groups could still exhaust memory (M1).
 
@@ -1698,7 +1698,7 @@ Each is measured before the pull request that relies on it; 3i, 3j and 3k before
   - the attachment line of `service_mgr`'s database attachments during a services backup (R29).
 - **3k** (R24): that user DML on system tables is refused on both versions (a matrix test); `ALTER SESSION RESET` on a database with connect and disconnect triggers; whether an API commit's `COMMIT_TRANSACTION` carries a commit trigger's block.
 - **3l** (R30): `RDB$DATABASE.RDB$LINGER` readable by the minimal account, and the expected-end rule on the 8i scenarios.
-- **3m** (R25), in the P10-D load run with **8g** (R7, unchanged): per-row statements under concurrent sessions within the hold bounds (65 536 records, 16 MiB, 10 s), many open transactions with pending groups within the group budget (4 096 groups, 16 MiB, 16 transactions per binding), the 10 s end of block-ful-only groups, a restart during a pending group and **a restart while an external-source binding's events are held** (the checkpoint, the held-back position and deduplication, R25 item 7, R29 item 2), and long caller transactions with a local external data source (R29's 10-minute hold).
+- **3m** (R25), in the P10-D load run with **8g** (R7, unchanged): per-row statements under concurrent sessions within the hold bounds (65 536 records, 16 MiB, 10 s), many open transactions with pending groups within the group budget (4 096 groups, 16 MiB, 16 transactions per binding), the 10 s end of block-ful-only groups, a restart during a pending group and **a restart while an external-source binding's events are held** (the checkpoint, the held-back position and deduplication, R25 item 7, R29 item 2), and long caller transactions with a local external data source (R29's 10-minute hold). *Done by #409 for its R25 part; the R29 cases are not driven by the load run ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 - Still open from earlier: `PLG$USERS` in a security database built with the legacy schema, Classic under socket activation, the `sysdba_mapped` account on the matrix (obligation 15).
 
 ### Protocol (P10-C)
@@ -1882,7 +1882,7 @@ Each is measured before the pull request that relies on it:
   - the transaction lines of reset-fired database-trigger records (R34 item 2);
   - here or in the connector lot: a server-side socket in `/proc/net/tcp` for a `service_mgr` backup's loopback attachment (N7).
 - **3i remainder** (R22 item 3), in the connector lot: the stale-cancel race, forced; the own-statement table rows of the cancelled and synchronization-error paths.
-- **3l** and **3m** with **8g** (unchanged, refinement of 2026-10-26 c), and obligation 15's open items.
+- **3l** and **3m** with **8g** (unchanged, refinement of 2026-10-26 c), and obligation 15's open items. *3m and 8g done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 
 ### Protocol (P10-C)
 
@@ -2021,7 +2021,7 @@ Each simplification fails closed (over-reporting, an ambiguous record or a lower
 - **Before the Audit lot merges**: R39 (a)'s re-read condition and its tests, (e)'s condition (the refused-read measurement or the permission-code event), (f), (g), (h), (i) and (k); R40 item 2's offset conditions and item 6's layout check.
 - **Before docs/08 and the user guide state a Firebird Audit level, and as a release gate**: (j), the `e2e-firebird` job (P10-D), listed in RELEASE.md.
 - **Follow-up lot** (R39): the parser checkpoint, R1 rule 2's stop, R29 with R1 rule 9, the R22 / R35 follow-ups.
-- Unchanged: **3n** (R32 to R34), **3l** and **3m** with **8g**, and obligation 15's open items.
+- Unchanged: **3n** (R32 to R34), **3l** and **3m** with **8g**, and obligation 15's open items. *3m and 8g done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 
 ### Protocol (P10-C)
 
@@ -2095,7 +2095,7 @@ In both cases the read is reported as `P` or `T`, with no `*` and no always-repo
    - expression indexes (type 6) are left out. An index expression's value is stored in the index and never returned to a reader, and Firebird is expected to refuse a subquery in it. The tests of item 9 check that refusal; if an expression index can depend on an always-reported relation, its table joins the set.
 2. **Bounds, fail closed.** The read and the computation are bounded: at most 65 536 dependency rows and 16 384 dependent objects per database, with the read under the statement timeout. R12 item 5's depth bound (16) is **replaced** for views and mixed chains alike (review N2): the computation over components needs no depth bound, so only the row and object bounds can cut it. A cut or failed read, or a computed-column row that maps to no table, makes **every** view, procedure, function, package and trigger of the database, and every table with a computed column, count as dependent until the next complete read. The agent logs the cut. The reads are new constant catalog texts of `sql::STATEMENTS`, with their R20 rows and their R13 and R23 sets (R39 (g)).
 
-   **Flood risk** (review N2). A cut or invalidated set turns the reads of every routine and computed-column table into always-reported events, which match "every read" policies. The console's per-target hourly cap and per-hour dedup (ADR-0021) bound the incidents, not the events. A note code that names the cut is left to a later refinement (open question 4). The tests of item 9 measure the read time and the bounds on a schema of at least 10 000 objects.
+   **Flood risk** (review N2). A cut or invalidated set turns the reads of every routine and computed-column table into always-reported events, which match "every read" policies. The console's per-target hourly cap and per-hour dedup (ADR-0021) bound the incidents, not the events. A note code that names the cut is left to a later refinement (open question 4). The tests of item 9 measure the read time and the bounds on a schema of at least 10 000 objects. *Measured by #409, with the fixes of #408 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 3. **Names unknown to the catalog read** (review M2). At all times, a name in a text or in a routine name line that the last complete catalog read does not know counts as dependent (over-reporting only). This covers an object created since that read, whatever path created it. It adds the mark to R39 (k)'s rule that such a name is an object.
 4. **What a record naming a dependent object becomes.** A record that names an object of the dependent set gets `*` and the always-reported mark, in every shape:
    - R12's no-record shape, a block-ful record, a folded routine record, and an event of its own under R4;
@@ -2137,7 +2137,7 @@ In both cases the read is reported as `P` or `T`, with no `*` and no always-repo
    - identifiers in `MERGE … USING`, a subquery, a common table expression, `LATERAL`, `INSERT … SELECT`, `PKG . P` and `PKG/**/.P`, and the printed character set of a `NONE` and a `WIN1252` attachment (review L1);
    - a dependent routine record inside a per-row group that ends early (review L5);
    - a failed call of a dependent procedure (review N4);
-   - a cut dependency read, and the read time on a schema of at least 10 000 objects (review N2).
+   - a cut dependency read, and the read time on a schema of at least 10 000 objects (review N2). *Done by #408 and #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 
 **Forging.**
 - A forged record that names a dependent object only adds a mark (over-reporting). A forged database-trigger record that names one gives an always-reported event, more reporting.
@@ -2272,7 +2272,7 @@ The items required before the merge by the refinements of 2026-10-30 and 2026-10
 **Accepted residuals** (maintainer, 2026-10-30 and 2026-10-31).
 
 - **R41 item 9 trace cases covered by unit tests only**: block-less `ON CONNECT` and `ON TRANSACTION START` triggers, a failed call of a dependent routine, an early-ended group, and the `NONE` and `WIN1252` attachment character sets. A non-UTF-8 DDL text cannot be sent through `isql`.
-- **The 10 000-object schema measurement** (R41 item 2) is not run. It is a release gate ([RELEASE.md](../../RELEASE.md#open-release-gates)).
+- **The 10 000-object schema measurement** (R41 item 2) is not run. It is a release gate ([RELEASE.md](../../RELEASE.md#open-release-gates)). *Done by #409, with the fixes of #408 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 - **Check-constraint and domain-check tracing** is not measured (deviation 2 covers it).
 - **R-1**: a DDL transaction of an attachment whose database name the agent cannot resolve (for example an unmapped alias), committed after a `check()`, leaves other clients' reads of the changed object without the always-reported mark until the next periodic `check()`. Every record of that attachment, the DDL included, is an always-reported `*` event and caps the level.
 - **R-2**: a forged record that resolves to a declared database with an unknown attachment keeps that one database's sets invalidated for the server run (over-reporting).
@@ -2287,8 +2287,8 @@ The items required before the merge by the refinements of 2026-10-30 and 2026-10
 - Optionally, for R-2, the live-binding wait instead of the run-long hold, and bounding R-4 to the attributed database.
 - Recycling undeclared database identities that have no live binding.
 - The follow-up lot of R39: the parser checkpoint, R1 rule 2's stop, R29 with R1 rule 9, the R22 / R35 follow-ups.
-- Measurements 3n, 3o, and 3l and 3m with 8g (P10-D load run).
-- Before docs/08 and the user guide state a Firebird Audit level: the `e2e-firebird` run (R39 (j)) and the 10 000-object measurement, both release gates.
+- Measurements 3n, 3o, and 3l and 3m with 8g (P10-D load run). *3m and 8g done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
+- Before docs/08 and the user guide state a Firebird Audit level: the `e2e-firebird` run (R39 (j)) and the 10 000-object measurement, both release gates. *The 10 000-object measurement is done (#409); the `e2e-firebird` run on the release head stays open.*
 
 ## Refinement (2026-10-31, accepted by the maintainer on 2026-10-31): host identity files for an agent in a container
 
@@ -2725,7 +2725,7 @@ Before #392, a rotation whose new file could not be opened lost the records alre
 - **Fix**: the parser checkpoint with persisted credits and header tokens (follow-up lot of R39). Its test: a restart in the middle of a record neither reports the agent's own reads nor makes a record ambiguous.
 - Until then, docs/08 and the user guide state that an agent restart can withhold Partial for up to 24 h and report the agent's own reads, and that "every read" policies should exclude the agent's account; the release notes must state it before they state a Firebird Audit level ([RELEASE.md](../../RELEASE.md#open-release-gates)).
 
-**Release gates.** The `e2e-firebird` gate of R39 (j) is met only by a green run on the release head; the run above was on the #394 branch. The 10 000-object schema measurement stays a separate gate.
+**Release gates.** The `e2e-firebird` gate of R39 (j) is met only by a green run on the release head; the run above was on the #394 branch. The 10 000-object schema measurement stays a separate gate. *Met by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 
 **Follow-ups.**
 
@@ -2824,7 +2824,7 @@ Together they stay within R25 item 9's single 16 MiB cap. Each file is an envelo
 
 - The rest of the R39 follow-up lot: R1 rule 2's stop, R29 with R1 rule 9, the R22 / R35 follow-ups.
 - R1 rule 5's restore state in the digest (R60); a computed server start later than now rejected (R60). *Done by #400 ([implementation note of 2026-11-01 b](#implementation-note-2026-11-01-b-the-r60-follow-ups-400)).*
-- The checkpoint and ledger I/O measured in the P10-D load run.
+- The checkpoint and ledger I/O measured in the P10-D load run. *Done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 
 ## Refinement (2026-11-01 b, decided by the maintainer on 2026-11-01): a restore confirmed from the agent's ledger
 
@@ -2895,7 +2895,7 @@ The restored database's attachments are then no longer out of order or duplicate
 **Follow-ups.**
 
 - The rest of the R39 follow-up lot: R1 rule 2's stop, R29 with R1 rule 9, the R22 / R35 follow-ups.
-- The checkpoint and ledger I/O measured in the P10-D load run.
+- The checkpoint and ledger I/O measured in the P10-D load run. *Done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
 
 ## Refinement (2026-11-01 c, decided by the maintainer on 2026-11-01): local external data sources across transactions
 
@@ -2987,4 +2987,63 @@ Recorded after the merge of #402 (squash-merged into `dev` as `b48c7be` on 2026-
 
 - A refinement for pooled external connections (R62).
 - The N7 split-poll case of services backups.
-- The checkpoint and ledger I/O measured in the P10-D load run.
+- The checkpoint and ledger I/O measured in the P10-D load run. *Done by #409 ([implementation note of 2026-11-04](#implementation-note-2026-11-04-the-dependent-set-fixes-408-and-the-firebird-load-run-409)).*
+
+## Implementation note (2026-11-04): the dependent-set fixes (#408) and the Firebird load run (#409)
+
+Recorded after the merges of #408 (squash-merged into `dev` as `7175b46` on 2026-11-04: Firebird expression-index, check and domain-check tables kept dependent when the set is cut or invalidated, and the statement analyzer's relation lists) and #409 (`2be179e`: the CI job `load-firebird`, measurements 8g and 3m, the checkpoint and ledger I/O and the 10 000-object schema); not released yet, as lot 3. The accepted text, its refinements and its implementation notes are unchanged; where this note differs from them, this note applies. **No protocol change, no new grant, no rule change.** ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B and P10-D.
+
+**What #408 fixes** (found by the 10 000-object measurement of #409; final security review: ready, no finding). With a cut or invalidated dependent set (R41 items 2 and 8), reads of a table with an expression index lost their `*` and always-reported mark (0 % against 100 % with a complete set), and so did reads of tables with a check constraint or a domain check. R41 item 2 makes every table with a computed column dependent while the set is incomplete; the [implementation note of 2026-10-31](#implementation-note-2026-10-31-lot-3) made tables with expression indexes, check constraints and domain checks dependent too (deviation 2 and the expression-index fact), but the incomplete paths did not include them: a fail-open.
+
+- **R41 items 2 and 8: the tables that count as dependent while the set is incomplete.** `ViewDeps` gains `marked` (the tables with a computed column, a domain check, a check constraint or an expression index) and `marked_known`. They come from the field-source read and the routines read, which list these tables even when the dependency read is cut. When either read failed, or a computed-column row maps to no table, `marked_known` is false and every table counts. External-file tables count as tables for this rule.
+- **R41 item 8: a DDL text naming a domain.** A DDL text with the `DOMAIN` token (`ALTER DOMAIN … ADD CHECK`) makes every relation of its database dependent until the next check after its transaction ends: it names no table that uses the domain.
+- **R58: the check digest** gains `marked` and `marked_known`, so a change of these sets while the agent was stopped invalidates the re-read.
+- **R41 item 6 on the incomplete paths** (security re-review M1). On the cut and invalidated paths, `dependent_token` matches, at any identifier token, a view, a routine, a package or a trigger name and a marked table, as the object positions do; after a DDL text that does not parse, every known relation. `Catalog::known_routine()` is added for this.
+- **R41 item 1 on 5.0: partial indexes** (security re-review L1). Measured on 5.0.4: a partial index whose condition (`RDB$CONDITION_BLR`) reads `MON$STATEMENTS` is accepted, and its dependency is recorded only under a dependent type the dependency read does not follow. On 5.0 the routines read is a separate constant text, `sql::ROUTINES_5`, which lists partial indexes with the expression indexes, so their tables count as dependent (complete set included). The text is chosen by the server's major version; 4.0 keeps `sql::ROUTINES`, since it refuses the column. If the 5.0 text runs on a 4.0 server and fails, the set is incomplete and every class counts as dependent (fail closed).
+- **Decision 4: one transaction, not one snapshot** (security re-review L2). The four dependent-set reads are separate statements of one read-committed transaction. A DDL committed between two of them can show in one read only; R41 item 8 covers it (the stream sees the DDL record, and the sets stay invalidated until a check whose catalog read started after the DDL transaction ended), and a name created since a read is unknown to it (R41 item 3).
+- **Decision 6, "Always-reported relations", and R28: the Firebird statement analyzer** (`classifiers::query::firebird`, security re-review H1). A read of a virtual relation writes no per-table block (R28), so the text is the only place where `SELECT * FROM (MON$STATEMENTS S JOIN T T ON 1=1)` names `MON$STATEMENTS`; before #408 the analysis stopped at the `(` and named `T` only. The analyzer now:
+  - reads parenthesized joins after `FROM`, `JOIN` or `,`, nested forms included, and continues a `FROM` list after a parenthesized part (`FROM (A JOIN B ON …), C`);
+  - tracks `CASE … END` per parenthesis depth, and does not end the list at `NEXT VALUE FOR`;
+  - reads MERGE's parenthesized source (`USING (A JOIN B ON …) S`);
+  - ends a `FROM` list only on clause forms; the unreserved words `RETURNING`, `WINDOW`, `OFFSET` and `OPTIMIZE` end it only when the clause form fits;
+  - sets `relations_unread` on any other parenthesized construct in a relation list and on any doubtful form, which gives `*` and always reported (fail closed).
+- **Safety nets in `dependent_hit`.** An identifier token naming a relation of the statement-text or credential-bearing lists, or an external-file table (whose reads write no per-table block, R28), marks the record whatever its position.
+
+**The `load-firebird` job** (#409; method and checks in [e2e/load/README.md](../../e2e/load/README.md#firebird-target)): the console, the agent in the `e2e-firebird` layout (in its container, `host_identity`, the named-user ACLs, `max_log_size = 0`) and one Firebird server limited to 2 CPUs, part `load` (Discovery, Audit under load, the checkpoint and ledger I/O, 8g, 3m) and part `schema` (the 10 000-object schema). Not a required check; 120 min budget. CI runs, every check passed, nothing lost, no batch dropped, no panic:
+
+| Run | Version, parts | Discovery impact (2-CPU server) | Audit: issued / in the log / events stored | Drain | Added p95 | Events of the agent's account | Agent CPU, peak RSS | 8g: largest inversion, latest late record |
+|---|---|---|---|---|---|---|---|---|
+| 41714461890 | 4.0.7, `load,schema` | 0.555 % | 180 000 / 180 000 / 180 000 (300/s for 600 s) | 67.2 s | −0.567 ms | 0 | about 0.0098 core, 70.9 MiB | 256 ids in 4 of 5 bursts of 256 (the whole burst, latest late record 0.99 s); 11 ids in the other |
+| 41723479359 | 5.0.4, `load,schema` | 0.527 % | 180 000 / 180 000 / 180 000 | 65.9 s | +0.027 ms | 0 | about 0.0075 core, 73 MiB | at most 17 ids, 0.054 s |
+| 41731951122 | 4.0.7, `load`, bursts of 512 | 0.567 % | 180 000 / 180 000 / 180 000 | 67.1 s | +0.118 ms | 0 | about 0.0092 core, 74 MiB | at most 145 ids, 0.985 s |
+
+The schema parts of the first two runs predate #408; the schema figures below are from the schema-only runs after #408, 41749337262 (5.0.4) and 41751673735 (4.0.7).
+
+**8g (R7): held, at its edge on 4.0.7.** On 4.0.7 the largest inversion reached exactly 256 ids, the whole burst, about 1 s late: within the count bound of R7, so the attaches were accepted in order and the agent's ambiguous-record count did not move. On 5.0.4 the inversion stayed at 17 ids. With bursts of 512 on 4.0.7 the inversion stayed at 145 ids, so the delay looks bounded by about 1 s of attaches rather than by the burst size. R7's "if 8g exceeds them, the bounds are raised" does not apply: **R7 is unchanged**. An attach past either bound is ambiguous and loud (always reported, `audit.log_records_ambiguous`), never silent. The maintainer may still decide to raise the count bound, given the 4.0.7 edge.
+
+**3m (R25).** The per-row statements (10 000 and 50 000 rows, an `INSERT` of 200 000) under the concurrent workload, and the open-transaction cases (cursors over a per-row function in many transactions, held and partly fetched), ran on both versions: within the hold and group bounds, every statement was in its principal's events with no ambiguous record. The cases past an R25 bound (more than 16 transactions per binding, block-ful-only groups past 10 s, more than 4 096 groups) and the graceful agent restart during pending groups are reported fail closed, as R25 allows; their ambiguous counts are reported by the job, not judged. At that restart the checkpoint was restored (1 restore, 0 refused). Not driven by the load run: R29's cases (a restart while an external-source binding's events are held, long caller transactions with a local external data source), which keep the residual of the [implementation note of 2026-11-01 c](#implementation-note-2026-11-01-c-the-r39-follow-up-lot-parts-b-to-e-402) (a hold restored empty), and 8i, only met when a burst closes the database.
+
+**Checkpoint and ledger I/O (R58 to R60, [implementation note of 2026-11-01](#implementation-note-2026-11-01-the-parser-checkpoint-397)).** Over about 1 950 s from Audit on to the end of part `load`: the checkpoint written about 64 times (about 0.033 writes/s, against the bound of one per second), 8.1 to 8.6 MB in total, peak file about 620 to 660 KB (cap 14 MiB); the ledger written about 128 times, about 15.4 MB in total, peak about 160 KB (cap 2 MiB).
+
+**The 10 000-object measurement (R41 items 2 and 9): the read-cost condition is met.** Schema: 2 000 tables, 1 505 views, 3 320 procedures, 400 functions, 100 packages, 2 000 triggers, 2 400 check triggers, 605 computed columns, 1 200 check constraints and 300 expression indexes, 11 430 objects and 33 525 dependency rows (65 601 rows read for the cut phase, past the 65 536-row bound). The dependent-set read per check, maximum (p50), against `check()`'s 3 s statement timeout per read and its 9 s budget:
+
+| | Complete set | Cut set |
+|---|---|---|
+| 5.0.4 | 101 ms (96) | 139 ms (131) |
+| 4.0.7 | 162 ms (155) | 243 ms (239) |
+
+The always-reported share of the reads, per category of table or object read (the flood of R41 item 2, measured, not judged):
+
+- **complete set**: 0 for every category except tables with an expression index, at 1 (they are dependent);
+- **cut set**: tables with a computed column, a check constraint or an expression index, views and procedures at 1; plain tables at 0;
+- **invalidated set** (a `CREATE VIEW`): `*` from about 0.1 s before the DDL to between 1.7 s (4.0.7) and 4.1 s (5.0.4) after it, 54 and 127 statements, shares of 0.015 to 0.036; tables with an expression index at 1.
+
+The flood is bounded by the console's per-target hourly cap and per-hour dedup (ADR-0021), not per event, as R41 item 2 says; this note adds no note code: whether the measured flood warrants one is left to the maintainer (open question 4 of the refinement of 2026-10-30 b).
+
+**Measurements done**: 8g, 3m (its R25 part), the checkpoint and ledger I/O, and the 10 000-object schema measurement. The [RELEASE.md](../../RELEASE.md#open-release-gates) gate "the 10 000-object schema measurement" is met; the `e2e-firebird` gate on the release head stays open.
+
+**Follow-ups.**
+
+- The `e2e-firebird` run on the release head (release gate).
+- The maintainer may decide to raise R7's count bound (above).
+- A refinement for pooled external connections (R62) and the N7 split-poll case of services backups, unchanged.
