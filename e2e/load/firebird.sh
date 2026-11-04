@@ -801,6 +801,11 @@ if part schema; then
   catalog_phase cut
   flood_phase cut
   phase_done schema-cut
+  # Without the load part, the drain phase did not run: wait for the spool here, after the floods.
+  if ! part load; then
+    if wait_spool_empty "$(now_s)"; then fact '{kind: "spool_drained", ok: true, batches: 0}'
+    else fact '{kind: "spool_drained", ok: false}'; fi
+  fi
 fi
 
 # ------------------------------------------------------------------------------ report
