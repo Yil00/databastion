@@ -12,8 +12,9 @@ use crate::ipc::{MAX_NAME, RowidAlias, SampleRange};
 /// column is never read).
 pub const CATALOG: &str =
     "SELECT type, name, rootpage FROM main.sqlite_schema WHERE type IN ('table', 'view')";
-/// `sqlite_stat1` row counts (the table's own row, not an index's).
-pub const STATS: &str = "SELECT tbl, stat FROM main.sqlite_stat1 WHERE idx IS NULL OR idx = tbl";
+/// `sqlite_stat1` rows: the table's own row and its indexes' rows, folded
+/// into one count per table by the reader (`db::StatsFold`).
+pub const STATS: &str = "SELECT tbl, idx, stat FROM main.sqlite_stat1";
 /// The check pragmas, without an argument.
 pub const PRAGMA_JOURNAL_MODE: &str = "PRAGMA main.journal_mode";
 /// See [`PRAGMA_JOURNAL_MODE`].

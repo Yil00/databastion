@@ -482,7 +482,8 @@ impl Db {
         out
     }
 
-    /// `sqlite_stat1` row counts, the first integer of `stat`.
+    /// `sqlite_stat1` row counts, the first integer of `stat`, one per
+    /// table (see [`StatsFold`]).
     ///
     /// # Errors
     /// The mapped failure.
@@ -491,31 +492,29 @@ impl Db {
         let out = (|| {
             let mut stmt = self.conn.prepare(sql::STATS).map_err(map_error)?;
             let mut rows = stmt.query([]).map_err(map_error)?;
-            let mut out = Vec::new();
-            let mut bytes = 0usize;
+            let mut fold = StatsFold::default();
+            let mut read = 0usize;
             while let Some(row) = rows.next().map_err(map_error)? {
-                let (ValueRef::Text(tbl), ValueRef::Text(stat)) = (
-                    row.get_ref(0).map_err(map_error)?,
-                    row.get_ref(1).map_err(map_error)?,
-                ) else {
-                    continue;
-                };
-                let Some(n) = first_integer(stat) else {
-                    continue;
-                };
-                if tbl.len() > MAX_NAME {
-                    continue;
-                }
-                bytes += 12 + tbl.len();
-                if out.len() >= MAX_STATS || bytes > SAMPLE_RESPONSE_BUDGET {
+                read += 1;
+                if read > MAX_STAT_ROWS_READ {
                     break;
                 }
-                out.push(crate::ipc::StatRow {
-                    name: Zeroizing::new(tbl.to_vec()),
-                    rows: n,
-                });
+                let ValueRef::Text(tbl) = row.get_ref(0).map_err(map_error)? else {
+                    continue;
+                };
+                let idx = match row.get_ref(1).map_err(map_error)? {
+                    ValueRef::Null => None,
+                    ValueRef::Text(i) => Some(i),
+                    _ => continue,
+                };
+                let ValueRef::Text(stat) = row.get_ref(2).map_err(map_error)? else {
+                    continue;
+                };
+                if !fold.add(tbl, idx, stat) {
+                    break;
+                }
             }
-            Ok(out)
+            Ok(fold.finish())
         })();
         self.disarm();
         out
@@ -698,6 +697,85 @@ fn cut(t: &[u8]) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(t.get(..end).unwrap_or_default().to_vec())
 }
 
+/// Most `sqlite_stat1` rows the statistics statement reads (one per index
+/// and per table without a full index, so several per table).
+const MAX_STAT_ROWS_READ: usize = 10 * MAX_STATS;
+
+/// Folds `sqlite_stat1` rows into one row count per table.
+///
+/// `ANALYZE` writes, per table, one row per index (`idx` the index name,
+/// the first integer of `stat` its entries) and, only when the table has
+/// no index without a `WHERE` clause, one row with a NULL `idx` (the
+/// table's rows). A `WITHOUT ROWID` table's primary key row has `idx`
+/// equal to `tbl`. So the table's own row (NULL `idx`, or `idx = tbl`)
+/// is its count when present; otherwise the table has a full index,
+/// whose entries are the table's rows, and a partial index has fewer:
+/// the largest index count is the table's. A table with no row (never
+/// analyzed, or empty when analyzed) gets no estimate.
+#[derive(Default)]
+pub(crate) struct StatsFold {
+    out: Vec<crate::ipc::StatRow>,
+    /// Per table in `out`: whether its count is its own row's.
+    own: Vec<bool>,
+    /// Indexes into `out` by a hash of the name (the names stay in `out`
+    /// only, zeroized there).
+    at: std::collections::HashMap<u64, Vec<usize>>,
+    hasher: std::collections::hash_map::RandomState,
+    bytes: usize,
+}
+
+impl StatsFold {
+    /// Adds one row; `false` once the response bounds are reached.
+    pub(crate) fn add(&mut self, tbl: &[u8], idx: Option<&[u8]>, stat: &[u8]) -> bool {
+        let Some(n) = first_integer(stat) else {
+            return true;
+        };
+        if tbl.is_empty() || tbl.len() > MAX_NAME {
+            return true;
+        }
+        let own = idx.is_none_or(|i| i == tbl);
+        let key = {
+            use std::hash::{BuildHasher, Hasher};
+            let mut h = self.hasher.build_hasher();
+            h.write(tbl);
+            h.finish()
+        };
+        let found = self.at.get(&key).and_then(|c| {
+            c.iter()
+                .copied()
+                .find(|&i| self.out.get(i).is_some_and(|r| r.name.as_slice() == tbl))
+        });
+        if let Some(i) = found {
+            let (Some(row), Some(was_own)) = (self.out.get_mut(i), self.own.get_mut(i)) else {
+                return true;
+            };
+            if own && !*was_own {
+                row.rows = n;
+                *was_own = true;
+            } else if own == *was_own {
+                row.rows = row.rows.max(n);
+            }
+            return true;
+        }
+        self.bytes += 12 + tbl.len();
+        if self.out.len() >= MAX_STATS || self.bytes > SAMPLE_RESPONSE_BUDGET {
+            return false;
+        }
+        self.at.entry(key).or_default().push(self.out.len());
+        self.out.push(crate::ipc::StatRow {
+            name: Zeroizing::new(tbl.to_vec()),
+            rows: n,
+        });
+        self.own.push(own);
+        true
+    }
+
+    /// The row counts, in the order their tables were first read.
+    pub(crate) fn finish(self) -> Vec<crate::ipc::StatRow> {
+        self.out
+    }
+}
+
 /// The first decimal integer of a `sqlite_stat1.stat` text, at most 19
 /// digits.
 fn first_integer(stat: &[u8]) -> Option<u64> {
@@ -780,6 +858,71 @@ pub(crate) mod tests {
         assert!(c.len() <= MAX_VALUE);
         assert!(std::str::from_utf8(&c).is_ok());
         assert_eq!(cut(b"abc").as_slice(), b"abc");
+    }
+
+    /// One `sqlite_stat1` row: `tbl`, `idx`, `stat`.
+    type StatInput<'a> = (&'a [u8], Option<&'a [u8]>, &'a [u8]);
+
+    fn stats_fold(rows: &[StatInput<'_>]) -> Vec<(Vec<u8>, u64)> {
+        let mut f = StatsFold::default();
+        for (t, i, s) in rows {
+            assert!(f.add(t, *i, s));
+        }
+        f.finish()
+            .into_iter()
+            .map(|r| (r.name.to_vec(), r.rows))
+            .collect()
+    }
+
+    /// The rows `ANALYZE` writes (SQLite 3.53.2, checked by
+    /// `it::row_estimates_cover_tables_with_an_index`), folded to one
+    /// count per table.
+    #[test]
+    fn stat_rows_fold_to_the_table_count() {
+        let got = stats_fold(&[
+            // No index: the table's own row.
+            (b"plain", None, b"10"),
+            // A full and a partial index, no own row: the largest count.
+            (b"indexed", Some(b"partial_i"), b"4 1"),
+            (b"indexed", Some(b"full_i"), b"10 1"),
+            // Only a partial index: its own row is written and wins.
+            (b"part_only", Some(b"p_i"), b"6 1"),
+            (b"part_only", None, b"10"),
+            // WITHOUT ROWID: the primary key's row has idx = tbl and wins
+            // over a larger, hostile index row.
+            (b"wr", Some(b"wr_v"), b"99 1"),
+            (b"wr", Some(b"wr"), b"10 1"),
+            // An unparseable stat, a too-long name: ignored.
+            (b"bad", Some(b"bad_i"), b"x 1"),
+            (&[b'n'; MAX_NAME + 1], None, b"5"),
+            (b"", None, b"5"),
+        ]);
+        assert_eq!(
+            got,
+            [
+                (b"plain".to_vec(), 10),
+                (b"indexed".to_vec(), 10),
+                (b"part_only".to_vec(), 10),
+                (b"wr".to_vec(), 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn stat_rows_are_bounded_by_table() {
+        let mut f = StatsFold::default();
+        let mut accepted = 0usize;
+        for i in 0..=MAX_STATS {
+            let t = format!("t{i}");
+            if !f.add(t.as_bytes(), None, b"1") {
+                break;
+            }
+            // A second row of the same table costs no entry.
+            assert!(f.add(t.as_bytes(), Some(b"i"), b"2"));
+            accepted += 1;
+        }
+        assert_eq!(accepted, MAX_STATS);
+        assert_eq!(f.finish().len(), MAX_STATS);
     }
 
     #[test]
