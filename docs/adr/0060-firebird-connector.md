@@ -3050,7 +3050,7 @@ The flood is bounded by the console's per-target hourly cap and per-hour dedup (
 
 ## Implementation note (2026-11-06): the `openat2` fallback, decided by the maintainer (#416)
 
-Recorded with #416 (branch `fix/p10-b-firebird-openat2-fallback`), security review finding F1 of #415; not released yet, as lot 3. **No protocol change, no new grant, no unit change.** The accepted text is unchanged; where this note differs from it, this note applies. ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
+Recorded with #416 (branch `fix/p10-b-firebird-openat2-fallback`), security review finding F1 of #415; not released yet, as lot 3. **No protocol change, no new grant, no unit change.** The accepted text is unchanged except for dated annotations pointing here; where this note differs from it, this note applies. ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
 
 **Decision (maintainer, 2026-11-06).** When `openat2` answers `ENOSYS`, whether from a seccomp filter or from a kernel older than Linux 5.6 (not supported anyway), an identity file and its directories are resolved through a component walk that follows no link, instead of being refused. This changes the last sentence of R45 item 1 ("A kernel without `openat2` (before 5.6) refuses the file (`not_readable`)") and the first sentence of interpretation 7 ("Kernels") of the [implementation note of 2026-10-31 b](#implementation-note-2026-10-31-b-host-identity-files). What does not change:
 
