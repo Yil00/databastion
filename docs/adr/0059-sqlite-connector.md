@@ -531,8 +531,9 @@ Recorded after the merge of #417 on `dev` (`c484410`); not released yet, no prot
 
 **Residual risk (L8): a compromised reader's own channels.** A reader taken over by a memory-safety exploit in SQLite, on a hostile file, controls what it answers within the IPC bounds. Besides the forged findings already listed under Residual risks:
 
-- it can put raw text of its own file into table or column names. Names go through ADR-0009 normalization and the ADR-0057 rules like every name, and the console stores what remains; masking applies to sampled values, not to names, so such text can reach the console unmasked. What it can carry is bounded by the name limits (1 024 bytes per name) and by the reader's grant, which reads only its own file and that file's side files;
-- on each failure it can choose among the about 200 valid SQLite result codes kept by item 7, about 7 bits per failure.
+- it can put raw text of its own file into table or column names. ADR-0009 normalization still applies to these names (a name a classifier matches becomes `*`), with the ADR-0057 rules, and the console stores what remains; masking applies to sampled values, not to names, so such text can reach the console unmasked. What it can carry is bounded by the name limits (1 024 bytes per name) and by the reader's grant, which reads only its own file and that file's side files;
+- on each failure it can choose among the about 200 valid SQLite result codes kept by item 7, about 7 bits per failure;
+- on each unit it can signal a few bits through the coverage counters and the row and skip counts it reports.
 
 What it exposes is the content of the file the reader was given, sent to the console without masking (an I2 residual for that file), never another secret of the agent.
 
