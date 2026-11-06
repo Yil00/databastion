@@ -15,7 +15,10 @@
 //! ([`Ledger::attach_store`]) and the ledger is written at every
 //! checkpoint and, on a blocking thread, soon after the end of an own
 //! session ([`Ledger::close`]), so a restart right after a check still
-//! finds that check's credits. What is written:
+//! finds that check's credits; and at the agent's stop ([`persist_all`]),
+//! once the core dropped every session, so a stop in the middle of a check
+//! keeps the credits of that check (its statement in flight credited as
+//! lost by the session's `Drop`). What is written:
 //! the attachments (a keyed tag of the declared `attach`, the id, the local
 //! port, the server pid, the open and close times) and the credits (a
 //! unique id, the tag of the `attach`, the attachment id, a **keyed tag of
@@ -238,14 +241,32 @@ fn earlier_life(a: &Attachment, attach: &str, id: u64, at: SystemTime) -> bool {
 /// of its first byte.
 pub(crate) type RecordAt = ((u64, u64), u64);
 
+/// The process's ledgers, per endpoint.
+fn ledgers() -> std::sync::MutexGuard<'static, HashMap<SocketAddr, Arc<Ledger>>> {
+    static LEDGERS: OnceLock<Mutex<HashMap<SocketAddr, Arc<Ledger>>>> = OnceLock::new();
+    LEDGERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The ledger of an endpoint (one per Firebird target).
 pub(crate) fn ledger_for(addr: SocketAddr) -> Arc<Ledger> {
-    static LEDGERS: OnceLock<Mutex<HashMap<SocketAddr, Arc<Ledger>>>> = OnceLock::new();
-    let map = LEDGERS.get_or_init(Mutex::default);
-    let mut m = map
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Arc::clone(m.entry(addr).or_default())
+    Arc::clone(ledgers().entry(addr).or_default())
+}
+
+/// At the agent's stop (blocking: from a blocking thread), every ledger
+/// whose stream attached a store is written, whatever it holds. The
+/// sessions the stop cut (a check in progress) are in memory only: the
+/// write their end schedules on a blocking thread is cancelled when the
+/// runtime shuts down. Written here, the next process restores them with
+/// the checkpoint and credits their records, instead of reporting them as
+/// any client's reads under the agent's account.
+pub(crate) fn persist_all() {
+    let all: Vec<Arc<Ledger>> = ledgers().values().cloned().collect();
+    for l in all {
+        l.persist();
+    }
 }
 
 impl Ledger {
@@ -481,10 +502,17 @@ impl Ledger {
         }
         drop(s);
         // The session's credits are all issued: written soon, so that an
-        // agent stopped right after a check still has them (R25 item 7),
-        // on a blocking thread, never from async code or a `Drop` (review
-        // L2), one write for the sessions that end meanwhile; without a
-        // runtime (tests), at the next checkpoint.
+        // agent stopped right after a check still has them (R25 item 7).
+        self.schedule_persist();
+    }
+
+    /// Marks the ledger changed and schedules its write on a blocking
+    /// thread, never from async code or a `Drop` (review L2), one write
+    /// for the changes made meanwhile; without a runtime (tests), at the
+    /// next checkpoint. At a session's end ([`Self::close`]) and at its
+    /// registration (`Session::register_own`, L1 of the review of #418:
+    /// a kill later in the session then still finds the attachment).
+    pub(crate) fn schedule_persist(self: &Arc<Self>) {
         self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(rt) = tokio::runtime::Handle::try_current()
             && !self

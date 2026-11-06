@@ -201,6 +201,15 @@ pub trait Connector: Send + Sync {
     fn name_case(&self, _target: &TargetConfig) -> Option<crate::name_case::NameCaseReport> {
         None
     }
+
+    /// The agent is stopping (SIGTERM, SIGINT): the core has dropped every
+    /// check, scan and Audit stream it was running. A connector whose
+    /// local state must outlive the process, and is written on a blocking
+    /// thread (which the runtime's shutdown would cancel), ends its own
+    /// tasks and writes that state here. The core waits at most 5 s for
+    /// all connectors together, then exits. Not called after a crash. The
+    /// default does nothing.
+    async fn shutdown(&self) {}
 }
 
 #[cfg(test)]

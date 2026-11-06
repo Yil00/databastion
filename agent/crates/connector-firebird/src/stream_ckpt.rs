@@ -530,6 +530,7 @@ impl Machine {
         // Every rule of the live state, then the global cap.
         self.failed_pids = m.failed_pids;
         self.bindings = m.bindings;
+        self.own_pending.clear();
         self.next_seq = m.next_seq;
         self.tra_pos = m.tra_pos;
         self.tra_pos_entries = self.tra_pos.values().map(Vec::len).sum();
@@ -621,6 +622,7 @@ impl Machine {
     fn reset_parser_state(&mut self) {
         self.failed_pids.clear();
         self.bindings.clear();
+        self.own_pending.clear();
         self.tra_pos.clear();
         self.tra_pos_entries = 0;
         self.by_addr.clear();

@@ -718,6 +718,215 @@ fn a_restart_right_after_a_check_finds_its_credits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The intermittent `e2e-firebird` failure of 2026-11-06 (CI run of PR
+/// #416 at `22dfbb9`: 5 events of `DATABASTION_AGENT` after the negative
+/// steps, none `*`, one object each). The agent is stopped (SIGTERM) while
+/// a check runs: the check's session registered and credited its
+/// statements after the stream's last checkpoint, the core drops the
+/// session (its statement in flight credited as lost, its attachment
+/// closed as lost, in memory only), and the write the session's end
+/// schedules on a blocking thread is cancelled with the runtime. The next
+/// process restores the checkpoint and a ledger without that attachment:
+/// the check's records are another client's, and its read of `SEC$USERS`
+/// (a credential relation, always reported) is an event of the agent's
+/// account. With the ledgers written at the stop
+/// ([`crate::own::persist_all`], the connector's `shutdown`), the records
+/// are the agent's own: no event, nothing ambiguous.
+///
+/// How the agent ends in the middle of the check (see
+/// [`stop_mid_check`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// SIGTERM: the core drops the session (its statement in flight
+    /// credited as lost, its attachment closed as lost), then the
+    /// connector's `shutdown` writes the endpoint's ledgers
+    /// ([`crate::own::persist_all`]); the port of that endpoint.
+    Stop(u16),
+    /// SIGKILL before the write the session's registration scheduled
+    /// landed: the ledger on disk was last written before the check.
+    KillBeforeRegistrationWrite,
+    /// SIGKILL after that write, and after a statement whose credit came
+    /// later.
+    KillAfterRegistrationWrite,
+}
+
+fn stop_mid_check(name: &str, end: End) -> (Counts, CkptCounts, Vec<Emitted>) {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let account = |end, counted| FetchAccount {
+        counted,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end,
+        ..FetchAccount::default()
+    };
+    let dir = temp(name);
+    first_start(&dir);
+    let (head, opened) = now_head(3600);
+    let classes = || vec![catalog(&[], &[], &[])];
+    // The stream of the first process, with the endpoint's ledger: its last
+    // checkpoint is written before the check starts.
+    let ledger = match end {
+        End::Stop(port) => {
+            crate::own::ledger_for(std::net::SocketAddr::from(([127, 0, 0, 2], port)))
+        }
+        _ => Arc::new(Ledger::default()),
+    };
+    append(
+        &dir,
+        &attach("24:0x7f0000000300", 5, APP).replace(HEAD, &head),
+    );
+    let mut p = Proc::start_full(&dir, Arc::clone(&ledger), settings(), RUN, classes());
+    p.read();
+    p.spooled();
+    p.commit();
+    // The check: its attachment registered with the credit of a statement
+    // run before (`Session::register_own`).
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    ledger.credit_at(
+        APP,
+        3,
+        crate::sql::VERSION,
+        account(FetchEnd::End, 1),
+        opened,
+    );
+    match end {
+        End::Stop(_) => {
+            // The second statement waits for its rows when the core drops
+            // the session (`Session::drop`; no runtime here, so the write
+            // it schedules does not run, as the runtime's shutdown cancels
+            // it), then the connector's `shutdown`.
+            ledger.credit_at(
+                APP,
+                3,
+                crate::sql::IDENTITY,
+                account(FetchEnd::Lost, 0),
+                opened,
+            );
+            ledger.close(APP, 3, true, Duration::from_secs(5));
+            crate::own::persist_all();
+        }
+        End::KillBeforeRegistrationWrite => {
+            ledger.credit_at(
+                APP,
+                3,
+                crate::sql::IDENTITY,
+                account(FetchEnd::End, 1),
+                opened,
+            );
+        }
+        End::KillAfterRegistrationWrite => {
+            // The write the registration scheduled.
+            ledger.persist();
+            ledger.credit_at(
+                APP,
+                3,
+                crate::sql::IDENTITY,
+                account(FetchEnd::End, 1),
+                opened,
+            );
+        }
+    }
+    drop(p);
+    // The server wrote the check's records, and the detach of the dropped
+    // connection.
+    let a = "24:0x7f0000000100";
+    append(
+        &dir,
+        &format!(
+            "{}{}{}{}",
+            attach_as(a, 3, AGENT),
+            stmt(
+                a,
+                3,
+                5,
+                AGENT,
+                crate::sql::VERSION,
+                1,
+                &[("RDB$DATABASE", 1)]
+            ),
+            stmt(
+                a,
+                3,
+                5,
+                AGENT,
+                crate::sql::IDENTITY,
+                1,
+                &[("RDB$DATABASE", 1), ("SEC$USERS", 1)]
+            ),
+            detach_as(&head, a, 3, AGENT),
+        )
+        .replace(HEAD, &head),
+    );
+    // The next process: a new, empty ledger.
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        classes(),
+    );
+    p.read();
+    let (c, k) = p.counts();
+    let out = std::mem::take(&mut p.out);
+    let _ = std::fs::remove_dir_all(&dir);
+    (c, k, out)
+}
+
+#[test]
+fn a_stop_in_the_middle_of_a_check_keeps_its_credits() {
+    let (c, k, out) = stop_mid_check("stopcheck", End::Stop(1));
+    assert_eq!(k.restored, 1, "{k:?}");
+    assert!(out.is_empty(), "{:?}", objects(&out));
+    // Both statements (and the detach of the attachment) are its own.
+    assert!(c.own >= 2, "{c:?}");
+    assert_eq!(c.own_not_matched, 0, "{c:?}");
+    assert_eq!(c.ambiguous, 0, "{c:?}");
+}
+
+/// What remains of a kill (SIGKILL, a crash) in the middle of a check,
+/// with a usable checkpoint (not the residual "a crash between two
+/// writes", where the checkpoint is not used). Killed between the
+/// session's `CURRENT_CONNECTION` and the ledger write its registration
+/// scheduled, the ledger on disk predates the check: its records are
+/// another client's, and its reads of always-reported relations are
+/// one-object events of the agent's account, not `*`, not ambiguous, with
+/// no level cap (the failed CI run's shape, and that of every stop before
+/// the fix).
+#[test]
+fn a_kill_before_the_registration_write_reports_its_records() {
+    let (c, k, out) = stop_mid_check("kill-before", End::KillBeforeRegistrationWrite);
+    assert_eq!(k.restored, 1, "the checkpoint itself is usable: {k:?}");
+    assert_eq!(c.own, 0, "{c:?}");
+    assert_eq!(c.ambiguous, 0, "not ambiguous: another client's records");
+    assert_eq!(objects(&out), ["SEC$USERS"]);
+    assert!(
+        out.iter()
+            .all(|(_, e)| e.principal().account_name() == AGENT)
+    );
+}
+
+/// Killed after that write: the attachment and the credits written with
+/// it are restored, so those records are the agent's own; a statement
+/// credited after the write finds no credit: a text of the closed set on
+/// the agent's attachment, ambiguous (`*`, always reported, R8 item 4),
+/// which withholds Partial for up to 24 h. Loud, never another client's
+/// read.
+#[test]
+fn a_kill_after_the_registration_write_is_own_or_ambiguous() {
+    let (c, k, out) = stop_mid_check("kill-after", End::KillAfterRegistrationWrite);
+    assert_eq!(k.restored, 1, "{k:?}");
+    assert!(c.own >= 1, "the statement credited before the write: {c:?}");
+    assert_eq!(c.ambiguous, 1, "the statement credited after it: {c:?}");
+    assert!(!out.is_empty());
+    assert!(out.iter().all(|(_, e)| e.always_report()), "{out:?}");
+    assert!(
+        objects(&out).contains(&"*".to_owned()),
+        "{:?}",
+        objects(&out)
+    );
+}
+
 /// A checkpoint of another server run (same pid, another start time),
 /// one sealed with another key or corrupted, and one of other declared
 /// databases are never used: the stream starts with no state.

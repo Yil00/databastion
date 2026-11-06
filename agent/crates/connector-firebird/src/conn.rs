@@ -234,6 +234,11 @@ struct Own {
     closed: bool,
     /// The table of the built statement being run (its credit names it).
     table: Option<String>,
+    /// The text of the statement being run, from its handle's allocation
+    /// to its credit: a session dropped meanwhile (a stop cut it) credits
+    /// it as lost (R22 item 1: the attachment was dropped with an answer
+    /// unread).
+    inflight: Option<String>,
 }
 
 /// How the fetch of one execution ended (ADR-0060 R22 item 1, R35).
@@ -668,6 +673,7 @@ impl Session {
             .request(&wire::allocate(), deadline, Stage::Check)
             .await?
             .object;
+        self.own.inflight = Some(text.to_owned());
         let result = self
             .run((tx, stmt), text, shape, max_rows, deadline, on_row)
             .await;
@@ -692,6 +698,7 @@ impl Session {
     /// One execution's credit (decision 6, R22 item 1): to the ledger once
     /// the attachment id is known, held until then.
     fn record_credit(&mut self, text: &str) {
+        self.own.inflight = None;
         let account = self.last_fetch;
         let table = self.own.table.take();
         match (&self.own.ledger, self.own.id) {
@@ -719,6 +726,25 @@ impl Session {
         for (text, table, account) in std::mem::take(&mut self.own.early) {
             l.credit(&self.own.attach, id, &text, table.as_deref(), account);
         }
+        // L1 of the review of #418: written soon, so that a kill later in
+        // the session keeps the attachment (its records are then the
+        // agent's own, or, for a credit issued after this write, a text of
+        // the closed set with no credit: ambiguous, never another client's).
+        l.schedule_persist();
+    }
+
+    /// Test support: the session's place in `ledger` as [`connect`] gives
+    /// it (the fake server's sessions have none).
+    #[cfg(test)]
+    pub(crate) fn own_in_for_tests(
+        &mut self,
+        ledger: std::sync::Arc<crate::own::Ledger>,
+        attach: &str,
+        local: SocketAddr,
+    ) {
+        self.own.ledger = Some(ledger);
+        self.own.attach = attach.to_owned();
+        self.local = Some(local);
     }
 
     /// The attachment id the session registered in the ledger (its
@@ -811,6 +837,9 @@ impl Session {
             .request(&wire::allocate(), deadline, Stage::Check)
             .await?
             .object;
+        // No fetch: a session dropped while it runs credits it with no row.
+        self.last_fetch = FetchAccount::default();
+        self.own.inflight = Some(text.to_owned());
         let result = async {
             let prepared = self
                 .request(
@@ -1119,11 +1148,25 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// A session dropped without `close` (an error path): its attachment
-    /// lives on in the ledger for the statement timeout plus 5 s (R22).
+    /// A session dropped without `close` (an error path, or the agent's
+    /// stop cutting a check): its attachment lives on in the ledger for the
+    /// statement timeout plus 5 s (R22). A statement still running is
+    /// credited as lost (R22 item 1: the attachment dropped with an answer
+    /// unread), with what its fetch counted so far, so that its record is
+    /// the agent's own within the lost bounds rather than a text of the
+    /// closed set with no credit (ambiguous, R8 item 4). This holds for
+    /// every drop: the agent's stop, and also a check cut by the core's
+    /// 10 s heartbeat check deadline (`CHECK_TIMEOUT`), whose statement in
+    /// flight is credited as lost too (N3 of the review of #418).
     fn drop(&mut self) {
         if !self.own.closed {
             self.broken = true;
+            if let Some(text) = self.own.inflight.take() {
+                if self.last_fetch.end == FetchEnd::NotRun {
+                    self.last_fetch.end = FetchEnd::Lost;
+                }
+                self.record_credit(&text);
+            }
             self.end_own();
         }
     }

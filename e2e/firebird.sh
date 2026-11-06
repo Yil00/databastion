@@ -343,9 +343,15 @@ readers_detail() {
 # quiesce_agent SERVICE: stops the agent of SERVICE between two checks, the way an operator restarts
 # one: after a new "Firebird checked" line, two Audit poll intervals and a margin (25 s; the
 # contract's default poll_interval_s is 10) for its stream to read that check's records, its last
-# TRACE_FINI included, then a graceful stop. An agent stopped in the middle of a check leaves records of its own attachments
-# that the next process reads with no state (ADR-0060 R39 (a), an accepted residual: reported as the
-# agent account's reads, or ambiguous); the negative steps test the readers check, not that.
+# TRACE_FINI included, then a graceful stop. A graceful stop in the middle of a check keeps that
+# check's credits (the ledgers are written at the stop, a statement in flight credited as lost), so
+# its records stay the agent's own. A kill in the middle of a check leaves a residual with a usable
+# checkpoint (not "a crash between two writes", where the checkpoint is not used): killed between
+# the session's CURRENT_CONNECTION and the ledger write its registration schedules, the check's
+# records come back as one-object events of the agent's account (always-reported relations), not
+# `*`, not ambiguous, no level cap; killed after that write, a statement credited later is
+# ambiguous (`*`, always reported). The unquiesced-restart step below kills the agent right after a
+# check.
 quiesce_agent() {
   local n0 deadline
   [ -n "$(compose --profile tools ps -q "$1")" ] || return 0

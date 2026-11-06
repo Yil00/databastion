@@ -501,6 +501,75 @@ fn views_over_always_reported_relations_and_view_ddl() {
     );
 }
 
+/// L2 of the review of #418: the stream reads the agent's own
+/// `ATTACH_DATABASE` before the session registered its attachment (the
+/// session reads `CURRENT_CONNECTION` after the server wrote the attach).
+/// The binding is judged again at its first record that reaches the
+/// own-record rule, by the same criteria: the check's records are its own.
+/// Never once a record of the binding was judged not its own, and never for
+/// an attach whose local port is not the registered one.
+#[test]
+fn an_own_attach_read_before_its_registration_is_judged_at_its_first_record() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let ledger = Arc::new(Ledger::default());
+    let (head, opened) = now_head(3600);
+    let account = FetchAccount {
+        counted: 1,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let id_text = crate::sql::IDENTITY;
+    let identity = |token: &str, id: u64, tra: u64| {
+        stmt(
+            token,
+            id,
+            tra,
+            agent,
+            id_text,
+            1,
+            &[("RDB$DATABASE", 1), ("SEC$USERS", 1)],
+        )
+    };
+    // 1. Read before the registration, then registered: its own.
+    let a = "24:0x7f0000000100";
+    let out = feed_h(&head, &mut m, &cats, &attach_as(a, 3, agent), 0);
+    assert!(out.is_empty());
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    ledger.credit_at(APP, 3, id_text, account, opened);
+    let before = m.counts.own;
+    let out = feed_h(&head, &mut m, &cats, &identity(a, 3, 5), 1000);
+    assert!(out.is_empty(), "{:?}", names(&out));
+    assert_eq!(m.counts.own, before + 1);
+    // 2. A first record judged before the registration: never judged again.
+    let b = "24:0x7f0000000200";
+    feed_h(&head, &mut m, &cats, &attach_as(b, 4, agent), 2000);
+    let out = feed_h(&head, &mut m, &cats, &identity(b, 4, 6), 3000);
+    assert_eq!(names(&out), ["SEC$USERS"]);
+    ledger.register_at(APP, 4, 40004, 24, opened);
+    ledger.credit_at(APP, 4, id_text, account, opened);
+    let before = m.counts.own;
+    let out = feed_h(&head, &mut m, &cats, &identity(b, 4, 7), 4000);
+    assert_eq!(names(&out), ["SEC$USERS"]);
+    assert_eq!(m.counts.own, before);
+    // 3. Registered with another local port: not its own.
+    let c = "24:0x7f0000000300";
+    feed_h(&head, &mut m, &cats, &attach_as(c, 5, agent), 5000);
+    ledger.register_at(APP, 5, 40999, 24, opened);
+    ledger.credit_at(APP, 5, id_text, account, opened);
+    let before = m.counts.own;
+    let out = feed_h(&head, &mut m, &cats, &identity(c, 5, 8), 6000);
+    assert_eq!(names(&out), ["SEC$USERS"]);
+    assert_eq!(m.counts.own, before);
+    assert_eq!(m.counts.ambiguous, 0);
+}
+
 /// R39 (g) through the stream: an own record is the agent's only with its
 /// text's row (here `RDB$DATABASE` must be read, nothing outside the
 /// may-read set); a copy with a user table in its block is not, and a

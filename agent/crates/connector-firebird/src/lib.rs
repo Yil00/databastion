@@ -131,11 +131,19 @@ pub fn statement_checked(text: &str) -> bool {
     sql::checked(text)
 }
 
+/// At the agent's stop, how long the aborted early checks may take to end
+/// before the ledgers are written anyway (within the core's 5 s).
+const EARLY_CHECKS_AT_STOP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Firebird connector. One instance serves every declared Firebird target.
 #[derive(Default)]
 #[non_exhaustive]
 pub struct FirebirdConnector {
     state: std::sync::Arc<check::CheckState>,
+    /// The early checks the streams started on tasks of their own (R28
+    /// item 4, R1 rule 2), ended at the agent's stop before the ledgers are
+    /// written ([`Connector::shutdown`]).
+    early_checks: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for FirebirdConnector {
@@ -224,6 +232,7 @@ impl Connector for FirebirdConnector {
         // runs on its own task, never while a check of the target runs.
         let early: audit::EarlyCheck = {
             let state = std::sync::Arc::clone(&self.state);
+            let early_checks = std::sync::Arc::clone(&self.early_checks);
             let target = target.clone();
             std::sync::Arc::new(move || {
                 if state.running(&target.id) {
@@ -231,9 +240,14 @@ impl Connector for FirebirdConnector {
                 }
                 let state = std::sync::Arc::clone(&state);
                 let target = target.clone();
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let _ = check::check(&state, &target).await;
                 });
+                let mut tasks = early_checks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tasks.retain(|t| !t.is_finished());
+                tasks.push(task);
                 true
             })
         };
@@ -268,6 +282,42 @@ impl Connector for FirebirdConnector {
 
     fn server_version(&self, target: &TargetConfig) -> Option<String> {
         self.state.version(&target.id)
+    }
+
+    /// The agent's stop (ADR-0060, the parser checkpoint's ledger): the
+    /// core dropped its checks, scans and streams; the early checks still
+    /// running end here, so every session the stop cut has credited its
+    /// statement in flight and closed its attachment in memory; then every
+    /// ledger is written, on a blocking thread. Without this, a stop in the
+    /// middle of a check lost that check's credits (the write its sessions'
+    /// end scheduled is cancelled with the runtime), and the next process
+    /// reported the check's records as reads of the agent's account.
+    async fn shutdown(&self) {
+        let tasks: Vec<_> = std::mem::take(
+            &mut *self
+                .early_checks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for t in &tasks {
+            t.abort();
+        }
+        // N2 of the review of #418: the aborted checks get their own share
+        // of the core's budget; the ledgers are written whatever remains.
+        let ended = async {
+            for t in tasks {
+                let _ = t.await;
+            }
+        };
+        if tokio::time::timeout(EARLY_CHECKS_AT_STOP, ended)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Firebird early checks not ended at the stop");
+        }
+        if tokio::task::spawn_blocking(own::persist_all).await.is_err() {
+            tracing::warn!("Firebird own-statement ledgers not saved at the stop");
+        }
     }
 }
 
