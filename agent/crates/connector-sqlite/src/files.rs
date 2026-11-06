@@ -5,7 +5,9 @@
 //!   symlink, not writable by the agent's account, not writable by every
 //!   local user unless it has the sticky bit.
 //! - The **check descriptor** (`O_RDONLY | O_NOFOLLOW | O_NONBLOCK |
-//!   O_NOCTTY | O_CLOEXEC`), then on it: `fstat` (a regular file, one link,
+//!   O_NOCTTY | O_CLOEXEC`; in the agent's process through
+//!   `databastion_core::fs::open_no_links`, which follows no link in any
+//!   component, review N4), then on it: `fstat` (a regular file, one link,
 //!   not writable by the agent, at least 512 bytes), `fstatfs` (no network
 //!   or FUSE file system), `fstatvfs` (`ST_RDONLY` required), and the
 //!   header pre-check through `pread`.
@@ -37,7 +39,7 @@ pub const MAX_WAL_BYTES: u64 = 128 * 1024 * 1024;
 
 /// `f_type` values of network and FUSE file systems (Linux `magic.h`, and
 /// the Lustre and GPFS values of their client modules).
-pub const NETWORK_FS_MAGIC: [u64; 11] = [
+pub const NETWORK_FS_MAGIC: [u64; 12] = [
     0x6969,      // NFS
     0x517B,      // SMB
     0xFF53_4D42, // CIFS
@@ -45,7 +47,8 @@ pub const NETWORK_FS_MAGIC: [u64; 11] = [
     0x6573_5546, // FUSE
     0x0102_1997, // 9P (V9FS)
     0x00C3_6400, // Ceph
-    0x5346_414F, // AFS (OpenAFS / kAFS)
+    0x5346_414F, // AFS_SUPER_MAGIC (OpenAFS)
+    0x6B41_4653, // AFS_FS_MAGIC (the in-kernel AFS client, kAFS; review L5)
     0x7375_7245, // Coda
     0x0BD0_0BD0, // Lustre
     0x4750_4653, // GPFS
@@ -62,6 +65,27 @@ pub struct Policy {
     pub require_read_only_fs: bool,
     /// Step 8: every descriptor of the process must be a known one.
     pub exact_descriptor_set: bool,
+    /// Open the check descriptor with `databastion_core::fs::open_no_links`
+    /// (review N4: no link followed in any component, not only the last).
+    ///
+    /// Off in the reader process only, where the last component is opened
+    /// `O_NOFOLLOW` and the sandbox already gives what the walk would
+    /// (accepted in the re-review of #417):
+    /// - Landlock grants `ReadFile` only on the inodes of the grant (the
+    ///   database and the side files present at open), whose descriptors
+    ///   are opened with `open_no_links` and checked against an `lstat` of
+    ///   their paths after `restrict_self`: a path that resolves anywhere
+    ///   else, through a link or a swapped ancestor, cannot be opened;
+    /// - the directory rule grants `ReadDir` only, never `ReadFile` on
+    ///   anything new in it;
+    /// - the descriptor's `(st_dev, st_ino)` is the session's identity,
+    ///   checked by `bind_main` (decision 2 step 6), by `recheck` before
+    ///   every unit, and by the agent against its own view of the file
+    ///   (review N2);
+    /// - `open_no_links` in the reader would need its seccomp filter to
+    ///   answer `openat2` with `ENOSYS` (it refuses it with `EPERM`), a
+    ///   wider filter for no gain.
+    pub open_no_links: bool,
 }
 
 impl Policy {
@@ -70,12 +94,14 @@ impl Policy {
         refuse_agent_writable: true,
         require_read_only_fs: true,
         exact_descriptor_set: true,
+        open_no_links: false,
     };
 
     /// The policy of the agent's own light check: the agent's process holds
     /// other descriptors (its sockets, files), so step 8 is the reader's.
     pub const AGENT: Self = Self {
         exact_descriptor_set: false,
+        open_no_links: true,
         ..Self::STRICT
     };
 
@@ -85,6 +111,7 @@ impl Policy {
         refuse_agent_writable: false,
         require_read_only_fs: false,
         exact_descriptor_set: false,
+        open_no_links: true,
     };
 }
 
@@ -375,11 +402,13 @@ fn check_descriptor(
 /// The rule broken.
 pub fn open_checked(path: &Path, policy: Policy) -> Result<Checked, Failure> {
     check_ancestors(path, policy)?;
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let fd = if policy.open_no_links {
+        databastion_core::fs::open_no_links(path, flags)
+    } else {
+        rustix::fs::open(path, flags, Mode::empty())
+    }
     .map_err(io_failure)?;
     let (st, header) = check_descriptor(fd.as_fd(), path, policy)?;
     let id = Identity {
@@ -594,6 +623,21 @@ mod tests {
             side_path(Path::new("/srv/a.db"), "-wal"),
             PathBuf::from("/srv/a.db-wal")
         );
+    }
+
+    /// Review L5: the in-kernel AFS client (`AFS_FS_MAGIC`, Linux uapi
+    /// `magic.h`; neither `libc` nor `rustix` defines it) is refused like
+    /// OpenAFS (`AFS_SUPER_MAGIC`, checked against `libc`).
+    #[test]
+    fn both_afs_clients_are_network_file_systems() {
+        assert!(NETWORK_FS_MAGIC.contains(&0x6B41_4653));
+        #[allow(
+            clippy::cast_sign_loss,
+            clippy::unnecessary_cast,
+            reason = "a magic number"
+        )]
+        let openafs = libc::AFS_SUPER_MAGIC as u64;
+        assert!(NETWORK_FS_MAGIC.contains(&openafs));
     }
 
     #[test]

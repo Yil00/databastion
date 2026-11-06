@@ -55,6 +55,22 @@ fn process_state(pid: i32) -> Option<char> {
     stat.rsplit_once(") ")?.1.chars().next()
 }
 
+/// The unit of the times in `/proc/<pid>/stat` (`USER_HZ`): 100 on every
+/// architecture the agent is built for (x86_64, aarch64).
+const USER_HZ: u64 = 100;
+
+/// The CPU time (`utime` + `stime`, fields 14 and 15) of a
+/// `/proc/<pid>/stat` line, read after the command name (which may hold
+/// spaces and parentheses).
+fn cpu_time_of(stat: &str) -> Option<Duration> {
+    let mut fields = stat.rsplit_once(") ")?.1.split_ascii_whitespace();
+    // Field 3 (the state) is the first after the command name.
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    let ticks = utime.checked_add(stime)?;
+    Some(Duration::from_millis(ticks.saturating_mul(1000) / USER_HZ))
+}
+
 /// Test support: the reader executable of other crates' tests (the agent
 /// binary built by Cargo), instead of `/proc/self/exe` (a test harness).
 static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
@@ -152,7 +168,11 @@ impl ReaderProcess {
         match joined {
             Ok((sock, Ok(resp))) => {
                 self.sock = Some(sock);
-                Ok(resp)
+                // Review L8: only SQLite's own result codes pass.
+                Ok(match resp {
+                    Response::Failed(f) => Response::Failed(f.with_known_engine_code()),
+                    other => other,
+                })
             }
             Ok((_, Err(e))) => {
                 self.kill().await;
@@ -173,6 +193,14 @@ impl ReaderProcess {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// The CPU time the reader used so far (review L6), from
+    /// `/proc/<pid>/stat`; `None` when it cannot be read.
+    #[must_use]
+    pub fn cpu_time(&self) -> Option<Duration> {
+        let pid = self.pid()?;
+        cpu_time_of(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }
 
     /// Test support: the reader's process id.
@@ -236,5 +264,31 @@ impl ReaderProcess {
             Ok(_) => {}
             Err(_) => self.kill().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_time_is_utime_plus_stime() {
+        // A command name with spaces and a parenthesis.
+        let stat = "4242 (a (b) c) S 1 4242 4242 0 -1 4194560 300 0 0 0 \
+                    1234 466 0 0 20 0 1 0 100 1000000 200 18446744073709551615";
+        assert_eq!(cpu_time_of(stat), Some(Duration::from_millis(17_000)));
+        assert_eq!(cpu_time_of("1 (x) S 1 2"), None);
+        assert_eq!(cpu_time_of("garbage"), None);
+        assert_eq!(
+            cpu_time_of("1 (x) R 0 0 0 0 0 0 0 0 0 0 x 1 0"),
+            None,
+            "not a number"
+        );
+    }
+
+    #[test]
+    fn this_process_has_a_cpu_time() {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        assert!(cpu_time_of(&stat).is_some());
     }
 }

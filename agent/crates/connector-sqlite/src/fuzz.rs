@@ -158,6 +158,7 @@ fn run(main: &Path) -> u64 {
         refuse_agent_writable: false,
         require_read_only_fs: false,
         exact_descriptor_set: false,
+        open_no_links: true,
     };
     let Ok((mut s, _)) = Session::open(&req, policy, None) else {
         return 0;
