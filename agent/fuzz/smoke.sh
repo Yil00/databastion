@@ -46,7 +46,7 @@ seed() {
     cas_audit_log)
       grep -E '"action":"OAUTH2_ACCESS_TOKEN_(REQUEST|RESPONSE)_CREATED"' "$AUDIT_FIXTURE" >"$2/token-records.jsonl"
       split -l 2 "$2/token-records.jsonl" "$2/token-pair-" ;;
-    # A small SQLite file (rollback mode), as one length-prefixed part (ADR-0059).
+    # A small SQLite file (rollback mode) and a WAL set, as length-prefixed parts (ADR-0059).
     sqlite_file)
       if command -v python3 >/dev/null 2>&1; then
         python3 -I "$HERE/sqlite_seed.py" "$2/seed" || true
