@@ -4,8 +4,11 @@
 //! Blocking I/O: call from a blocking thread.
 //!
 //! - **In a container** (`firebird.audit.host_identity`, R44): each
-//!   declared file is opened with `openat2` and `RESOLVE_NO_SYMLINKS |
-//!   RESOLVE_NO_MAGICLINKS`, checked on its handle (a regular file with
+//!   declared file is opened with no symbolic or magic link followed
+//!   anywhere in its path (`databastion_core::fs::open_no_links`:
+//!   `openat2` with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, or the
+//!   same resolution one component at a time where a seccomp filter
+//!   answers `ENOSYS`, as the agent's systemd unit does), checked on its handle (a regular file with
 //!   one hard link, the path still naming it, not writable by the agent,
 //!   owned by uid 0, no group or other write bit) and must be the root of
 //!   its own read-only bind mount, found by the handle's mount id in
@@ -40,7 +43,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use databastion_core::config::firebird::FirebirdHostIdentity;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, ResolveFlags, StatVfsMountFlags, StatxFlags};
+use rustix::fs::{AtFlags, OFlags, StatVfsMountFlags, StatxFlags};
 use zeroize::Zeroizing;
 
 /// Why a declared (or bare-host) identity file is refused (R45; the
@@ -758,8 +761,15 @@ fn oflags() -> OFlags {
     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY
 }
 
-fn resolve() -> ResolveFlags {
-    ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS
+/// `path` opened with `flags`, no symbolic or magic link followed anywhere
+/// in it: `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`, or,
+/// where `openat2` answers `ENOSYS` (the agent's systemd unit,
+/// `RestrictSUIDSGID=yes`; security review F1), the same resolution one
+/// component at a time, with the same answers: a link anywhere is `ELOOP`
+/// with the read flags of [`oflags`] and with
+/// [`databastion_core::fs::DIRECTORY`]. `ENOSYS` never refuses a file.
+fn open_at(path: &Path, flags: OFlags) -> Result<OwnedFd, rustix::io::Errno> {
+    databastion_core::fs::open_no_links(path, flags)
 }
 
 /// Why an open failed: the file is not there, or another refusal.
@@ -769,10 +779,12 @@ pub(crate) enum OpenError {
     Refused(Kind),
 }
 
-/// R45 item 1: `openat2` without any symbolic or magic link on the path;
-/// a kernel without `openat2` refuses the file.
+/// R45 item 1: no symbolic or magic link anywhere on the path
+/// ([`open_at`]: `openat2`, or its component walk where `openat2` answers
+/// `ENOSYS`); a link is refused (`not_readable`), a missing file told
+/// apart.
 pub(crate) fn open_no_links(path: &Path) -> Result<OwnedFd, OpenError> {
-    rustix::fs::openat2(CWD, path, oflags(), Mode::empty(), resolve()).map_err(|e| {
+    open_at(path, oflags()).map_err(|e| {
         if e == rustix::io::Errno::NOENT {
             OpenError::Missing
         } else {
@@ -835,9 +847,9 @@ fn under(p: &Path, base: &Path) -> bool {
     p != base && p.starts_with(base)
 }
 
-/// Opens a bare-host file (R45 item 2, option (a)): `openat2` without
-/// links; when the path's last component is a link, the chain is followed
-/// only under `rules`. Returns the handle and the path that names it.
+/// Opens a bare-host file (R45 item 2, option (a)): without links
+/// ([`open_at`]); when the path's last component is a link (`ELOOP`), the
+/// chain is followed only under `rules`. Returns the handle and the path that names it.
 pub(crate) fn open_bare_host(
     path: &Path,
     rules: ChainRules<'_>,
@@ -850,7 +862,7 @@ pub(crate) fn open_bare_host(
         let Some(dir) = cur.parent() else {
             return Err(OpenError::Refused(Kind::NotReadable));
         };
-        match rustix::fs::openat2(CWD, &cur, oflags(), Mode::empty(), resolve()) {
+        match open_at(&cur, oflags()) {
             Ok(fd) => {
                 dirs_ok(dir, rules)?;
                 return Ok((fd, cur));
@@ -898,14 +910,8 @@ fn dirs_ok(dir: &Path, rules: ChainRules<'_>) -> Result<OwnedFd, OpenError> {
         .collect();
     chain.reverse();
     for a in chain {
-        let fd = rustix::fs::openat2(
-            CWD,
-            a,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            resolve(),
-        )
-        .map_err(|_| OpenError::Refused(Kind::Links))?;
+        let fd = open_at(a, databastion_core::fs::DIRECTORY)
+            .map_err(|_| OpenError::Refused(Kind::Links))?;
         let st = rustix::fs::fstat(&fd).map_err(|_| OpenError::Refused(Kind::NotReadable))?;
         if st.st_uid != rules.dir_owner {
             return Err(OpenError::Refused(Kind::Owner));
@@ -933,13 +939,7 @@ fn handle_facts(file: &File, path: &Path) -> Result<HandleFacts, Kind> {
 
 /// Whether `path`, resolved without links, still names the handle.
 fn names(path: &Path, meta: &std::fs::Metadata) -> bool {
-    match rustix::fs::openat2(
-        CWD,
-        path,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        resolve(),
-    ) {
+    match open_at(path, OFlags::PATH | OFlags::NOFOLLOW) {
         Ok(fd) => File::from(fd).metadata().is_ok_and(|now| {
             now.file_type().is_file() && (now.dev(), now.ino()) == (meta.dev(), meta.ino())
         }),

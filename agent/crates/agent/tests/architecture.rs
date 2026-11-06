@@ -1248,3 +1248,63 @@ fn the_agent_never_enables_sqlite_fuzzing() {
         }
     }
 }
+
+/// Security review F1 (the Firebird lot) and #415: every path opened with
+/// no symbolic link followed goes through `databastion_core::fs`, whose
+/// `open_no_links` falls back to a component walk where `openat2` answers
+/// `ENOSYS` (the agent's systemd unit, `RestrictSUIDSGID=yes`). Test code
+/// aside, `openat2` is called in that module only, once, and both the
+/// SQLite grant and the Firebird host identity files use it; the module
+/// logs and formats nothing (I2: it is handed paths of host files).
+#[test]
+fn openat2_only_through_core_fs() {
+    let core_fs = workspace_root().join("crates/core/src/fs.rs");
+    let mut calls = Vec::new();
+    for source in all_crate_sources() {
+        let shown = source.display().to_string();
+        if shown.contains("/tests/")
+            || shown.ends_with("/it.rs")
+            || shown.contains("/it_")
+            || shown.ends_with("_tests.rs")
+        {
+            continue;
+        }
+        let text = fs::read_to_string(&source).unwrap();
+        for l in code_lines(&text).take_while(|l| !l.trim_end().ends_with("mod tests {")) {
+            if l.contains("openat2(") {
+                calls.push((shown.clone(), l.trim().to_owned()));
+            }
+        }
+    }
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].0 == core_fs.display().to_string(),
+        "openat2 outside core::fs: {calls:?}"
+    );
+    for user in [
+        "crates/connector-sqlite/src/sandbox.rs",
+        "crates/connector-firebird/src/host_identity.rs",
+    ] {
+        let text = fs::read_to_string(workspace_root().join(user)).unwrap();
+        assert!(
+            code_lines(&text).any(|l| l.contains("databastion_core::fs::open_no_links(")),
+            "{user} does not use databastion_core::fs::open_no_links"
+        );
+    }
+    let text = fs::read_to_string(&core_fs).unwrap();
+    for l in code_lines(&text).take_while(|l| !l.trim_end().ends_with("mod tests {")) {
+        for banned in [
+            "tracing",
+            "log::",
+            "print",
+            "format!(",
+            "write!(",
+            "dbg!(",
+            "panic!(",
+            ".unwrap()",
+            ".expect(",
+        ] {
+            assert!(!l.contains(banned), "core/src/fs.rs: {banned} in {l}");
+        }
+    }
+}

@@ -93,9 +93,15 @@ fn handle_refusals() {
 }
 
 /// R45 item 1 on the kernel: a symbolic link as the last component or in
-/// an ancestor is refused by `openat2`; a missing file is told apart.
+/// an ancestor is refused (`openat2`, or its component walk without it,
+/// [`tests::the_bare_host_load_without_openat2`]); a missing file is told
+/// apart.
 #[test]
 fn symlinks_are_refused_anywhere_on_the_path() {
+    links_cases();
+}
+
+fn links_cases() {
     let d = tmp("links");
     let file = d.join("passwd");
     std::fs::write(&file, PASSWD).unwrap();
@@ -145,6 +151,10 @@ fn a_second_hard_link_is_seen_on_the_handle() {
 /// bit; anything else is refused.
 #[test]
 fn bare_host_chains() {
+    chains_cases();
+}
+
+fn chains_cases() {
     let d = tmp("chain");
     let me = rustix::process::geteuid().as_raw();
     let rules = ChainRules {
@@ -261,6 +271,10 @@ fn bare_host_chains() {
 /// means no range.
 #[test]
 fn bare_host_files_on_disk() {
+    files_on_disk_cases();
+}
+
+fn files_on_disk_cases() {
     crate::fsread::allow_own_files_for_tests();
     let d = tmp("bare");
     let me = rustix::process::geteuid().as_raw();
@@ -1034,4 +1048,113 @@ fn a_large_group_is_judged_in_one_pass() {
         "{:?}",
         t.elapsed()
     );
+}
+
+// In a `mod tests` block: the agent's architecture test reads the code
+// before it only, and this test starts a process (itself).
+mod tests {
+    use std::process::{Command, Stdio};
+
+    use super::*;
+
+    /// Set in the child: apply the filter, then run the cases.
+    const CHILD: &str = "DATABASTION_FB_TEST_NO_OPENAT2_CHILD";
+    /// The parent's answers on the host's own files, for the child.
+    const EXPECTED: &str = "DATABASTION_FB_TEST_NO_OPENAT2_EXPECTED";
+    const NAME: &str = "host_identity_tests::tests::the_bare_host_load_without_openat2";
+    const OK: &str = "fb-no-openat2-child-ok";
+
+    /// What systemd's `RestrictSUIDSGID=yes` does to `openat2`: `ENOSYS`;
+    /// every other call allowed (this thread, where the test runs).
+    fn refuse_openat2_like_systemd() {
+        let rules = std::collections::BTreeMap::from([(libc::SYS_openat2, Vec::new())]);
+        #[cfg(target_arch = "x86_64")]
+        let arch = seccompiler::TargetArch::x86_64;
+        #[cfg(target_arch = "aarch64")]
+        let arch = seccompiler::TargetArch::aarch64;
+        let filter = seccompiler::SeccompFilter::new(
+            rules,
+            seccompiler::SeccompAction::Allow,
+            seccompiler::SeccompAction::Errno(u32::try_from(libc::ENOSYS).unwrap()),
+            arch,
+        )
+        .unwrap();
+        let program = seccompiler::BpfProgram::try_from(filter).unwrap();
+        seccompiler::apply_filter(&program).unwrap();
+        let r = rustix::fs::openat2(
+            rustix::fs::CWD,
+            "/",
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::empty(),
+        );
+        assert_eq!(
+            r.err(),
+            Some(rustix::io::Errno::NOSYS),
+            "openat2 not refused"
+        );
+    }
+
+    /// The bare host's own files (`/etc`, production rules) and a readers
+    /// check on a log of this test's: their answers, as text (verdicts and
+    /// closed reasons only, never a name or a line).
+    fn host_answers() -> String {
+        crate::fsread::allow_own_files_for_tests();
+        let load = crate::host_identity::load_bare_host()
+            .map(|_| ())
+            .map_err(Fail::reason);
+        let d = tmp("readers");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = d.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let readers = crate::fsread::readers_check(
+            &log,
+            Some((me, rustix::process::getegid().as_raw())),
+            None,
+            crate::fsread::Place {
+                in_container: false,
+                host_identity: None,
+            },
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        format!("load {load:?}, readers {readers:?}")
+    }
+
+    /// Security review F1: under the agent's systemd unit, `openat2`
+    /// answers `ENOSYS` (`RestrictSUIDSGID=yes`), which refused every
+    /// bare-host identity file (`host_identity_refused (passwd:
+    /// not_readable)`, then `audit.log_readable_by_others`). In a child
+    /// process behind the same filter: every link, owner, mode and bound
+    /// refusal of the bare-host tests holds, and the host's own files and
+    /// a readers check give the answers they give with `openat2`.
+    #[test]
+    #[allow(clippy::print_stderr)] // The child's marker, for the parent.
+    fn the_bare_host_load_without_openat2() {
+        if std::env::var(CHILD).as_deref() == Ok("1") {
+            refuse_openat2_like_systemd();
+            links_cases();
+            chains_cases();
+            files_on_disk_cases();
+            let expected = std::env::var(EXPECTED).unwrap();
+            assert_eq!(host_answers(), expected, "the host's files without openat2");
+            eprintln!("{OK}");
+            return;
+        }
+        let expected = host_answers();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(EXPECTED, &expected)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.contains(OK),
+            "child failed ({expected}):\n{stdout}\n{stderr}"
+        );
+    }
 }
