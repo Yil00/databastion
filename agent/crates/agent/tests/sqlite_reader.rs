@@ -62,25 +62,93 @@ struct Env {
     base: PathBuf,
     rw: PathBuf,
     ro: PathBuf,
+    /// Dropped after `Drop for Env` has run (fields drop last).
+    _exe: ExeLease,
 }
 
-/// The reader executable: one copy of the agent binary, which any account
-/// can run, for the whole test binary.
-fn reader_executable() -> PathBuf {
-    static EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    EXE.get_or_init(|| {
-        let dir = PathBuf::from(format!(
-            "/tmp/databastion-sqlite-reader-exe-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let exe = dir.join("databastion-agent");
-        std::fs::copy(env!("CARGO_BIN_EXE_databastion-agent"), &exe).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        exe
-    })
-    .clone()
+/// The prefix of the reader executable's directory, followed by the test
+/// process id.
+const EXE_DIR_PREFIX: &str = "databastion-sqlite-reader-exe-";
+
+/// The reader executable's directory for this process. Its path is fixed
+/// for the whole test binary: the connector keeps the first path it is
+/// given.
+fn reader_exe_dir() -> PathBuf {
+    PathBuf::from(format!("/tmp/{EXE_DIR_PREFIX}{}", std::process::id()))
+}
+
+/// Tests holding the reader executable (a copy of the agent binary, about
+/// 271 MB, which any account can run).
+static EXE_LEASES: Mutex<usize> = Mutex::new(0);
+
+/// A hold on the reader executable: the first lease copies it, the last
+/// one dropped removes it, panics included (the lease is dropped while
+/// the test unwinds). A test process killed before its leases drop leaves
+/// its copy behind; the next run removes it ([`remove_stale_executables`]).
+struct ExeLease;
+
+impl ExeLease {
+    fn take() -> Self {
+        let mut n = EXE_LEASES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *n == 0 {
+            static STALE: std::sync::Once = std::sync::Once::new();
+            STALE.call_once(remove_stale_executables);
+            let dir = reader_exe_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let exe = dir.join("databastion-agent");
+            std::fs::copy(env!("CARGO_BIN_EXE_databastion-agent"), &exe).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        *n += 1;
+        Self
+    }
+}
+
+impl Drop for ExeLease {
+    fn drop(&mut self) {
+        let mut n = EXE_LEASES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            let _ = std::fs::remove_dir_all(reader_exe_dir());
+        }
+    }
+}
+
+/// Best effort: removes the reader executable directories that earlier
+/// runs of this user left in `/tmp` (a killed test process), those of a
+/// process that is no longer running. Never follows a symbolic link, and
+/// never touches another account's directory.
+fn remove_stale_executables() {
+    use std::os::unix::fs::MetadataExt;
+    let me = euid();
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(EXE_DIR_PREFIX))
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let path = e.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_dir() && meta.uid() == me {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 fn run(cmd: &mut Command) {
@@ -120,9 +188,17 @@ impl Env {
         let ro = base.join("ro");
         std::fs::create_dir(&rw).unwrap();
         std::fs::create_dir(&ro).unwrap();
-        databastion_connector_sqlite::set_reader_executable_for_tests(reader_executable());
+        let exe = ExeLease::take();
+        databastion_connector_sqlite::set_reader_executable_for_tests(
+            reader_exe_dir().join("databastion-agent"),
+        );
         databastion_connector_sqlite::set_reader_credentials_for_tests(AGENT_UID, SHARED_GID);
-        Some(Self { base, rw, ro })
+        Some(Self {
+            base,
+            rw,
+            ro,
+            _exe: exe,
+        })
     }
 
     /// Mounts `rw` read-only on `ro`, after giving every file to the
