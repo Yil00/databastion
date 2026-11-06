@@ -457,6 +457,103 @@ async fn run_stops_on_shutdown() {
     );
 }
 
+/// A connector whose check never ends (a check in progress at the stop):
+/// its future holds a guard that marks the cut when dropped; its
+/// `shutdown` records whether the check was already dropped.
+struct CutAtStop {
+    started: Arc<tokio::sync::Notify>,
+    cut: Arc<std::sync::atomic::AtomicBool>,
+    /// The cut flag as each `shutdown` saw it.
+    shutdown: Arc<Mutex<Vec<bool>>>,
+}
+
+struct Guard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Connector for CutAtStop {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        let _guard = Guard(Arc::clone(&self.cut));
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown
+            .lock()
+            .unwrap()
+            .push(self.cut.load(Ordering::SeqCst));
+    }
+}
+
+/// The agent's stop in the middle of a check (ADR-0060, the Firebird
+/// ledger): the check is dropped first, then every connector's
+/// `shutdown` runs, once, before `run` returns.
+#[tokio::test]
+async fn a_stop_drops_the_checks_then_shuts_the_connectors_down() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/jobs"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = Arc::new(Mutex::new(Vec::new()));
+    let connector = CutAtStop {
+        started: Arc::clone(&started),
+        cut: Arc::clone(&cut),
+        shutdown: Arc::clone(&shutdown),
+    };
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn({
+        let path = env.config_path.clone();
+        async move { run(&path, vec![Box::new(connector)], rx).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(!cut.load(Ordering::SeqCst));
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(*shutdown.lock().unwrap(), [true]);
+}
+
 // ------------------------------------------------------------------- jobs
 
 fn job(id: &str, kind: &str, params: serde_json::Value) -> serde_json::Value {

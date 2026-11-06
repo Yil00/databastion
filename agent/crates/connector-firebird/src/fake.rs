@@ -1220,4 +1220,83 @@ mod tests {
         s.close().await;
         server.await.unwrap();
     }
+
+    /// A check cut by the agent's stop (the intermittent `e2e-firebird`
+    /// failure of 2026-11-06): the core drops the check's future while a
+    /// statement waits for its rows, then the session. The statement in
+    /// flight is credited as lost (R22 item 1) next to the one that ended,
+    /// and the attachment is closed as lost, in memory, for the ledger
+    /// written at the stop.
+    #[tokio::test]
+    async fn a_session_dropped_mid_statement_credits_it_as_lost() {
+        let ledger = std::sync::Arc::new(crate::own::Ledger::default());
+        let (mut s, server) = session(Script {
+            statements: vec![
+                canned(
+                    crate::sql::VERSION,
+                    vec![text_col(128)],
+                    vec![vec![v("5.0.4")]],
+                ),
+                canned(
+                    crate::sql::LINGER,
+                    vec![int_col()],
+                    vec![vec![Value::Int(0)]],
+                ),
+            ],
+            ..Script::default()
+        })
+        .await;
+        s.own_in_for_tests(
+            std::sync::Arc::clone(&ledger),
+            "app",
+            "127.0.0.1:40007".parse().unwrap(),
+        );
+        s.register_own(7, 24);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        s.query(crate::sql::VERSION, &[Col::Text(128)], 1, deadline)
+            .await
+            .unwrap();
+        drop(s);
+        server.await.unwrap();
+        // The first statement ended; nothing was in flight at the drop.
+        assert_eq!(
+            ledger.credits_left(),
+            [(crate::sql::VERSION.to_owned(), conn::FetchEnd::End)]
+        );
+        let ledger = std::sync::Arc::new(crate::own::Ledger::default());
+        let (mut s, server) = session(Script {
+            statements: vec![canned(
+                crate::sql::LINGER,
+                vec![int_col()],
+                vec![vec![Value::Int(0)]],
+            )],
+            fetch_delay: Some(Duration::from_secs(3)),
+            ..Script::default()
+        })
+        .await;
+        s.own_in_for_tests(
+            std::sync::Arc::clone(&ledger),
+            "app",
+            "127.0.0.1:40008".parse().unwrap(),
+        );
+        s.register_own(8, 24);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // The stop: the statement's future is dropped while its fetch waits.
+        let cut = tokio::time::timeout(
+            Duration::from_millis(300),
+            s.query(crate::sql::LINGER, &[Col::Int], 1, deadline),
+        )
+        .await;
+        assert!(cut.is_err(), "the statement was still running");
+        drop(s);
+        let _ = server.await;
+        assert_eq!(
+            ledger.credits_left(),
+            [(crate::sql::LINGER.to_owned(), conn::FetchEnd::Lost)]
+        );
+        // Closed as lost: within the statement timeout plus 5 s, not later.
+        let now = std::time::SystemTime::now();
+        assert!(ledger.is_own_attach("app", 8, 40008, Some(now)));
+        assert!(!ledger.is_own_attach("app", 8, 40008, Some(now + Duration::from_secs(60))));
+    }
 }

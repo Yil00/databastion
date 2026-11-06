@@ -718,6 +718,155 @@ fn a_restart_right_after_a_check_finds_its_credits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The intermittent `e2e-firebird` failure of 2026-11-06 (CI run of PR
+/// #416 at `22dfbb9`: 5 events of `DATABASTION_AGENT` after the negative
+/// steps, none `*`, one object each). The agent is stopped (SIGTERM) while
+/// a check runs: the check's session registered and credited its
+/// statements after the stream's last checkpoint, the core drops the
+/// session (its statement in flight credited as lost, its attachment
+/// closed as lost, in memory only), and the write the session's end
+/// schedules on a blocking thread is cancelled with the runtime. The next
+/// process restores the checkpoint and a ledger without that attachment:
+/// the check's records are another client's, and its read of `SEC$USERS`
+/// (a credential relation, always reported) is an event of the agent's
+/// account. With the ledgers written at the stop
+/// ([`crate::own::persist_all`], the connector's `shutdown`), the records
+/// are the agent's own: no event, nothing ambiguous.
+/// `written_at_stop`: the port of the endpoint whose ledger the stop
+/// writes (the process's ledgers, as the connector has them); `None`: a
+/// ledger the stop does not write.
+fn stop_mid_check(name: &str, written_at_stop: Option<u16>) -> (Counts, CkptCounts, Vec<Emitted>) {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let dir = temp(name);
+    first_start(&dir);
+    let (head, opened) = now_head(3600);
+    let classes = || vec![catalog(&[], &[], &[])];
+    // The stream of the first process, with the endpoint's ledger: its last
+    // checkpoint is written before the check starts.
+    let ledger = written_at_stop.map_or_else(
+        || Arc::new(Ledger::default()),
+        |port| crate::own::ledger_for(std::net::SocketAddr::from(([127, 0, 0, 2], port))),
+    );
+    append(
+        &dir,
+        &attach("24:0x7f0000000300", 5, APP).replace(HEAD, &head),
+    );
+    let mut p = Proc::start_full(&dir, Arc::clone(&ledger), settings(), RUN, classes());
+    p.read();
+    p.spooled();
+    p.commit();
+    // The check: its attachment, a statement that ended, then the stop
+    // while the second waits for its rows.
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    ledger.credit_at(
+        APP,
+        3,
+        crate::sql::VERSION,
+        FetchAccount {
+            counted: 1,
+            requested: 64,
+            last: 64,
+            largest: 64,
+            end: FetchEnd::End,
+            ..FetchAccount::default()
+        },
+        opened,
+    );
+    ledger.credit_at(
+        APP,
+        3,
+        crate::sql::IDENTITY,
+        FetchAccount {
+            counted: 0,
+            requested: 64,
+            last: 64,
+            largest: 64,
+            end: FetchEnd::Lost,
+            ..FetchAccount::default()
+        },
+        opened,
+    );
+    // The session's `Drop` (no runtime here: the write is only scheduled
+    // with one, and the runtime's shutdown cancels it).
+    ledger.close(APP, 3, true, Duration::from_secs(5));
+    if written_at_stop.is_some() {
+        crate::own::persist_all();
+    }
+    drop(p);
+    // The server wrote the check's records, and the detach of the dropped
+    // connection.
+    let a = "24:0x7f0000000100";
+    append(
+        &dir,
+        &format!(
+            "{}{}{}{}",
+            attach_as(a, 3, AGENT),
+            stmt(
+                a,
+                3,
+                5,
+                AGENT,
+                crate::sql::VERSION,
+                1,
+                &[("RDB$DATABASE", 1)]
+            ),
+            stmt(
+                a,
+                3,
+                5,
+                AGENT,
+                crate::sql::IDENTITY,
+                1,
+                &[("RDB$DATABASE", 1), ("SEC$USERS", 1)]
+            ),
+            detach_as(&head, a, 3, AGENT),
+        )
+        .replace(HEAD, &head),
+    );
+    // The next process: a new, empty ledger.
+    let mut p = Proc::start_full(
+        &dir,
+        Arc::new(Ledger::default()),
+        settings(),
+        RUN,
+        classes(),
+    );
+    p.read();
+    let (c, k) = p.counts();
+    let out = std::mem::take(&mut p.out);
+    let _ = std::fs::remove_dir_all(&dir);
+    (c, k, out)
+}
+
+#[test]
+fn a_stop_in_the_middle_of_a_check_keeps_its_credits() {
+    let (c, k, out) = stop_mid_check("stopcheck", Some(1));
+    assert_eq!(k.restored, 1, "{k:?}");
+    assert!(out.is_empty(), "{:?}", objects(&out));
+    // Both statements (and the detach of the attachment) are its own.
+    assert!(c.own >= 2, "{c:?}");
+    assert_eq!(c.own_not_matched, 0, "{c:?}");
+    assert_eq!(c.ambiguous, 0, "{c:?}");
+}
+
+/// The same cut without the ledgers written at the stop: the behaviour
+/// of every stop before the fix (the failed CI run: an event of the
+/// agent's account, one object, not `*`), and still that of a kill
+/// (SIGKILL, a crash) in the middle of a check, the residual "a crash
+/// between two writes" of the implementation note of 2026-11-01.
+#[test]
+fn a_kill_in_the_middle_of_a_check_reports_its_records() {
+    let (c, k, out) = stop_mid_check("stopcheck-none", None);
+    assert_eq!(k.restored, 1, "the checkpoint itself is usable: {k:?}");
+    assert_eq!(c.own, 0, "{c:?}");
+    assert_eq!(c.ambiguous, 0, "not ambiguous: another client's records");
+    assert_eq!(objects(&out), ["SEC$USERS"]);
+    assert!(
+        out.iter()
+            .all(|(_, e)| e.principal().account_name() == AGENT)
+    );
+}
+
 /// A checkpoint of another server run (same pid, another start time),
 /// one sealed with another key or corrupted, and one of other declared
 /// databases are never used: the stream starts with no state.

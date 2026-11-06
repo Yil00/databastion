@@ -593,6 +593,11 @@ struct ScanQueue {
 /// Bound of one target's `check()` in a heartbeat.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound of the connectors' [`Connector::shutdown`] at a stop, all
+/// together (well within `docker stop`'s default 10 s and systemd's
+/// `TimeoutStopSec`).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How a heartbeat target check ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckOutcome {
@@ -864,17 +869,34 @@ impl Runtime {
     }
 
     async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
-        let heartbeat = self.heartbeat_loop(shutdown.clone());
-        let jobs = self.jobs_loop(shutdown.clone());
-        let scans = self.scan_loop(shutdown.clone());
-        let audits = self.audit_loop(shutdown.clone());
-        let spool = self.spool_loop(shutdown);
-        tokio::select! {
-            r = heartbeat => r,
-            r = jobs => r,
-            r = scans => r,
-            r = audits => r,
-            r = spool => r,
+        let result = {
+            let heartbeat = self.heartbeat_loop(shutdown.clone());
+            let jobs = self.jobs_loop(shutdown.clone());
+            let scans = self.scan_loop(shutdown.clone());
+            let audits = self.audit_loop(shutdown.clone());
+            let spool = self.spool_loop(shutdown);
+            tokio::select! {
+                r = heartbeat => r,
+                r = jobs => r,
+                r = scans => r,
+                r = audits => r,
+                r = spool => r,
+            }
+        };
+        // Every loop is dropped now, with the checks, scans and streams it
+        // was running (a check in progress included): the connectors write
+        // the state those left in memory before the runtime goes away
+        // (ADR-0060, the Firebird own-statement ledger).
+        self.shutdown_connectors().await;
+        result
+    }
+
+    /// [`Connector::shutdown`] of every connector, together, within
+    /// [`SHUTDOWN_TIMEOUT`].
+    async fn shutdown_connectors(&self) {
+        let all = futures_util::future::join_all(self.connectors.iter().map(|c| c.shutdown()));
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, all).await.is_err() {
+            tracing::warn!("connector shutdown not finished in time");
         }
     }
 
