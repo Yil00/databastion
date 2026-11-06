@@ -2351,7 +2351,7 @@ Item 2 is why a numeric-only proof is not enough in a container, even for a layo
 
 Each declared file is opened and checked on its handle before it is read, with the file rules of [ADR-0043](0043-audit-logs-opened-without-following-a-final-symlink.md) as the lot 3 code applies them (`read_checked`), plus rules of its own. Any failure fails the readers check with the reason `host_identity_refused` and the kind (`not_readable`, `links`, `changed`, `writable`, `owner`, `mode`, `mount`, `too_large`, `malformed`, `not_in_container`) in the local detail, never the path or the content.
 
-1. **Opened with `openat2` and `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`** (security review N1), so that no component of the path, the last included, is a symbolic link or a `/proc` magic link. A kernel without `openat2` (before 5.6) refuses the file (`not_readable`). The file is a regular file with **exactly one hard link**, and the path still names the handle after the checks (ADR-0043 decision 5).
+1. **Opened with `openat2` and `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`** (security review N1), so that no component of the path, the last included, is a symbolic link or a `/proc` magic link. A kernel without `openat2` (before 5.6) refuses the file (`not_readable`). *Changed by the maintainer on 2026-11-06: `ENOSYS` from `openat2` resolves the path through a component walk that follows no link, instead of refusing ([implementation note of 2026-11-06](#implementation-note-2026-11-06-the-openat2-fallback-decided-by-the-maintainer-416)).* The file is a regular file with **exactly one hard link**, and the path still names the handle after the checks (ADR-0043 decision 5).
 2. **On the bare host** (the agent's own `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, `/etc/subuid` and `/etc/subgid`, R47 and R48 item 4a), some distributions make a file a symbolic link (for example `/etc/nsswitch.conf` managed by authselect). Options (security review L4):
    - **(a) Follow a chain only when every link and every target is owned by uid 0, not group- or other-writable, and stays under `/etc`** (recommended). Each step is opened as in item 1, and the final file is checked under items 1, 3, 4, 6 and 7.
    - **(b) Refuse any symbolic link on the bare host too**: such a host proves no group and, under R47 item 3, may fail the check.
@@ -2576,7 +2576,7 @@ Recorded after the merge of the agent lot of the [refinement of 2026-10-31](#ref
 4. **nsswitch grammar.** In a bracketed action item, `[` may only be a token's first byte and `]` only its last byte; any other bracket, an unclosed item, or a source token with a character outside `[A-Za-z0-9_.-]` is `malformed` (fail closed).
 5. **mountinfo**: an empty source field (field 4 after `-`) is accepted, since some file systems show none; every other field must be present.
 6. **uid 0 as the server's uid** is exempt from R48 items 4 and 4a (root is always allowed); 65534, 4294967294 and 4294967295 are still refused.
-7. **Kernels.** Without `openat2` (before Linux 5.6) every identity file is refused (`not_readable`), on the bare host too. Without `STATX_MNT_ID` (before 5.8) a declared file is refused (`mount`). Without `STATX_MNT_ID_UNIQUE` (before 6.8) the mount id alone is used. This is safe because the open handle pins its mount, so its id cannot be reused while the check runs; the unique-id comparison of R45 item 5 is kept where available but cannot detect a reuse and does not need to.
+7. **Kernels.** Without `openat2` (before Linux 5.6) every identity file is refused (`not_readable`), on the bare host too. *Changed by the maintainer on 2026-11-06: `ENOSYS` from `openat2` now resolves through the no-link component walk ([implementation note of 2026-11-06](#implementation-note-2026-11-06-the-openat2-fallback-decided-by-the-maintainer-416)).* Without `STATX_MNT_ID` (before 5.8) a declared file is refused (`mount`). Without `STATX_MNT_ID_UNIQUE` (before 6.8) the mount id alone is used. This is safe because the open handle pins its mount, so its id cannot be reused while the check runs; the unique-id comparison of R45 item 5 is kept where available but cannot detect a reuse and does not need to.
 8. **Local detail format**: `host_identity_refused (<role>: <kind>)`, the role being `passwd`, `group`, `nsswitch`, `subuid`, `subgid`, `mountinfo` or `host_identity` (the block), never a path or content.
 9. **The `info` line** (R44 item 6) is written when a target's identity-file source changes (host files, declared files, none) and at the target's first check; it names the target and the source only.
 10. **A new reason, `log_directory_is_a_symlink`**: a log directory that is a symbolic link fails the readers check before the log itself is examined.
@@ -3047,3 +3047,32 @@ The flood is bounded by the console's per-target hourly cap and per-hour dedup (
 - The `e2e-firebird` run on the release head (release gate).
 - The maintainer may decide to raise R7's count bound (above).
 - A refinement for pooled external connections (R62) and the N7 split-poll case of services backups, unchanged.
+
+## Implementation note (2026-11-06): the `openat2` fallback, decided by the maintainer (#416)
+
+Recorded with #416 (branch `fix/p10-b-firebird-openat2-fallback`), security review finding F1 of #415; not released yet, as lot 3. **No protocol change, no new grant, no unit change.** The accepted text is unchanged except for dated annotations pointing here; where this note differs from it, this note applies. ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
+
+**Decision (maintainer, 2026-11-06).** When `openat2` answers `ENOSYS`, whether from a seccomp filter or from a kernel older than Linux 5.6 (not supported anyway), an identity file and its directories are resolved through a component walk that follows no link, instead of being refused. This changes the last sentence of R45 item 1 ("A kernel without `openat2` (before 5.6) refuses the file (`not_readable`)") and the first sentence of interpretation 7 ("Kernels") of the [implementation note of 2026-10-31 b](#implementation-note-2026-10-31-b-host-identity-files). What does not change:
+
+- no symbolic or magic link is followed anywhere in the path, on either path;
+- `ENOSYS` is the only trigger: every other error of `openat2` is returned unchanged;
+- the walk is tested for equivalence with `openat2` (below).
+
+**The cause.** The shipped unit, `deploy/deb/databastion-agent.service`, sets `RestrictSUIDSGID=yes`. systemd's seccomp filter for it answers `openat2` with `ENOSYS`, because it cannot inspect the mode inside `struct open_how`. The Firebird connector runs in the agent's process and opened its identity files (`host_identity.rs`) with `openat2` only. On a bare host under the unit, every check therefore refused `/etc/passwd` (local detail `host_identity_refused (passwd: not_readable)`). The readers check failed, the target reported a false `audit.log_readable_by_others`, and Audit never reached its best level. This failed closed (nothing was read that should not have been) and was never released. The same filter broke the SQLite reader's Landlock grant (#415, [ADR-0059 implementation note of 2026-11-06](0059-sqlite-connector.md#implementation-note-2026-11-06-415-and-416-the-reader-grant-without-openat2-and-the-platform-checks)); the review of #415 found the Firebird case (F1).
+
+**The fix** (#416). The walk added by #415 for the SQLite reader moves to `databastion_core::fs::open_no_links(path, flags)`, with `core::fs::DIRECTORY` for directory handles; the SQLite grant and the four Firebird call sites use it.
+
+- It calls `openat2` with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, and falls back to the walk only on `ENOSYS`.
+- The path is checked as text first, on both paths: a leading `/`, no trailing `/`, no empty, `.` or `..` segment; `EINVAL` otherwise.
+- The walk opens each intermediate component with `O_PATH | O_NOFOLLOW | O_CLOEXEC`, relative to the previous descriptor, and checks with `fstat` that it is a directory. It opens the last component relative to its parent with the caller's flags plus `O_NOFOLLOW`. A link before the last component gives `ELOOP`; a final link gives `ELOOP` for a read open or a directory handle, as `openat2` does.
+- Only read opens are allowed (no `O_CREAT`, `O_TMPFILE`, `O_TRUNC`, `O_APPEND`, `O_WRONLY` or `O_RDWR`; `EINVAL`).
+- The module logs nothing (I2): paths and errors are only returned to the caller, which maps them to its closed reasons.
+- R45 item 2's chain rules (option (a), interpretation 1 of the implementation note of 2026-10-31 b) are unchanged: each step of a root-owned `/etc` link chain is opened through `open_no_links`, and the final file is still checked under R45 items 1, 3, 4, 6 and 7.
+
+**Tests.**
+
+- A unit test compares the walk with `openat2` on every case, for the flag sets of both connectors.
+- A connector test runs the bare-host load and a readers check behind a seccomp filter that refuses `openat2` as systemd does, with the link, owner, mode and bound refusals.
+- The architecture rule `openat2_only_through_core_fs`: `openat2` appears only in `core::fs`, and that module uses no logging.
+- `e2e/firebird-unit.sh` ([e2e/README.md](../../e2e/README.md#firebird-identity-files-under-the-systemd-unit)), in the packaging job `deb-install` after `e2e/sqlite-unit.sh` (Debian 12 with systemd 252 and Ubuntu 24.04 with systemd 255, amd64 and arm64). Under the shipped unit it checks that `openat2` answers `ENOSYS`, that the bare-host identity files load from the real `/etc` under the production rules, that the readers check passes on a seeded log in the named-user ACL layout, and the chain rules. No Firebird server runs: the stand-in is the connector's test binary, built by the packaging job `firebird-unit-bin` and never packaged. What it does not prove: container detection is forced off for the readers check (the run is in a container), and the server process proof is replaced by the declared uid.
+

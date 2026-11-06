@@ -144,7 +144,7 @@ jobs:
           fi
           echo "e2e_firebird=$e2e_firebird" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
-              || grep -qE '^(agent/|console/|deploy/|e2e/sqlite-unit\.sh$|e2e/sqlite_unit_driver\.py$|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
+              || grep -qE '^(agent/|console/|deploy/|e2e/sqlite-unit\.sh$|e2e/sqlite_unit_driver\.py$|e2e/firebird-unit\.sh$|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
           else
             packaging=false
@@ -786,7 +786,7 @@ jobs:
           for t in "test sandbox_refusals ... ok" \
               "test sandbox_refusals_without_openat2 ... ok" \
               "test sandbox::tests::the_allow_list_refuses_everything_else ... ok" \
-              "test sandbox::tests::the_component_walk_resolves_as_openat2 ... ok" \
+              "test sandbox::tests::grant_opens_without_links ... ok" \
               "test the_reader_is_sandboxed_and_its_crashes_stay_its_own ... ok" \
               "test a_rollback_file_is_scanned_by_the_sandboxed_reader ... ok" \
               "test a_wal_file_is_read_while_another_process_writes_and_nothing_changes ... ok"; do
@@ -1247,7 +1247,7 @@ jobs:
           echo
       - name: shellcheck
         run: |
-          timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh e2e/sqlite-unit.sh
+          timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh e2e/sqlite-unit.sh e2e/firebird-unit.sh
           python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' e2e/sqlite_unit_driver.py
       - name: Unit tests of the I2 leak scanner
         run: timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v

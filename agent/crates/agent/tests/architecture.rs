@@ -1248,3 +1248,242 @@ fn the_agent_never_enables_sqlite_fuzzing() {
         }
     }
 }
+
+/// The code lines of a source before its test module: up to a
+/// `#[cfg(test)]` attribute whose item is `mod tests` (other attributes may
+/// stand between them). A bare `mod tests {` does not end the scan
+/// (security review L1 of #416).
+fn lines_before_cfg_test_mod(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = code_lines(text).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "#[cfg(test)]" {
+            let item = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty() && !l.starts_with("#["));
+            if item.is_some_and(|l| {
+                l.starts_with("mod tests ")
+                    || l.starts_with("mod tests{")
+                    || l.starts_with("mod tests;")
+                    || l.starts_with("pub(crate) mod tests ")
+            }) {
+                break;
+            }
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Every identifier-like token of `line` (`[A-Za-z0-9_]+`) that names
+/// `openat2` in any form: the call, a path (`fcntl::openat2`), an import
+/// or alias (`use rustix::fs::openat2 as o`, `let f = rustix::fs::openat2;`),
+/// the syscall number (`SYS_openat2`), whatever follows it.
+fn openat2_tokens(line: &str) -> usize {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| t.to_ascii_lowercase().contains("openat2"))
+        .count()
+}
+
+/// The attributes right above each `mod <name>;` / `#[path = …] mod …;`
+/// declaration of `file` in the crate's other sources, with the declaring
+/// file. Empty when `file` is declared nowhere (then it counts as not
+/// test-only).
+fn module_declarations(file: &Path, crate_sources: &[PathBuf]) -> Vec<(PathBuf, Vec<String>)> {
+    let stem = file.file_stem().unwrap().to_str().unwrap();
+    let dir = file.parent().unwrap();
+    let mut found = Vec::new();
+    for decl in crate_sources {
+        if decl == file {
+            continue;
+        }
+        let ddir = decl.parent().unwrap();
+        let dname = decl.file_stem().unwrap().to_str().unwrap();
+        // The directory where `decl`'s child modules live.
+        let children = if ["lib", "main", "mod"].contains(&dname) {
+            ddir.to_path_buf()
+        } else {
+            ddir.join(dname)
+        };
+        let text = fs::read_to_string(decl).unwrap();
+        let lines: Vec<&str> = code_lines(&text).map(str::trim).collect();
+        for (i, l) in lines.iter().enumerate() {
+            let item = l
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ");
+            let Some(rest) = item.strip_prefix("mod ") else {
+                continue;
+            };
+            let Some(module) = rest.strip_suffix(';') else {
+                continue;
+            };
+            let attrs: Vec<String> = lines[..i]
+                .iter()
+                .rev()
+                .take_while(|a| a.starts_with("#["))
+                .map(|a| (*a).to_owned())
+                .collect();
+            let path_attr = attrs
+                .iter()
+                .find_map(|a| a.strip_prefix("#[path = \"")?.strip_suffix("\"]"));
+            let declares = match path_attr {
+                Some(p) => ddir.join(p) == file,
+                None => module.trim() == stem && children == dir,
+            };
+            if declares {
+                found.push((decl.clone(), attrs));
+            }
+        }
+    }
+    found
+}
+
+/// Whether `file` is compiled for tests only: each of its declarations is
+/// under `#[cfg(test)]` (or `#[cfg(all(test, …))]`), or in a file that is
+/// itself test-only.
+fn declared_under_cfg_test(file: &Path, crate_sources: &[PathBuf], depth: usize) -> bool {
+    let decls = module_declarations(file, crate_sources);
+    !decls.is_empty()
+        && depth < 8
+        && decls.iter().all(|(decl, attrs)| {
+            attrs
+                .iter()
+                .any(|a| a == "#[cfg(test)]" || a.starts_with("#[cfg(all(test,"))
+                || declared_under_cfg_test(decl, crate_sources, depth + 1)
+        })
+}
+
+/// The `openat2` mentions of the agent's non-test code, per file.
+fn openat2_outside_tests() -> Vec<(String, String)> {
+    let mut by_crate: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> = Default::default();
+    let crates = workspace_root().join("crates");
+    for source in all_crate_sources() {
+        let krate = crates.join(source.strip_prefix(&crates).unwrap().iter().next().unwrap());
+        by_crate.entry(krate).or_default().push(source);
+    }
+    let mut found = Vec::new();
+    for (krate, sources) in &by_crate {
+        let src: Vec<PathBuf> = sources
+            .iter()
+            .filter(|p| p.starts_with(krate.join("src")))
+            .cloned()
+            .collect();
+        for source in sources {
+            // Integration tests are compiled as tests only.
+            if source.starts_with(krate.join("tests")) {
+                continue;
+            }
+            let shown = source.display().to_string();
+            let name = source.file_name().unwrap().to_str().unwrap();
+            let test_named =
+                name == "it.rs" || name.starts_with("it_") || name.ends_with("_tests.rs");
+            if test_named && declared_under_cfg_test(source, &src, 0) {
+                continue;
+            }
+            let text = fs::read_to_string(source).unwrap();
+            for l in lines_before_cfg_test_mod(&text) {
+                if openat2_tokens(l) > 0 {
+                    found.push((shown.clone(), l.trim().to_owned()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Security review F1 (the Firebird lot) and #415: every path opened with
+/// no symbolic link followed goes through `databastion_core::fs`, whose
+/// `open_no_links` falls back to a component walk where `openat2` answers
+/// `ENOSYS` (the agent's systemd unit, `RestrictSUIDSGID=yes`). Test code
+/// aside (a crate's `tests/`, a `#[cfg(test)] mod tests`, and `it.rs`,
+/// `it_*.rs` or `*_tests.rs` files only when declared under
+/// `#[cfg(test)]`), `openat2` is named in that module only, once, in any
+/// form (call, path, import, alias, syscall number; security review L1 of
+/// #416), and both the SQLite grant and the Firebird host identity files
+/// use it; the module logs and formats nothing (I2: it is handed paths of
+/// host files).
+#[test]
+fn openat2_only_through_core_fs() {
+    let core_fs = workspace_root().join("crates/core/src/fs.rs");
+    let found = openat2_outside_tests();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].0 == core_fs.display().to_string() && found[0].1 == "match rustix::fs::openat2(",
+        "openat2 outside core::fs: {found:?}"
+    );
+    for user in [
+        "crates/connector-sqlite/src/sandbox.rs",
+        "crates/connector-firebird/src/host_identity.rs",
+    ] {
+        let text = fs::read_to_string(workspace_root().join(user)).unwrap();
+        assert!(
+            code_lines(&text).any(|l| l.contains("databastion_core::fs::open_no_links(")),
+            "{user} does not use databastion_core::fs::open_no_links"
+        );
+    }
+    let text = fs::read_to_string(&core_fs).unwrap();
+    for l in lines_before_cfg_test_mod(&text) {
+        for banned in [
+            "tracing",
+            "log::",
+            "print",
+            "format!(",
+            "write!(",
+            "dbg!(",
+            "panic!(",
+            ".unwrap()",
+            ".expect(",
+        ] {
+            assert!(!l.contains(banned), "core/src/fs.rs: {banned} in {l}");
+        }
+    }
+}
+
+/// The helpers of [`openat2_only_through_core_fs`] on their own: every
+/// form of the name is seen, a bare `mod tests {` does not end the scan,
+/// and the known test-only files are recognized as such.
+#[test]
+fn openat2_rule_helpers() {
+    for l in [
+        "rustix::fs::openat2(CWD, p, f, m, r)",
+        "let f = rustix::fs::openat2;",
+        "use rustix::fs::openat2 as o;",
+        "use rustix::fs::{openat2, Mode};",
+        "nix::fcntl::openat2 (dirfd, p, how)",
+        "const N: i64 = libc::SYS_openat2;",
+        "let n = libc::SYS_OPENAT2;",
+    ] {
+        assert_eq!(openat2_tokens(l), 1, "{l}");
+    }
+    assert_eq!(openat2_tokens("rustix::fs::openat(CWD, p, f, m)"), 0);
+    let text = "fn a() {}\nmod tests {\nfn b() { openat2(); }\n}\n";
+    assert_eq!(lines_before_cfg_test_mod(text).len(), 4);
+    let text = "fn a() {}\n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\nfn b() {}\n}\n";
+    assert_eq!(lines_before_cfg_test_mod(text), ["fn a() {}"]);
+    let text = "#[cfg(test)]\nfn helper() {}\nfn c() {}\n";
+    assert_eq!(lines_before_cfg_test_mod(text).len(), 3);
+    let fb = workspace_root().join("crates/connector-firebird/src");
+    let mut src = Vec::new();
+    rust_sources(&fb, &mut src);
+    for test_only in [
+        "it.rs",
+        "it_unit.rs",
+        "it_host_identity.rs",
+        "host_identity_tests.rs",
+        "stream_tests.rs",
+    ] {
+        assert!(
+            declared_under_cfg_test(&fb.join(test_only), &src, 0),
+            "{test_only} is not seen as test-only"
+        );
+    }
+    for shipped in ["host_identity.rs", "fsread.rs", "lib.rs"] {
+        assert!(
+            !declared_under_cfg_test(&fb.join(shipped), &src, 0),
+            "{shipped} is seen as test-only"
+        );
+    }
+}

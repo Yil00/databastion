@@ -1066,6 +1066,12 @@ mod audit;
 #[path = "it_host_identity.rs"]
 mod host_identity;
 
+/// The bare-host identity load and the readers check under the shipped
+/// systemd unit, whose filter answers `ENOSYS` to `openat2`
+/// (`e2e/firebird-unit.sh`, security review F1).
+#[path = "it_unit.rs"]
+mod unit;
+
 /// A measurement: the agent's stream across a server rotation under the
 /// user guide's ACL layout (`dev/firebird/it.sh`, step 6).
 #[path = "it_rotation.rs"]
