@@ -34,9 +34,10 @@ pub const DIRECTORY: OFlags = OFlags::PATH.union(OFlags::DIRECTORY);
 /// component walk, with the same answers:
 ///
 /// - a symbolic link before the last component: `ELOOP`;
-/// - a symbolic link as the last component: the link itself when `flags`
-///   has both `O_PATH` and `O_NOFOLLOW` (the caller checks the handle's
-///   type), `ELOOP` otherwise (a read open, or [`DIRECTORY`]);
+/// - a symbolic link as the last component: with `O_DIRECTORY` and
+///   `O_NOFOLLOW`, `ENOTDIR`; otherwise the link itself when `flags` has
+///   both `O_PATH` and `O_NOFOLLOW` (the caller checks the handle's type),
+///   `ELOOP` in every other case (a read open, or [`DIRECTORY`]);
 /// - a component before the last that is not a directory, or the last one
 ///   with `O_DIRECTORY`: `ENOTDIR`;
 /// - every other error of the kernel, unchanged (`ENOENT`, `EACCES`…).
@@ -113,9 +114,13 @@ fn walk(names: &[&OsStr], flags: OFlags) -> Result<OwnedFd, Errno> {
         }
     }
     let fd = match rustix::fs::openat(&dir, *last, flags | OFlags::NOFOLLOW, Mode::empty()) {
-        // `O_DIRECTORY` is checked before `O_NOFOLLOW` (`ENOTDIR`, where
-        // `openat2` gives `ELOOP` for a link).
-        Err(Errno::NOTDIR) if flags.contains(OFlags::DIRECTORY) => {
+        // `O_DIRECTORY` is checked before `O_NOFOLLOW` (`ENOTDIR`). Where
+        // the caller did not ask for `O_NOFOLLOW`, `openat2` would follow a
+        // final link and refuses it (`ELOOP`); with `O_NOFOLLOW` it does not
+        // follow it and gives `ENOTDIR` too, unchanged here.
+        Err(Errno::NOTDIR)
+            if flags.contains(OFlags::DIRECTORY) && !flags.contains(OFlags::NOFOLLOW) =>
+        {
             return match rustix::fs::statat(&dir, *last, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
                     Err(Errno::LOOP)
@@ -174,7 +179,7 @@ mod tests {
     /// The flag sets of the callers: the SQLite grant (an `O_PATH` file
     /// that may be a final link, an `O_PATH` directory), the Firebird host
     /// identity files (a read open) and their directories.
-    fn flag_sets() -> [(&'static str, OFlags); 5] {
+    fn flag_sets() -> [(&'static str, OFlags); 7] {
         [
             ("sqlite file", OFlags::PATH | OFlags::NOFOLLOW),
             ("sqlite directory", OFlags::PATH | OFlags::DIRECTORY),
@@ -184,6 +189,16 @@ mod tests {
             ),
             ("directory handle", DIRECTORY),
             ("read directory", OFlags::RDONLY | OFlags::DIRECTORY),
+            // Security review L2 of #416: a final link with `O_NOFOLLOW`
+            // and `O_DIRECTORY` is `ENOTDIR` on both paths.
+            (
+                "directory handle, no follow",
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            ),
+            (
+                "read directory, no follow",
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            ),
         ]
     }
 
@@ -262,6 +277,15 @@ mod tests {
             Err(Errno::LOOP)
         );
         assert_eq!(id(walked(&dir.join("x.db"), DIRECTORY)), Err(Errno::NOTDIR));
+        for flags in [
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        ] {
+            for link in [dir.join("file-link"), base.join("dir-link")] {
+                assert_eq!(id(walked(&link, flags)), Err(Errno::NOTDIR), "{flags:?}");
+                assert_eq!(id(resolve(&link, flags)), Err(Errno::NOTDIR), "{flags:?}");
+            }
+        }
         // Not canonical: refused before any open, where `openat2` errors
         // (`/d/x.db/`: ENOTDIR) or normalizes (`/d/./x.db`, `/d//x.db`).
         let d = dir.to_str().unwrap();
