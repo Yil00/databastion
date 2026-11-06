@@ -144,7 +144,7 @@ jobs:
           fi
           echo "e2e_firebird=$e2e_firebird" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
-              || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
+              || grep -qE '^(agent/|console/|deploy/|e2e/sqlite-unit\.sh$|e2e/sqlite_unit_driver\.py$|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
           else
             packaging=false
@@ -718,12 +718,23 @@ jobs:
   # read-only bind mount, the writer in another process, a truncated -shm killing the reader and
   # never the agent) run as root, which they need to play the application's account, the agent's
   # account and the read-only mount; DATABASTION_IT_SQLITE_REQUIRE=1 makes them fail instead of
-  # skipping (no root, no Landlock). Required through ci-result.
+  # skipping (no root, no Landlock). Required through ci-result (a matrix job: ci-result sees one
+  # result, failed if any leg failed).
+  # Two legs (re-review N3 of P10-A): amd64 and arm64. The reader's seccomp allow-list is built per
+  # architecture (`target_arch` cfgs in connector-sqlite/src/sandbox.rs: the system call numbers,
+  # the audit architecture, `open` on x86_64 only, the x32 rule on x86_64 only), so the arm64 leg
+  # runs the same tests natively on an aarch64 runner kernel: the filter's own unit tests with the
+  # aarch64 audit architecture, tests/sandbox.rs (the sandbox applied for real, every refusal
+  # checked) and the reader-process tests (the reader starts, reads, and its crash stays its own).
   agent-sqlite:
-    name: Agent SQLite
+    name: Agent SQLite (${{ matrix.arch }})
     needs: detect
     if: needs.detect.outputs.agent == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 30
     defaults:
       run:
@@ -738,11 +749,20 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
-      - name: Kernel and Landlock
+      - name: Kernel, architecture and Landlock
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          uname -r
+          uname -rm
           cat /sys/kernel/security/lsm 2>/dev/null || true
           echo
+          case "$ARCH:$(uname -m)" in
+            amd64:x86_64 | arm64:aarch64) ;;
+            *) echo "::error::runner architecture $(uname -m) is not the leg's ($ARCH)"; exit 1 ;;
+          esac
+          # landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION): number 444 on both
+          # architectures (asm-generic and x86_64 tables agree from Linux 5.13).
+          python3 -I -c 'import ctypes, sys; libc = ctypes.CDLL(None, use_errno=True); abi = libc.syscall(444, None, 0, 1); print("Landlock ABI", abi if abi > 0 else "unavailable (errno %d)" % ctypes.get_errno()); sys.exit(0 if abi > 0 else 1)'
       - name: Connector tests (unit, property, in-process integration, the sandbox's refusals)
         env:
           # tests/sandbox.rs applies the reader's sandbox in a child process: it must run.
@@ -756,7 +776,22 @@ jobs:
           exe="$(timeout 1200 cargo test -p databastion-agent --test sqlite_reader --all-features --locked --no-run --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sqlite_reader" and .executable != null) | .executable')"
           test -x "$exe"
+          file "$exe"
           sudo env DATABASTION_IT_SQLITE_REQUIRE=1 timeout 600 "$exe" --test-threads 1 2>&1 | tee -a "$RUNNER_TEMP/it.log"
+      # Not skipped on this architecture: the sandbox applied for real (tests/sandbox.rs), the
+      # filter's unit test with this architecture's numbers, and the reader process started, read
+      # from and crashed without the agent.
+      - name: The sandbox tests ran on this architecture
+        run: |
+          for t in "test sandbox_refusals ... ok" \
+              "test sandbox_refusals_without_openat2 ... ok" \
+              "test sandbox::tests::the_allow_list_refuses_everything_else ... ok" \
+              "test sandbox::tests::the_component_walk_resolves_as_openat2 ... ok" \
+              "test the_reader_is_sandboxed_and_its_crashes_stay_its_own ... ok" \
+              "test a_rollback_file_is_scanned_by_the_sandboxed_reader ... ok" \
+              "test a_wal_file_is_read_while_another_process_writes_and_nothing_changes ... ok"; do
+            grep -qxF "$t" "$RUNNER_TEMP/it.log" || { echo "::error::not run: ${t}"; exit 1; }
+          done
       - name: Failure summary
         if: failure()
         run: |
@@ -1211,7 +1246,9 @@ jobs:
           cat /sys/kernel/security/lsm 2>/dev/null || true
           echo
       - name: shellcheck
-        run: timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh
+        run: |
+          timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh e2e/sqlite-unit.sh
+          python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' e2e/sqlite_unit_driver.py
       - name: Unit tests of the I2 leak scanner
         run: timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
       - name: Run e2e/sqlite.sh

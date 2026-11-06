@@ -10,6 +10,8 @@ name: Packaging
 # - deb-install:   installs each .deb in Debian 12 and Ubuntu 24.04 containers and checks users,
 #                  files, owners, modes, the systemd unit (systemd-analyze verify / security),
 #                  `--version`, reinstall, upgrade, remove and purge (deploy/deb/test-install.sh);
+#                  then, with systemd as PID 1, the SQLite reader under the unit's own sandbox
+#                  (e2e/sqlite-unit.sh);
 # - install-test:  smoke test of the console image (entrypoint, healthcheck script, as uid 10001),
 #                  then "Installation < 15 min" (ROADMAP phase 7): a fresh console + agent install on
 #                  the runner following deploy/README.md, timed up to the agent's first heartbeat
@@ -151,7 +153,7 @@ jobs:
         arch: [amd64, arm64]
         distro: [debian-12, ubuntu-24.04]
     runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -174,6 +176,36 @@ jobs:
           deb="$(cd "$RUNNER_TEMP/deb" && ls -- *.deb)"
           docker run --rm -v "$PWD/deploy/deb:/test:ro" -v "$RUNNER_TEMP/deb:/deb:ro" "$image" \
             /test/test-install.sh "/deb/$deb" "$EXPECTED"
+      # ROADMAP P10-A: the SQLite reader under the unit's own sandbox (e2e/sqlite-unit.sh). A
+      # throwaway privileged container of the same pinned image with systemd as PID 1 (Debian 12:
+      # systemd 252; Ubuntu 24.04: 255; the runner's kernel). The script installs the .deb and starts
+      # databastion-agent.service itself, ExecStart (and Restart) replaced by a drop-in under /run
+      # with the agent's stand-in (e2e/sqlite_unit_driver.py), every other property of the shipped
+      # unit kept: the reader must apply Landlock and its seccomp filter on top of the unit's, read a
+      # seeded file and exit 0. --privileged is for systemd as PID 1 (it turns Docker's seccomp
+      # profile off: Docker's default profile is the e2e-sqlite job's). No secret, no console.
+      - name: SQLite reader under the unit's own SystemCallFilter (systemd as PID 1)
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          image="$DEBIAN_IMAGE"; [ "$DISTRO" = ubuntu-24.04 ] && image="$UBUNTU_IMAGE"
+          deb="$(cd "$RUNNER_TEMP/deb" && ls -- *.deb)"
+          docker version --format 'Docker {{.Server.Version}}'
+          printf '%s\n' "FROM $image" \
+            "RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends systemd systemd-sysv python3 >/dev/null && rm -rf /var/lib/apt/lists/*" \
+            "STOPSIGNAL SIGRTMIN+3" 'CMD ["/sbin/init"]' \
+            | timeout 600 docker build -q -t "databastion-deb-systemd:$DISTRO" -
+          docker run -d --name "databastion-deb-systemd-$DISTRO" --privileged --cgroupns=private \
+            --tmpfs /run --tmpfs /run/lock -e container=docker \
+            -v "$PWD/e2e:/test:ro" -v "$RUNNER_TEMP/deb:/deb:ro" "databastion-deb-systemd:$DISTRO" >/dev/null
+          timeout 300 docker exec "databastion-deb-systemd-$DISTRO" /test/sqlite-unit.sh "/deb/$deb"
+      - name: Remove the systemd container
+        if: always()
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          docker rm -f "databastion-deb-systemd-$DISTRO" >/dev/null 2>&1 || true
+          docker rmi "databastion-deb-systemd:$DISTRO" >/dev/null 2>&1 || true
 
   install-test:
     name: Installation < 15 min (console + agent .deb)

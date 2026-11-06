@@ -19,6 +19,12 @@
 #     process mapping it): exactly one reader dies, its unit counted `skipped_error`, the agent
 #     keeps running, the scan succeeds, the target is readable again once the application
 #     restarted, and the next scan loses nothing.
+#   - The reader's sandbox under Docker's default seccomp profile (ROADMAP P10-A): the agent's
+#     container has no seccomp option (the daemon's built-in default profile applies, its filter seen
+#     on the agent process); the Landlock calls pass that profile (the ABI read in a container of the
+#     same options); a reader paused between two units of the paced scan has its own seccomp filter
+#     stacked on Docker's, and it had answered its open, which it does only once its Landlock
+#     ruleset is enforced and its filter applied (no fallback exists).
 #   - I2: no ground-truth value (names included) in the console database, the logs, the pages or the
 #     agent's state; no generated secret in any container log.
 # See e2e/README.md "SQLite targets". Requires: docker (compose v2.24+), openssl, curl, jq, python3.
@@ -109,6 +115,9 @@ truth_for() {
 # The application's log (every run of its container, restarts included), and its lines with TEXT.
 app_logs() { timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color target-sqlite 2>/dev/null || true; }
 app_log_count() { app_logs | grep -cF "$1" || true; }
+
+# status_of_pid PID FIELD: a field of /proc/PID/status (0444 even for a non-dumpable reader).
+status_of_pid() { sed -n "s/^$2:[[:space:]]*//p" "/proc/$1/status" 2>/dev/null; }
 
 # --------------------------------------------------------------------------- secrets, CA, agent.yaml
 console_secrets
@@ -206,6 +215,27 @@ timeout 60 docker compose "${COMPOSE_ARGS[@]}" up -d --no-deps agent
 docker inspect "$(compose ps -q agent)" | jq -e '.[0].HostConfig.ReadonlyRootfs == true
     and any(.[0].Mounts[]; .Destination == "/srv/sqlite" and .RW == false)' >/dev/null \
   || fail "the agent does not see the SQLite files read-only (or its root file system is writable)"
+# Docker's default seccomp profile (ROADMAP P10-A): no seccomp option on the agent's container (no
+# `seccomp=unconfined`, no custom profile), the daemon's default being its built-in profile, and
+# that profile's filter on the agent process (Seccomp mode 2, as many filters as the profile).
+log "Docker $(docker version --format '{{.Server.Version}}'), security options $(docker info --format '{{json .SecurityOptions}}')"
+docker inspect "$(compose ps -q agent)" | jq -e '[.[0].HostConfig.SecurityOpt[]? | select(startswith("seccomp"))] | length == 0' >/dev/null \
+  || fail "the agent's container sets a seccomp option: this run must use Docker's default profile"
+docker info --format '{{json .SecurityOptions}}' | grep -qE 'name=seccomp,profile=(builtin|default)"' \
+  || fail "the Docker daemon's default seccomp profile is not its built-in one"
+agent_pid="$(docker inspect -f '{{.State.Pid}}' "$(compose ps -q agent)")"
+[ "$(status_of_pid "$agent_pid" Seccomp)" = 2 ] || fail "the agent process runs without a seccomp filter (Seccomp $(status_of_pid "$agent_pid" Seccomp))"
+docker_filters="$(status_of_pid "$agent_pid" Seccomp_filters)"
+[ "${docker_filters:-0}" -ge 1 ] || fail "no seccomp filter counted on the agent process"
+# The Landlock ABI as a container with the agent's options sees it under the default profile:
+# landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION), number 444 on x86_64 and
+# aarch64. The reader requires ABI 1 and asks for the rest up to ABI 6 (best effort).
+abi="$(timeout 60 docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  --user 10001:10001 "$(sed -n 's/^x-python-image: &python-image \(.*\)$/\1/p' "$HERE/docker-compose.sqlite.yml")" \
+  python3 -I -c 'import ctypes; libc = ctypes.CDLL(None, use_errno=True); r = libc.syscall(444, None, 0, 1); print(r if r > 0 else "errno-%d" % ctypes.get_errno())')" \
+  || fail "cannot read the Landlock ABI in a container"
+[[ "$abi" =~ ^[0-9]+$ ]] || fail "landlock_create_ruleset under Docker's default seccomp profile: ${abi} (kernel $(uname -r))"
+log "Docker default seccomp profile: ${docker_filters} filter(s) on the agent; Landlock ABI ${abi} in a container (kernel $(uname -r))"
 # P10-E: the console lists engine.sqlite; without it the agent holds the targets' items (ADR-0042)
 # and this wait fails.
 specs=()
@@ -330,6 +360,27 @@ until [ "$(agent_log_count "sqlite catalog read" "$PACED_TARGET")" -gt "$catalog
   [ "$(date +%s)" -lt "$deadline" ] || fail "the scan of ${PACED_TARGET} did not read its catalog within 120 s"
   sleep 0.2
 done
+# The scan's reader, paused (SIGSTOP) between two units, so past its open: its sandbox on top of
+# Docker's profile. A reader answers its open only once its Landlock ruleset is enforced (ABI 1 at
+# least, a ruleset reported not enforced refused) and its seccomp filter applied; its filter is one
+# more than the agent's, NoNewPrivs set.
+# Paused for about 99 % of the scan (1 % duty cycle): a few looks at most.
+paused=0
+deadline=$(( $(date +%s) + 20 ))
+while :; do
+  for child in $(pgrep -P "$agent_pid" || true); do
+    [ "$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$child/status" 2>/dev/null)" = T ] || continue
+    [ "$(tr '\0' ' ' <"/proc/$child/cmdline" 2>/dev/null)" = "/proc/self/exe sqlite-reader " ] || continue
+    st="NoNewPrivs $(status_of_pid "$child" NoNewPrivs), Seccomp $(status_of_pid "$child" Seccomp), filters $(status_of_pid "$child" Seccomp_filters)"
+    [ "$st" = "NoNewPrivs 1, Seccomp 2, filters $(( docker_filters + 1 ))" ] \
+      || fail "the paused reader ${child}: ${st}, expected its own filter on Docker's ${docker_filters}"
+    paused=$(( paused + 1 ))
+  done
+  [ "$paused" -eq 0 ] || break
+  [ "$(date +%s)" -lt "$deadline" ] || fail "no paused reader of the scan of ${PACED_TARGET} found under the agent (pid ${agent_pid}) within 20 s"
+  sleep 0.1
+done
+log "reader sandbox: ${paused} paused reader(s), each with its own seccomp filter on Docker's ${docker_filters}, Landlock enforced (it opened)"
 compose exec -T target-sqlite python3 -I -B /opt/sqlite/build.py truncate-shm "${SQLITE_DIR}/${PACED_FILE}" >&2 \
   || fail "cannot truncate the -shm of ${PACED_FILE}"
 st="$(console_sql "SELECT status FROM jobs WHERE id = '$job_id'")"
