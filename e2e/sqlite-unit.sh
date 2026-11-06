@@ -122,7 +122,10 @@ EOF
 systemctl daemon-reload
 dropins="$(systemctl show -p DropInPaths --value "$UNIT")"
 [ "$dropins" = "$DROPIN" ] || fail "unexpected drop-ins for $UNIT: '${dropins}'"
-[ "$(systemctl show -p FragmentPath --value "$UNIT")" = "$UNIT_FILE" ] || fail "$UNIT is not loaded from $UNIT_FILE"
+# Debian 12's systemd 252 reports the unit under /lib (merged /usr): compare the resolved files.
+fragment="$(systemctl show -p FragmentPath --value "$UNIT")"
+[ -n "$fragment" ] && [ "$(readlink -f -- "$fragment")" = "$(readlink -f -- "$UNIT_FILE")" ] \
+  || fail "$UNIT is not loaded from $UNIT_FILE (FragmentPath: ${fragment:-none})"
 
 log "systemctl start $UNIT (the shipped unit, ExecStart, Restart and the output redirection replaced)"
 systemctl start "$UNIT" || true
