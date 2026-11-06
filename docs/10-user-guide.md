@@ -492,8 +492,60 @@ While a scan runs, the agent page shows the target's state from the last check b
 
 **Location exceptions are scoped to the target**: an exception with a location pattern covers SQLite findings only when it names both the agent id and the target. Without both, it still applies to the other engines but covers no SQLite target, and the console says so when you create it. To cover the same table and column names in every SQLite file of the exception's scope, tick the cross-target confirmation: the confirmation is recorded in the console audit log. Exceptions without a location (agent, target or classifier only) work as on other engines. SQLite names are compared with case, and trailing spaces count. Exceptions follow the target id, not the file: if you point a target at another file in `agent.yaml`, its exceptions now apply to the new file.
 
+### Firebird targets
+*On `dev`, not released yet (phase 10, [ADR-0060](adr/0060-firebird-connector.md)).* Firebird 4.0 and 5.0 are supported; 3.0 and 6.0 are refused. The agent needs a console that lists the `engine.firebird` capability. What Discovery reads: [08-engine-capabilities.md](08-engine-capabilities.md#firebird-discovery); the security model: [05-security.md](05-security.md#firebird-connector). Audit is set up in the [next section](#firebird-audit); no Firebird Audit level is stated yet.
+
+**Run the agent on the server's host, over loopback.** Firebird has no TLS, and its wire encryption protects neither the integrity of the connection nor the server's identity, so the agent connects only to `127.0.0.1` or `::1`. Declare the target:
+
+```yaml
+targets:
+  - id: app-fb
+    engine: firebird
+    host: 127.0.0.1                # or ::1; never a name, not even localhost (port: 3050 by default)
+    account: DATABASTION_AGENT
+    secret:
+      file: /etc/databastion/secrets/app-fb
+    firebird:
+      peer_uid: firebird           # the account that owns the server's sockets: a name, or a number
+      databases:
+        - name: app                # the label the console shows
+          attach: appdb            # a databases.conf alias (recommended) or an absolute path; never sent to the console
+      # tunnel: false              # true: a remote server through a tunnel you run (below)
+      # extended_grants: false     # true: the reader role holds SELECT_ANY_OBJECT_IN_DATABASE
+```
+
+- **`databases`**: the databases to scan, 1 to 64 per target; the agent never lists the server's databases. Prefer an **alias** in `attach`: the name you declare there travels **in clear on loopback**, before wire encryption starts (the server picks its per-database settings by that name), and so does the account name. Neither is sent to the console or logged.
+- **`peer_uid`**: before it sends anything, the agent checks that the server side of its connection belongs to this account, so that a local user who binds port 3050 while Firebird is down gets nothing. **When the agent runs in a container, give a number** (a name would be looked up in the agent image's own `/etc/passwd`). `0` (root) is refused unless `peer_uid_root: true`; do not use it: the official Firebird image runs the server as root, so run it as its own account instead (uid 84 in the image) and declare that uid. A wrong `peer_uid` shows as `target_unreachable`, with the reason in the agent's log.
+- **Containers: the network namespace.** The agent's container shares the server's network namespace (`network_mode: service:<firebird>` in Compose). **No other container may share that namespace unless every container in it drops `NET_RAW` and `NET_ADMIN`** (`cap_drop: [NET_RAW, NET_ADMIN]`): a process holding either there can capture or alter the agent's connection, guess its password offline from the capture and read the sampled values. Docker gives `NET_RAW` by default. On a plain host, only root holds them.
+- **A remote server: `tunnel: true`.** Run a TLS or WireGuard tunnel (stunnel, `ssh -L`, WireGuard) that ends on the agent host's loopback, declare its loopback end as `host` / `port`, set `tunnel: true` and set `peer_uid` to the tunnel process's account (required). The target then shows the permanent note `security.firebird_tunnel` (the tunnel's security is yours) and has no Audit. Without `tunnel: true`, a forwarder on loopback is detected and refused.
+
+**Server settings** (`firebird.conf`, and the database's entry in `databases.conf` if it sets them): `AuthServer` listing `Srp256`; `WireCrypt = Required`; `WireCryptPlugin` listing `ChaCha64` or `ChaCha`; and `RemoteBindAddress = 127.0.0.1` when no other client needs the network. The agent refuses a server without ChaCha wire encryption (`Arc4` is refused) or that asks for a login plugin other than `Srp256`. A wire-encryption failure is shown on the agent page as `check.stage_failed` with "wire encryption (stage_tls)".
+
+**The account.** Create a user with the `Srp` user manager and a **random password of at least 32 characters** (a process that impersonates the server gets one offline guess per candidate), then a reader role with `SELECT` on each table, granted as a default role:
+
+```sql
+CREATE USER DATABASTION_AGENT PASSWORD '<random, 32+ characters>' USING PLUGIN Srp;
+CREATE ROLE DATABASTION_READER;
+GRANT SELECT ON TABLE CUSTOMERS TO ROLE DATABASTION_READER;   -- one per table
+GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT;
+```
+
+A new table needs a new grant (`coverage.relations_without_select` lists the tables not covered). Never use `SYSDBA`, the database owner, `RDB$ADMIN` or a user mapped to them: the agent refuses to scan or audit with them (`privilege.refused`), and with the system privileges listed in [05-security.md](05-security.md#firebird-connector). Give each agent its own account. Details: [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only).
+
+**Notes you may see, and what to do**:
+
+| Note | What to do |
+|------|------------|
+| `check.stage_failed` with "wire encryption (stage_tls)" | Set `WireCrypt = Required` and list `ChaCha64` or `ChaCha` in `WireCryptPlugin` |
+| `privilege.refused` | Use a dedicated user with the reader role only, not `SYSDBA`, the owner, `RDB$ADMIN`, a mapped user or a refused system privilege |
+| `privilege.beyond_select`, `privilege.grant_option`, `privilege.owner_of_objects`, `privilege.global_privileges` | Remove the extra rights or ownership. A `credential_relation_readable` label caused only by a global authentication mapping is a known false report, being removed |
+| `coverage.relations_without_select` | Grant `SELECT` on the new tables to the reader role, or leave them out on purpose |
+| `coverage.external_file_tables`, `coverage.views_not_sampled`, `coverage.computed_columns_not_sampled` | Information: these objects are never read |
+| `security.login_event_trigger` | A database trigger runs at each of the agent's attachments or transactions; check that it writes nothing in an autonomous transaction |
+| `security.firebird_tunnel` | Expected with `tunnel: true` |
+
 ### Firebird Audit
-*On `dev`, not released yet (phase 10, [ADR-0060](adr/0060-firebird-connector.md), lot 3). The Firebird target itself (account, `databases`, `peer_uid`, loopback) is documented with P10-G; [`agent/agent.example.yaml`](../agent/agent.example.yaml) shows the block.* No Firebird Audit level is stated yet: it waits for the `e2e-firebird` gate (a green run of that CI job on the release head) and the 10 000-object schema measurement ([release gates](../RELEASE.md#open-release-gates)). What Audit sees and its limits: [08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit); the trust model: [05-security.md](05-security.md#firebird-audit-trace-log).
+*On `dev`, not released yet (phase 10, [ADR-0060](adr/0060-firebird-connector.md), lot 3). The Firebird target itself (account, `databases`, `peer_uid`, loopback) is in the [previous section](#firebird-targets); [`agent/agent.example.yaml`](../agent/agent.example.yaml) shows the block.* No Firebird Audit level is stated yet: it waits for the `e2e-firebird` gate (a green run of that CI job on the release head) and the other Firebird release gates ([release gates](../RELEASE.md#open-release-gates)). What Audit sees and its limits: [08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit); the trust model: [05-security.md](05-security.md#firebird-audit-trace-log).
 
 The agent reads the server's **system audit trace**, a text log the server writes on its host. Audit needs no database grant; it is refused for a target with `tunnel: true`. Add an `audit` block to the target's `firebird` block, with canonical absolute paths on the agent host:
 
@@ -572,7 +624,7 @@ A missing setting is shown as `audit.trace_settings_missing` with the setting's 
 - **The moved log still holds statement texts**: keep it with the same restrictions as the live log, or delete it.
 - DataBastion provides no tool that restores the ACL after a rotation by the server.
 
-**Agent restarts.** Keep `state_dir` on a persistent volume: the agent keeps its Firebird parser state there (`<target>.firebird_audit_trace.checkpoint` and `<target>.firebird_ledger.counters`, `0600`), so a restart recognizes the agent's own earlier reads and does not, by itself, make records ambiguous. The state is not used after a server restart, a host reboot, a change of the declared databases, or a log rotation while the agent was stopped. Then, as without `state_dir`, restarting the agent while the server is busy can make the first records it re-reads ambiguous, which keeps the target at Limited for up to 24 h (`audit.log_records_ambiguous`), and its own recent reads are reported as reads by the agent's account. A pending routine read restored from the state is reported as `*`, and a database whose schema changed, or that was restored, while the agent was stopped has its re-read reads reported as `*`. No read is hidden. **Exclude the agent's account from "every read" policies** on Firebird targets ([08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit)).
+**Agent restarts.** Keep `state_dir` on a persistent volume: the agent keeps its Firebird parser state there (`<target>.firebird_audit_trace.checkpoint` and `<target>.firebird_ledger.counters`, `0600`), so a restart recognizes the agent's own earlier reads and does not, by itself, make records ambiguous. A graceful stop (`systemctl stop`, `docker stop`) during a check keeps that check's reads the agent's own (#418); a kill (SIGKILL, the OOM killer) during a check can report them as reads by the agent's account, or make one of them ambiguous. The state is not used after a server restart, a host reboot, a change of the declared databases, or a log rotation while the agent was stopped. Then, as without `state_dir`, restarting the agent while the server is busy can make the first records it re-reads ambiguous, which keeps the target at Limited for up to 24 h (`audit.log_records_ambiguous`), and its own recent reads are reported as reads by the agent's account. A pending routine read restored from the state is reported as `*`, and a database whose schema changed, or that was restored, while the agent was stopped has its re-read reads reported as `*`. No read is hidden. **Exclude the agent's account from "every read" policies** on Firebird targets ([08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit)).
 
 **One account per agent.** Each agent recognizes only its own statements in the trace. If two agent processes use the same Firebird account (two agents, or a test agent beside the production one), each reports the other's reads as reads by that account. Give each agent its own Firebird account.
 
@@ -595,6 +647,7 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | Microsoft SQL Server (since 0.8.0) | SQL login with `CHECK_POLICY = ON`, a database user and `SELECT` per schema in each monitored database; database `VIEW DEFINITION` too with the row-level security opt-in, or Discovery samples nothing; never `sysadmin`, `db_owner` or the other refused rights | Only where Audit runs. SQL Server Audit (2022+): `VIEW SERVER SECURITY AUDIT` and `VIEW ANY SECURITY DEFINITION`. Extended Events: `VIEW SERVER STATE` (2019) or `VIEW SERVER PERFORMANCE STATE` (2022+), which expose every statement text on the server. Never `VIEW SERVER SECURITY STATE` or `CONTROL SERVER` | [ADR-0051](adr/0051-sqlserver-connector.md), [section 6](#microsoft-sql-server-targets), [05-security.md](05-security.md#microsoft-sql-server-connector) |
 | Redis / Valkey (since 0.8.0) | ACL user: `-@all` plus `select`, `scan`, `type`, `getrange`, `hrandfield`, `hstrlen`, `hmget`, `srandmember`, `zrandmember`, `lrange`, `xrevrange`, `info`, `acl\|dryrun`, on `%R~*` or the declared patterns, `resetchannels`; never `default` | `slowlog\|get`, `acl\|log`, `client\|list` (Valkey 8.1+: `commandlog\|get`) | [ADR-0052](adr/0052-redis-valkey-connector.md), [05-security.md](05-security.md#redis--valkey-connector) |
 | SQLite (on `dev`, not released yet) | no account: the file `0640` and its directory `2750` readable through the agent's group, never writable, on a file system mounted read-only for the agent | none (Discovery only) | [ADR-0059](adr/0059-sqlite-connector.md), [section 6](#sqlite-targets), [05-security.md](05-security.md#sqlite-connector) |
+| Firebird (on `dev`, not released yet) | a user of the security database (`Srp` user manager, random password of 32+ characters) with a reader role holding `SELECT` per table, granted `DEFAULT`; never `SYSDBA`, the owner or `RDB$ADMIN`; loopback only | no grant: the system audit trace log readable by the agent through a named-user ACL | [ADR-0060](adr/0060-firebird-connector.md), [section 6](#firebird-targets), [05-security.md](05-security.md#firebird-connector) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.
