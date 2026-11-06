@@ -210,23 +210,38 @@ fn open_path(path: &Path, directory: bool) -> Result<OwnedFd, rustix::io::Errno>
 /// (`O_PATH | O_NOFOLLOW` opens the link itself, which [`Grant::verify`]
 /// then refuses: it is not a regular file); a component before the last,
 /// or the last when `directory`, that is not a directory with `ENOTDIR`.
-/// The path is canonical (`files::check_ancestors` ran first): a `.` or
-/// `..` component, or a relative path, is refused with `EINVAL`.
+/// The path must be canonical (`files::check_ancestors` ran first), and
+/// its text is checked, not `Path::components()` (which drops an interior
+/// `.`, a repeated `/` and a trailing `/`): a path that does not start with
+/// `/`, ends with `/`, or has an empty, `.` or `..` segment is refused with
+/// `EINVAL` before any open ([`grant_failure`]: `Rule::NotCanonical`).
 fn open_path_walk(path: &Path, directory: bool) -> Result<OwnedFd, rustix::io::Errno> {
     use rustix::fs::FileType;
-    use std::path::Component;
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
+    use std::os::unix::ffi::OsStrExt;
+    let text = path.as_os_str().as_bytes();
+    let Some(rest) = text.strip_prefix(b"/") else {
+        return Err(rustix::io::Errno::INVAL);
+    };
+    let names: Vec<&[u8]> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split(|b| *b == b'/').collect()
+    };
+    if names
+        .iter()
+        .any(|n| n.is_empty() || *n == b"." || *n == b"..")
+    {
         return Err(rustix::io::Errno::INVAL);
     }
     let flags = OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW;
     let mut current = rustix::fs::open("/", flags | OFlags::DIRECTORY, Mode::empty())?;
-    let names: Vec<Component<'_>> = components.collect();
-    for (i, component) in names.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            return Err(rustix::io::Errno::INVAL);
-        };
-        let next = rustix::fs::openat(&current, *name, flags, Mode::empty())?;
+    for (i, name) in names.iter().enumerate() {
+        let next = rustix::fs::openat(
+            &current,
+            std::ffi::OsStr::from_bytes(name),
+            flags,
+            Mode::empty(),
+        )?;
         let kind = FileType::from_raw_mode(rustix::fs::fstat(&next)?.st_mode);
         let last = i + 1 == names.len();
         if kind == FileType::Symlink {
@@ -251,6 +266,9 @@ fn grant_failure(e: rustix::io::Errno) -> Failure {
             Failure::rule(Code::PathRefused, Rule::SymlinkComponent)
         }
         rustix::io::Errno::NOTDIR => Failure::rule(Code::PathRefused, Rule::NotDirectory),
+        // Only the component walk gives EINVAL (a path that is not
+        // canonical): `openat2` is called with fixed, valid flags.
+        rustix::io::Errno::INVAL => Failure::rule(Code::PathRefused, Rule::NotCanonical),
         _ => Failure::new(Code::SandboxUnavailable),
     }
 }
@@ -846,14 +864,37 @@ mod tests {
             rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&link).unwrap().st_mode),
             rustix::fs::FileType::Symlink
         );
-        // Not canonical: refused before any open.
-        for path in ["relative/x.db", "/srv/../etc/x.db"] {
+        // Not canonical: refused before any open, where `openat2` errors
+        // (`/d/x.db/`: ENOTDIR) or normalizes (`/d/./x.db`, `/d//x.db`).
+        let d = dir.to_str().unwrap();
+        for (path, directory) in [
+            ("relative/x.db".to_owned(), false),
+            ("/srv/../etc/x.db".to_owned(), false),
+            (format!("{d}/./x.db"), false),
+            (format!("{d}//x.db"), false),
+            (format!("{d}/x.db/"), false),
+            (format!("{d}/"), true),
+            (format!("{d}/."), true),
+        ] {
+            let resolved = id(resolve(Path::new(&path), directory));
             assert_eq!(
-                id(open_path_walk(Path::new(path), false)),
+                id(open_path_walk(Path::new(&path), directory)),
                 Err(rustix::io::Errno::INVAL),
-                "{path}"
+                "{path} (openat2: {resolved:?})"
             );
         }
+        assert_eq!(
+            id(resolve(Path::new(&format!("{d}/x.db/")), false)),
+            Err(rustix::io::Errno::NOTDIR)
+        );
+        assert_eq!(
+            grant_failure(rustix::io::Errno::INVAL).rule,
+            Some(Rule::NotCanonical)
+        );
+        assert_eq!(
+            grant_failure(rustix::io::Errno::INVAL).code,
+            Code::PathRefused
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

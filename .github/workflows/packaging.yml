@@ -179,11 +179,17 @@ jobs:
       # ROADMAP P10-A: the SQLite reader under the unit's own sandbox (e2e/sqlite-unit.sh). A
       # throwaway privileged container of the same pinned image with systemd as PID 1 (Debian 12:
       # systemd 252; Ubuntu 24.04: 255; the runner's kernel). The script installs the .deb and starts
-      # databastion-agent.service itself, ExecStart (and Restart) replaced by a drop-in under /run
+      # databastion-agent.service itself, ExecStart, Restart and the output redirection replaced by a
+      # drop-in under /run
       # with the agent's stand-in (e2e/sqlite_unit_driver.py), every other property of the shipped
       # unit kept: the reader must apply Landlock and its seccomp filter on top of the unit's, read a
       # seeded file and exit 0. --privileged is for systemd as PID 1 (it turns Docker's seccomp
       # profile off: Docker's default profile is the e2e-sqlite job's). No secret, no console.
+      # The test image's apt packages (systemd, systemd-sysv, python3) are not pinned to versions,
+      # as in deploy/deb/test-install.sh: the base image is pinned by digest, apt verifies the
+      # archive signatures, and the distribution archives drop superseded versions (a security
+      # update would break a pinned version on a release run, publish.yml included). They are the
+      # test harness only: nothing from them goes into the .deb under test or any release asset.
       - name: SQLite reader under the unit's own SystemCallFilter (systemd as PID 1)
         env:
           DISTRO: ${{ matrix.distro }}

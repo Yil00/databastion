@@ -11,7 +11,8 @@
 # .deb if given (otherwise databastion-agent must be installed), seeds a small SQLite file
 # (root:databastion 0640 in a 0750 directory under /srv, read-only for the unit through
 # ProtectSystem=strict), and starts databastion-agent.service itself with a drop-in under /run that
-# replaces ExecStart (and Restart) only: every other property of
+# replaces ExecStart, Restart and the output redirection (StandardOutput, StandardError) only:
+# every other property of
 # /usr/lib/systemd/system/databastion-agent.service applies, its SystemCallFilter lines included.
 # ExecStart is e2e/sqlite_unit_driver.py, the agent's stand-in, which starts the installed binary's
 # reader mode as the agent does and drives one unit of work (open, catalog, sample, close).
@@ -123,7 +124,7 @@ dropins="$(systemctl show -p DropInPaths --value "$UNIT")"
 [ "$dropins" = "$DROPIN" ] || fail "unexpected drop-ins for $UNIT: '${dropins}'"
 [ "$(systemctl show -p FragmentPath --value "$UNIT")" = "$UNIT_FILE" ] || fail "$UNIT is not loaded from $UNIT_FILE"
 
-log "systemctl start $UNIT (the shipped unit, ExecStart replaced)"
+log "systemctl start $UNIT (the shipped unit, ExecStart, Restart and the output redirection replaced)"
 systemctl start "$UNIT" || true
 deadline=$(( $(date +%s) + 60 ))
 while :; do

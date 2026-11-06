@@ -837,12 +837,16 @@ allow what the reader needs"). [`sqlite-unit.sh`](sqlite-unit.sh), run as root w
 PID 1, installs the agent `.deb` (if given), seeds a small rollback-journal file
 (`root:databastion 0640` in a `0750` directory under `/srv`, read-only for the unit through
 `ProtectSystem=strict`) and starts `databastion-agent.service` itself, with a drop-in under `/run`
-that replaces `ExecStart` (and `Restart`) only: every other property of the shipped
+that replaces `ExecStart`, `Restart` and the output redirection (`StandardOutput`,
+`StandardError`) only: every other property of the shipped
 [`databastion-agent.service`](../deploy/deb/databastion-agent.service) applies, its
 `SystemCallFilter` lines included. `ExecStart` is [`sqlite_unit_driver.py`](sqlite_unit_driver.py),
-the agent's stand-in: it checks the unit's filter is in effect (`bind()` refused with `EPERM`),
-starts the installed binary's reader mode as the agent does (`posix_spawn`, the mode as its only
-argument, an empty environment, one end of a socket pair as its standard input) and drives one unit
+the agent's stand-in: it checks the unit's filter is in effect (`bind()` refused with `EPERM`) and
+answers `openat2` with `ENOSYS` (`RestrictSUIDSGID=yes`, so the reader's grant is built by its
+component walk), starts the installed binary's reader mode as the agent does (`posix_spawn`, the
+mode as its only argument, `argv[0]` `/proc/self/exe` as the agent gives it, though the file
+executed is `/usr/bin/databastion-agent`, the same binary, since the stand-in is Python; an empty
+environment, one end of a socket pair as its standard input) and drives one unit
 of work over the reader's IPC: open (the reader's seccomp filter must stack on the unit's: one
 filter more), catalog (the seeded table), a sample of 10 rows (no value printed), close; the reader
 must exit 0 and the unit end `Result=success`. The script also checks the unit's filter as this

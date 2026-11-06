@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """The agent's stand-in under the shipped systemd unit (e2e/sqlite-unit.sh, ROADMAP P10-A).
 
-Run by e2e/sqlite-unit.sh as the unit's ExecStart (a drop-in under /run replaces ExecStart and
-Restart only), so this process has every sandbox property of
+Run by e2e/sqlite-unit.sh as the unit's ExecStart (a drop-in under /run replaces ExecStart,
+Restart and the output redirection only), so this process has every sandbox property of
 deploy/deb/databastion-agent.service: User=databastion, NoNewPrivileges, ProtectSystem=strict,
 RestrictAddressFamilies, RestrictNamespaces, MemoryDenyWriteExecute, SystemCallFilter (with
 SystemCallErrorNumber=EPERM), and the rest. It starts the installed binary's SQLite reader the way
 the agent does (ADR-0059 decision 4: posix_spawn of the binary with the mode as its only argument,
+argv[0] `/proc/self/exe` as process.rs gives it (the agent executes `/proc/self/exe`, which is
+itself; this process is Python, so it executes /usr/bin/databastion-agent, the same file),
 an empty environment, one end of a Unix socket pair as its standard input, /dev/null as its output),
 then drives it over the reader's IPC (agent/crates/connector-sqlite/src/ipc.rs) through a whole
 unit of work: open, catalog, one sample, close.
 
 Proves, on this system's systemd and kernel:
-  - the unit's own filter is in effect here (bind() refused with EPERM, Seccomp mode 2);
+  - the unit's own filter is in effect here (bind() refused with EPERM, Seccomp mode 2), and it
+    answers ENOSYS to openat2 (RestrictSUIDSGID=yes), so the reader's grant is built by its
+    component walk, not by openat2;
   - the reader inherits it (same filter count before its open) and stacks its own seccomp filter on
     top of it (one more filter after its open, Landlock applied: the reader answers `opened` only
     once its Landlock ruleset is enforced, its filter applied and its self-check passed; there is
@@ -24,6 +28,7 @@ Proves, on this system's systemd and kernel:
 Prints `sqlite-unit-check-ok ...` on success; exits 1 with a reason otherwise. Standard library only.
 """
 
+import ctypes
 import os
 import socket
 import struct
@@ -133,10 +138,25 @@ def main():
     finally:
         s.close()
 
+    # openat2(AT_FDCWD, "/", {O_PATH}, 24): number 437 on x86_64 and aarch64. Under the unit
+    # (RestrictSUIDSGID=yes) it must answer ENOSYS: the reader then builds its grant by its
+    # component walk, which is what this check exercises.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    how = ctypes.create_string_buffer(struct.pack("=QQQ", 0o10000000, 0, 0))
+    r = libc.syscall(ctypes.c_long(437), ctypes.c_int(-100), b"/", how, ctypes.c_size_t(24))
+    err = ctypes.get_errno()
+    if r >= 0:
+        os.close(r)
+        fail("openat2 is allowed under the unit: the reader's component walk is not exercised "
+             "(RestrictSUIDSGID=yes no longer refuses openat2 with ENOSYS?)")
+    if err != 38:
+        fail("openat2 under the unit answered errno %d, expected ENOSYS (38)" % err)
+
     agent, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     devnull = os.open("/dev/null", os.O_RDWR)
     pid = os.posix_spawn(
-        READER, [READER, "sqlite-reader"], {},
+        READER, ["/proc/self/exe", "sqlite-reader"], {},
         file_actions=[
             (os.POSIX_SPAWN_DUP2, reader.fileno(), 0),
             (os.POSIX_SPAWN_DUP2, devnull, 1),
@@ -206,7 +226,7 @@ def main():
         fail("the reader was killed by signal %d" % os.WTERMSIG(wstatus))
     if os.waitstatus_to_exitcode(wstatus) != 0:
         fail("the reader exited %d" % os.waitstatus_to_exitcode(wstatus))
-    print("sqlite-unit-check-ok seccomp filters: unit %d, reader %d; catalog %d object(s); %d row(s) sampled"
+    print("sqlite-unit-check-ok openat2 ENOSYS (component walk); seccomp filters: unit %d, reader %d; catalog %d object(s); %d row(s) sampled"
           % (unit_filters, unit_filters + 1, len(names), ROWS), flush=True)
 
 
