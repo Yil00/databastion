@@ -242,6 +242,61 @@ fn joined_with_value(input: &str, value: &str, at: usize) -> Vec<usize> {
         .collect()
 }
 
+/// The words of `pre` and `post` (around the refused `value`, joined with
+/// dots into the input) that `out` should keep and does not: words of
+/// non-hexadecimal letters (first names excepted), unless `out` is `*` or
+/// the word and the value together are one detected value
+/// ([`joined_with_value`]). The value takes `value.split('.')` parts of the
+/// input, so a word of `post` at index `i` of `pre ++ post` is part
+/// `i + n` (security review L1 of #420).
+fn lost_words(pre: &[String], value: &str, post: &[String], out: &str) -> Vec<String> {
+    let input = pre
+        .iter()
+        .map(String::as_str)
+        .chain([value])
+        .chain(post.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".");
+    let n = value.split('.').count();
+    let joined = joined_with_value(&input, value, pre.len());
+    pre.iter()
+        .chain(post)
+        .enumerate()
+        .filter(|(i, w)| {
+            let part = if *i < pre.len() { *i } else { *i + n };
+            out != "*"
+                && w.chars().all(|c| ('g'..='z').contains(&c))
+                && !names::segment_looks_like_value(w)
+                && !joined.contains(&part)
+        })
+        .map(|(_, w)| w)
+        .filter(|w| {
+            !out.split('.')
+                .any(|s| s.trim_end_matches("[]") == w.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Security review L1 of #420: with a value of three parts, an ordinary
+/// word after it is checked (it was excused when the oracle counted the
+/// value as one part), and one the detector joins to the value is not.
+#[test]
+fn the_oracle_counts_every_part_of_a_dotted_value() {
+    let v = "be45.f207.2c8b";
+    let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // Kept by the agent: nothing lost.
+    let post = words(&["txyz", "gg"]);
+    let out = normalize_path("be45.f207.2c8b.txyz.gg");
+    assert!(lost_words(&[], v, &post, out.as_str()).is_empty());
+    // An output that dropped the ordinary word is caught.
+    assert_eq!(lost_words(&[], v, &post, "*.gg"), ["txyz"]);
+    // Before the value too.
+    assert_eq!(lost_words(&words(&["mmm"]), v, &post, "*.txyz.gg"), ["mmm"]);
+    // The word that completes an IBAN with the value is excused.
+    assert!(lost_words(&[], v, &words(&["txyy", "gg"]), "*.gg").is_empty());
+}
+
 /// The CI failure on #419: `txyy` after the dotted MAC `be45.f207.2c8b`
 /// completes `BE45 F207 2C8B TXYY`, an IBAN whose check digits hold
 /// (country length and mod 97, the classifier's rule). The whole IBAN is a
@@ -441,15 +496,8 @@ proptest! {
             // and the value together are one detected value (an IBAN read
             // across the dots: masking the word too is fail closed, keeping
             // it would send part of the value).
-            let joined = joined_with_value(&input, &value, pre.len());
-            for w in pre.iter().chain(&post).enumerate().filter(|(i, w)| {
-                out != "*"
-                    && w.chars().all(|c| ('g'..='z').contains(&c))
-                    && !names::segment_looks_like_value(w)
-                    && !joined.contains(&(if *i < pre.len() { *i } else { *i + 1 }))
-            }).map(|(_, w)| w) {
-                prop_assert!(out.split('.').any(|s| s.trim_end_matches("[]") == w), "{:?} -> {:?} lost {:?}", input, out, w);
-            }
+            let lost = lost_words(&pre, &value, &post, out);
+            prop_assert!(lost.is_empty(), "{:?} -> {:?} lost {:?}", input, out, lost);
         }
         let dn = normalize_ldap_dn(&format!("uid=x,ou={value},dc=example"));
         // `+` makes an RDN multi-valued: the whole DN is `*`.
