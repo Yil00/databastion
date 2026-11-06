@@ -1218,14 +1218,21 @@ fn it_settings() -> Settings {
 /// The server's log and the ledger of the agent's own reads that wrote
 /// part of it (`dev/firebird/it.sh`: the R20 matrix phase), and the state
 /// directory of the restart test; `None` outside it.sh.
+#[allow(clippy::print_stderr)]
 fn it_inputs() -> Option<(Vec<u8>, String, std::path::PathBuf)> {
-    if std::env::var("DATABASTION_IT_FIREBIRD").as_deref() != Ok("1") {
-        return None;
+    let inputs = (|| {
+        if std::env::var("DATABASTION_IT_FIREBIRD").as_deref() != Ok("1") {
+            return None;
+        }
+        let log = std::fs::read(std::env::var("FIREBIRD_IT_AUDIT_LOG").ok()?).ok()?;
+        let dump = std::fs::read_to_string(std::env::var("FIREBIRD_IT_MATRIX_FILE").ok()?).ok()?;
+        let dir = std::path::PathBuf::from(std::env::var("FIREBIRD_IT_RESTART_DIR").ok()?);
+        Some((log, dump, dir))
+    })();
+    if inputs.is_none() {
+        eprintln!("skipped: not the restart phase of dev/firebird/it.sh");
     }
-    let log = std::fs::read(std::env::var("FIREBIRD_IT_AUDIT_LOG").ok()?).ok()?;
-    let dump = std::fs::read_to_string(std::env::var("FIREBIRD_IT_MATRIX_FILE").ok()?).ok()?;
-    let dir = std::path::PathBuf::from(std::env::var("FIREBIRD_IT_RESTART_DIR").ok()?);
-    Some((log, dump, dir))
+    inputs
 }
 
 /// The run of the server's log (the pid of its headers; a fixed start
