@@ -699,7 +699,7 @@ fn an_ambiguous_failed_attach_never_sends_the_user_name() {
 #[test]
 fn own_transaction_records_and_folds_keep_their_relations() {
     let l = Arc::new(Ledger::default());
-    l.register(APP, 3, 40003, 24);
+    l.register(APP, 3, 40003, 24, std::time::SystemTime::now());
     let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&l));
     m.confirm_run(Run {
         pid: 24,
@@ -1247,7 +1247,7 @@ fn a_panicking_record_is_isolated_and_loud() {
 fn an_ambiguous_own_text_never_consumes_a_credit() {
     use crate::conn::{FetchAccount, FetchEnd};
     let ledger = Arc::new(Ledger::default());
-    ledger.register(APP, 3, 40003, 24);
+    ledger.register(APP, 3, 40003, 24, std::time::SystemTime::now());
     let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
     let cat = Cat;
     let cats: [&dyn Catalog; 1] = [&cat];

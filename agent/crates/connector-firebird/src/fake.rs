@@ -112,6 +112,10 @@ pub(crate) struct Script {
     pub(crate) late_cancel: bool,
     /// The stale cancel meets the next `DSQL_drop` (`isc_cancelled`).
     pub(crate) cancel_hits_drop: bool,
+    /// The statement type of every describe answer, instead of the real
+    /// server's (`isc_info_sql_stmt_select` for a `SELECT`,
+    /// `isc_info_sql_stmt_ddl` for the session-management statement).
+    pub(crate) stmt_type: Option<i32>,
 }
 
 impl Default for Script {
@@ -128,6 +132,7 @@ impl Default for Script {
             fetch_delay: None,
             late_cancel: false,
             cancel_hits_drop: false,
+            stmt_type: None,
         }
     }
 }
@@ -210,15 +215,15 @@ fn cond_accept(
     w.as_slice().to_vec()
 }
 
-/// A describe answer for `columns`.
-pub(crate) fn describe(columns: &[Column]) -> Vec<u8> {
+/// A describe answer for `columns` with the statement type `stmt_type`.
+pub(crate) fn describe_typed(columns: &[Column], stmt_type: i32) -> Vec<u8> {
     let mut out = Vec::new();
     let val = |out: &mut Vec<u8>, item: u8, v: i32| {
         out.push(item);
         out.extend_from_slice(&4u16.to_le_bytes());
         out.extend_from_slice(&v.to_le_bytes());
     };
-    val(&mut out, 21, 1);
+    val(&mut out, 21, stmt_type);
     out.push(4);
     val(&mut out, 7, i32::try_from(columns.len()).unwrap());
     for (i, c) in columns.iter().enumerate() {
@@ -580,7 +585,11 @@ pub(crate) async fn serve(io: DuplexStream, script: Script) -> Seen {
                     Some(c) => {
                         prepared = Some(c.clone());
                         cursor = 0;
-                        response(0, &describe(&c.columns), None)
+                        // As Firebird 4.0 and 5.0 type them (`dsql.cpp`):
+                        // session management is `isc_info_sql_stmt_ddl`.
+                        let real = if c.text.starts_with("SELECT ") { 1 } else { 5 };
+                        let t = script.stmt_type.unwrap_or(real);
+                        response(0, &describe_typed(&c.columns, t), None)
                     }
                     None => {
                         prepared = None;
@@ -1298,6 +1307,76 @@ mod tests {
         let now = std::time::SystemTime::now();
         assert!(ledger.is_own_attach("app", 8, 40008, Some(now)));
         assert!(!ledger.is_own_attach("app", 8, 40008, Some(now + Duration::from_secs(60))));
+    }
+
+    /// Review N3 of P10-F: the session-management statement runs only
+    /// when the server types it as Firebird does (`isc_info_sql_stmt_ddl`);
+    /// any other type (a `SELECT`, an `EXECUTE PROCEDURE`, a DML type) is
+    /// refused before `op_execute` and leaves the session unusable.
+    #[tokio::test]
+    async fn exec_checks_the_statement_type() {
+        let script = |stmt_type| Script {
+            statements: vec![canned(crate::sql::IDLE_TIMEOUT, vec![], vec![])],
+            stmt_type,
+            ..Script::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut s, server) = session(script(None)).await;
+        s.exec(crate::sql::IDLE_TIMEOUT, deadline).await.unwrap();
+        assert!(!s.is_broken());
+        s.close().await;
+        let seen = server.await.unwrap();
+        assert!(seen.ops.contains(&op::EXECUTE), "{:?}", seen.ops);
+        // isc_info_sql_stmt_select, _insert, _exec_procedure, _set_generator.
+        for wrong in [1, 2, 8, 13] {
+            let (mut s, server) = session(script(Some(wrong))).await;
+            let e = s
+                .exec(crate::sql::IDLE_TIMEOUT, deadline)
+                .await
+                .unwrap_err();
+            assert_eq!(e.detail, Some(Detail::Protocol), "{wrong}");
+            assert!(s.is_broken());
+            s.close().await;
+            let seen = server.await.unwrap();
+            assert!(!seen.ops.contains(&op::EXECUTE), "{wrong}: {:?}", seen.ops);
+        }
+    }
+
+    /// Review N1 of P10-F: the attachment enters the ledger with the time
+    /// the server answered `op_attach`, not the time of its registration
+    /// after the session's first statements (a slow server would move it
+    /// past the 5 s lifetime slack).
+    #[tokio::test]
+    async fn the_attachment_is_registered_at_its_attach_time() {
+        let ledger = std::sync::Arc::new(crate::own::Ledger::default());
+        let (mut s, server) = session(Script {
+            statements: vec![canned(
+                crate::sql::VERSION,
+                vec![text_col(128)],
+                vec![vec![v("5.0.4")]],
+            )],
+            ..Script::default()
+        })
+        .await;
+        let attached = std::time::SystemTime::now();
+        s.own_in_for_tests(
+            std::sync::Arc::clone(&ledger),
+            "app",
+            "127.0.0.1:40010".parse().unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        s.query(crate::sql::VERSION, &[Col::Text(128)], 1, deadline)
+            .await
+            .unwrap();
+        // A slow setup between the attach and the registration.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let registered = std::time::SystemTime::now();
+        s.register_own(10, 24);
+        let opened = ledger.opened("app", 10).unwrap();
+        assert!(opened <= attached, "opened at the attach answer");
+        assert!(registered.duration_since(opened).unwrap() >= Duration::from_millis(400));
+        s.close().await;
+        server.await.unwrap();
     }
 
     /// L1 of the review of #418: the session's registration schedules the

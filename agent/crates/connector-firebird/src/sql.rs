@@ -642,6 +642,10 @@ pub(crate) mod charset {
 
 /// `isc_info_sql_stmt_select`.
 pub(crate) const STMT_SELECT: i64 = 1;
+/// `isc_info_sql_stmt_ddl`: also the type Firebird 4.0 and 5.0 give a
+/// session-management statement such as `SET SESSION IDLE TIMEOUT`
+/// (`dsql.cpp`, `TYPE_SESSION_MANAGEMENT`).
+pub(crate) const STMT_DDL: i64 = 5;
 
 /// A described output column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

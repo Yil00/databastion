@@ -2156,7 +2156,7 @@ async fn a_session_end_writes_the_ledger_on_a_blocking_thread() {
         CursorStore::counters(&dir, "t", "fblg").unwrap(),
         Arc::clone(&k),
     );
-    ledger.register(APP, 3, 40003, 24);
+    ledger.register(APP, 3, 40003, 24, std::time::SystemTime::now());
     ledger.close(APP, 3, false, Duration::from_secs(1));
     let file = dir.join("t.fblg.counters");
     for _ in 0..200 {

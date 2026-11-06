@@ -234,6 +234,11 @@ struct Own {
     closed: bool,
     /// The table of the built statement being run (its credit names it).
     table: Option<String>,
+    /// When the server answered `op_attach` (review N1 of P10-F): the
+    /// attachment's open time in the ledger, so that the statements run
+    /// before the registration (the session's setup) do not move it past
+    /// the server's attach record by more than the lifetime slack.
+    attached_at: Option<std::time::SystemTime>,
     /// The text of the statement being run, from its handle's allocation
     /// to its credit: a session dropped meanwhile (a stop cut it) credits
     /// it as lost (R22 item 1: the attachment was dropped with an answer
@@ -481,6 +486,7 @@ pub(crate) async fn handshake(
     session
         .request(&wire::attach(attach, login), deadline, Stage::SessionSetup)
         .await?;
+    session.own.attached_at = Some(std::time::SystemTime::now());
     Ok(session)
 }
 
@@ -721,7 +727,11 @@ impl Session {
         if self.own.id.is_some() {
             return;
         }
-        l.register(&self.own.attach, id, local.port(), pid);
+        let opened = self
+            .own
+            .attached_at
+            .unwrap_or_else(std::time::SystemTime::now);
+        l.register(&self.own.attach, id, local.port(), pid, opened);
         self.own.id = Some(id);
         for (text, table, account) in std::mem::take(&mut self.own.early) {
             l.credit(&self.own.attach, id, &text, table.as_deref(), account);
@@ -849,7 +859,9 @@ impl Session {
                 )
                 .await?;
             let d = sql::parse_describe(&prepared.data).map_err(|_| self.fail(Stage::Check))?;
-            if !d.columns.is_empty() || d.parameters != 0 {
+            // Review N3 of P10-F (defence in depth): the session-management
+            // statement's type, never anything else the server could run.
+            if d.stmt_type != sql::STMT_DDL || !d.columns.is_empty() || d.parameters != 0 {
                 return Err(self.fail(Stage::Check));
             }
             self.execute(stmt, tx, deadline, None).await

@@ -276,8 +276,10 @@ impl Ledger {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A session's attachment, after its `CURRENT_CONNECTION` read.
-    pub(crate) fn register(&self, attach: &str, id: u64, port: u16, pid: u32) {
+    /// A session's attachment, after its `CURRENT_CONNECTION` read;
+    /// `opened` when the server answered its `op_attach` (review N1 of
+    /// P10-F).
+    pub(crate) fn register(&self, attach: &str, id: u64, port: u16, pid: u32, opened: SystemTime) {
         let mut s = self.state();
         if s.attachments.len() >= MAX_ATTACHMENTS {
             s.attachments.remove(0);
@@ -287,7 +289,7 @@ impl Ledger {
             id,
             port,
             pid,
-            opened: SystemTime::now(),
+            opened,
             closed: None,
         });
     }
@@ -345,10 +347,7 @@ impl Ledger {
         pid: u32,
         opened: SystemTime,
     ) {
-        self.register(attach, id, port, pid);
-        if let Some(a) = self.state().attachments.last_mut() {
-            a.opened = opened;
-        }
+        self.register(attach, id, port, pid, opened);
     }
 
     /// Test support (the engine-matrix own-statement test, R20): the
@@ -1122,7 +1121,7 @@ mod tests {
     #[test]
     fn credits_are_consumed_once() {
         let l = Ledger::default();
-        l.register("app", 7, 40000, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
         assert!(l.is_own_attach("app", 7, 40000, None));
         assert!(!l.is_own_attach("app", 7, 40001, None));
         let text = crate::sql::OWN_ATTACHMENT;
@@ -1152,7 +1151,7 @@ mod tests {
     #[test]
     fn a_re_read_record_finds_its_credit_again() {
         let l = Ledger::default();
-        l.register("app", 7, 40000, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
         let text = crate::sql::OWN_ATTACHMENT;
         l.credit("app", 7, text, None, acc(FetchEnd::End, 1, 64, 64, 64));
         assert_eq!(l.consume("app", 7, text, AT, bounded(1)), Verdict::Own);
@@ -1201,8 +1200,8 @@ mod tests {
         let store = || CursorStore::counters(&dir, "t", "fblg").unwrap();
         let l = Ledger::default();
         l.attach_store(store(), Arc::clone(&key));
-        l.register("app", 7, 40000, 24);
-        l.register("gone", 8, 40001, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
+        l.register("gone", 8, 40001, 24, SystemTime::now());
         let text = crate::sql::OWN_ATTACHMENT;
         let one = acc(FetchEnd::End, 1, 64, 64, 64);
         for _ in 0..3 {
@@ -1270,7 +1269,7 @@ mod tests {
     #[test]
     fn a_sampling_credit_names_its_table() {
         let l = Ledger::default();
-        l.register("app", 7, 40000, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
         let t = "SELECT FIRST 3 X FROM \"T\"";
         l.credit("app", 7, t, Some("T"), acc(FetchEnd::End, 3, 3, 3, 3));
         assert_eq!(
