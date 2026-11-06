@@ -1133,7 +1133,7 @@ fn sqlite_errors_are_never_formatted() {
 /// whose `-shm` helper is started from a `Command` its fuzz target builds)
 /// are exempt only while that module is compiled for tests and the
 /// `fuzzing` feature alone, a feature the agent never enables
-/// ([`the_agent_never_enables_sqlite_fuzzing`]).
+/// ([`the_agent_never_enables_connector_fuzzing`]).
 #[test]
 fn the_only_spawned_process_is_the_sqlite_reader() {
     let starts_a_process = |l: &str| {
@@ -1199,51 +1199,81 @@ fn the_only_spawned_process_is_the_sqlite_reader() {
     assert!(process.contains(".env_clear()"));
 }
 
-/// Security review L1 of #413: no crate of the agent workspace enables the
-/// SQLite connector's `fuzzing` feature (its fuzz entry points, and the
-/// `-shm` helper they start), neither in the resolved graph nor through a
-/// declared dependency or a feature of its own; only the fuzz workspace
+/// Security review L1 of #413, generalized by note 2 of the review of #420:
+/// no crate of the agent workspace enables the `fuzzing` feature of a crate
+/// that has one (the connectors' fuzz entry points and test hooks: the
+/// SQLite `-shm` helper, Firebird's `Ledger::credit_at` and `register_at`,
+/// and the like), neither in the resolved graph nor through a declared
+/// dependency or a feature of its own; only the fuzz workspace
 /// (`agent/fuzz`, outside this one) does.
-#[cfg(feature = "sqlite")]
 #[test]
-fn the_agent_never_enables_sqlite_fuzzing() {
-    const CRATE: &str = "databastion-connector-sqlite";
+fn the_agent_never_enables_connector_fuzzing() {
     let metadata = cargo_metadata();
-    let nodes = resolved_nodes(&metadata);
-    let resolved: Vec<&String> = nodes
+    let packages = metadata["packages"].as_array().unwrap();
+    let members: Vec<&str> = metadata["workspace_members"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|n| n.0 == CRATE)
-        .flat_map(|n| n.3.iter())
+        .map(|m| m.as_str().unwrap())
         .collect();
+    let crates: Vec<&str> = packages
+        .iter()
+        .filter(|p| members.contains(&p["id"].as_str().unwrap()))
+        .filter(|p| p["features"].get("fuzzing").is_some())
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    for must in [
+        "databastion-connector-sqlite",
+        "databastion-connector-firebird",
+        "databastion-connector-mongodb",
+        "databastion-connector-sqlserver",
+    ] {
+        assert!(
+            crates.contains(&must),
+            "{must} has no fuzzing feature: {crates:?}"
+        );
+    }
+    let nodes = resolved_nodes(&metadata);
+    #[cfg(feature = "sqlite")]
+    assert!(nodes.iter().any(|n| n.0 == "databastion-connector-sqlite"));
+    #[cfg(feature = "firebird")]
     assert!(
-        nodes.iter().any(|n| n.0 == CRATE),
-        "{CRATE} is not in the resolved graph"
+        nodes
+            .iter()
+            .any(|n| n.0 == "databastion-connector-firebird")
     );
-    assert!(
-        !resolved.iter().any(|f| *f == "fuzzing"),
-        "{CRATE} resolved with {resolved:?}"
-    );
-    for p in metadata["packages"].as_array().unwrap() {
-        let name = p["name"].as_str().unwrap();
-        if name == CRATE {
-            continue;
-        }
-        for d in p["dependencies"].as_array().unwrap() {
-            if d["name"] == CRATE {
-                let f = d["features"].as_array().unwrap();
-                assert!(
-                    !f.iter().any(|x| x == "fuzzing"),
-                    "{name} depends on {CRATE} with {f:?}"
-                );
+    for krate in &crates {
+        let resolved: Vec<&String> = nodes
+            .iter()
+            .filter(|n| n.0 == *krate)
+            .flat_map(|n| n.3.iter())
+            .collect();
+        assert!(
+            !resolved.iter().any(|f| *f == "fuzzing"),
+            "{krate} resolved with {resolved:?}"
+        );
+        for p in packages {
+            let name = p["name"].as_str().unwrap();
+            if name == *krate {
+                continue;
             }
-        }
-        for (feature, enables) in p["features"].as_object().unwrap() {
-            for e in enables.as_array().unwrap() {
-                let e = e.as_str().unwrap();
-                assert!(
-                    e != format!("{CRATE}/fuzzing") && e != format!("{CRATE}?/fuzzing"),
-                    "{name} feature {feature} enables {e}"
-                );
+            for d in p["dependencies"].as_array().unwrap() {
+                if d["name"] == *krate {
+                    let f = d["features"].as_array().unwrap();
+                    assert!(
+                        !f.iter().any(|x| x == "fuzzing"),
+                        "{name} depends on {krate} with {f:?}"
+                    );
+                }
+            }
+            for (feature, enables) in p["features"].as_object().unwrap() {
+                for e in enables.as_array().unwrap() {
+                    let e = e.as_str().unwrap();
+                    assert!(
+                        e != format!("{krate}/fuzzing") && e != format!("{krate}?/fuzzing"),
+                        "{name} feature {feature} enables {e}"
+                    );
+                }
             }
         }
     }
