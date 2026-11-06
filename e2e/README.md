@@ -888,6 +888,35 @@ reader's ruleset is partly enforced by design (ABI 1 required; truncate, device 
 scopes asked for best effort, none of them on 6.1); the read-only rule and the seccomp filter do not
 depend on them.
 
+### Firebird identity files under the systemd unit
+Security review F1 of the Firebird lot ([ADR-0060](../docs/adr/0060-firebird-connector.md) R45
+items 1 and 2, R48). The shipped unit's `RestrictSUIDSGID=yes` makes systemd's seccomp filter answer
+`openat2` with `ENOSYS`; the Firebird connector runs in the agent's process, so its bare-host
+identity files (`/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, `/etc/subuid`, `/etc/subgid`)
+are opened there by `databastion_core::fs::open_no_links`'s component walk. Before that walk, every
+bare-host Firebird target reported `audit.log_readable_by_others` (local detail
+`host_identity_refused (passwd: not_readable)`).
+
+[`firebird-unit.sh`](firebird-unit.sh) `TEST_BINARY [DEB]`, run as root where systemd is PID 1
+(CI: after `sqlite-unit.sh`, in the same `deb-install` containers), takes the Firebird connector's
+library test binary (`cargo test --locked -p databastion-connector-firebird --lib --no-run`; CI
+builds it in the agent Dockerfile's builder image, job `firebird-unit-bin`). No production entry
+point runs a Firebird check without an enrolled identity and a console, so the binary's
+`it::unit` tests are the stand-in: it creates a throwaway server account, runs `it::unit::prepare`
+as root (a log in the user guide's named-user ACL layout under `/srv`, owner the server account,
+read for `databastion`; root-owned link chains and refused links), then starts
+`databastion-agent.service` with a drop-in that replaces `ExecStart` (`it::unit::check`),
+`Restart`, `Environment` and the output only. Under the unit, as `databastion`, the check asserts
+that `openat2` answers `ENOSYS`, that `load_bare_host` reads the host's own `/etc` files under the
+production rules (no `host_identity_refused`), that the readers check of the seeded log passes
+(`audit.rs` adds `audit.log_readable_by_others` exactly when it fails), and that root-owned link
+chains are followed while a link of another owner, a link in an ancestor and a link out of the base
+are refused (`links`). What it does not prove: container detection is forced off for the readers
+check (the run is in a container, which `agent_in_container` detects; the bare-host branch is what
+is exercised), and the server process proof (`/proc/<pid>/status`) is replaced by the declared uid,
+since no Firebird server runs. Without the walk the same run fails with
+`host_identity_refused (passwd: not_readable)`.
+
 ## Firebird target
 ROADMAP P10-D, [ADR-0060](../docs/adr/0060-firebird-connector.md) R39 (j) and the host-identity
 refinement of 2026-10-31 (R43 to R52, R52 item 2): the [RELEASE.md](../RELEASE.md#open-release-gates)

@@ -144,7 +144,7 @@ jobs:
           fi
           echo "e2e_firebird=$e2e_firebird" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
-              || grep -qE '^(agent/|console/|deploy/|e2e/sqlite-unit\.sh$|e2e/sqlite_unit_driver\.py$|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
+              || grep -qE '^(agent/|console/|deploy/|e2e/sqlite-unit\.sh$|e2e/sqlite_unit_driver\.py$|e2e/firebird-unit\.sh$|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
           else
             packaging=false
@@ -1247,7 +1247,7 @@ jobs:
           echo
       - name: shellcheck
         run: |
-          timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh e2e/sqlite-unit.sh
+          timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh e2e/sqlite-unit.sh e2e/firebird-unit.sh
           python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' e2e/sqlite_unit_driver.py
       - name: Unit tests of the I2 leak scanner
         run: timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
