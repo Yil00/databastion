@@ -67,14 +67,28 @@ struct Env {
 }
 
 /// The prefix of the reader executable's directory, followed by the test
-/// process id.
+/// process id and a random suffix.
 const EXE_DIR_PREFIX: &str = "databastion-sqlite-reader-exe-";
 
-/// The reader executable's directory for this process. Its path is fixed
-/// for the whole test binary: the connector keeps the first path it is
-/// given.
-fn reader_exe_dir() -> PathBuf {
-    PathBuf::from(format!("/tmp/{EXE_DIR_PREFIX}{}", std::process::id()))
+/// The reader executable's directory for this process: `/tmp`, the
+/// prefix, the process id and a random suffix chosen once (security review
+/// L2 of #413: the tests run as root, so the path is not predictable, and
+/// it is created by this process, never reused). Its path is fixed for the
+/// whole test binary: the connector keeps the first path it is given.
+fn reader_exe_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        use std::io::Read;
+        let mut random = [0u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut random))
+            .unwrap();
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        PathBuf::from(format!(
+            "/tmp/{EXE_DIR_PREFIX}{}-{suffix}",
+            std::process::id()
+        ))
+    })
 }
 
 /// Tests holding the reader executable (a copy of the agent binary, about
@@ -89,6 +103,7 @@ struct ExeLease;
 
 impl ExeLease {
     fn take() -> Self {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
         let mut n = EXE_LEASES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -96,11 +111,28 @@ impl ExeLease {
             static STALE: std::sync::Once = std::sync::Once::new();
             STALE.call_once(remove_stale_executables);
             let dir = reader_exe_dir();
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let exe = dir.join("databastion-agent");
-            std::fs::copy(env!("CARGO_BIN_EXE_databastion-agent"), &exe).unwrap();
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Created here, or the test fails: never a directory or a
+            // symbolic link someone else planted at that path.
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(dir)
+                .unwrap_or_else(|e| panic!("create the reader executable directory: {e}"));
+            let meta = std::fs::symlink_metadata(dir).unwrap();
+            assert!(
+                meta.file_type().is_dir() && meta.uid() == euid(),
+                "the reader executable directory is not this account's directory"
+            );
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut source = std::fs::File::open(env!("CARGO_BIN_EXE_databastion-agent")).unwrap();
+            let mut copy = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(dir.join("databastion-agent"))
+                .unwrap();
+            std::io::copy(&mut source, &mut copy).unwrap();
+            copy.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         *n += 1;
         Self
@@ -131,9 +163,11 @@ fn remove_stale_executables() {
     };
     for e in entries.flatten() {
         let name = e.file_name();
+        // `<pid>-<suffix>`, or `<pid>` (runs before the random suffix).
         let Some(pid) = name
             .to_str()
             .and_then(|n| n.strip_prefix(EXE_DIR_PREFIX))
+            .and_then(|p| p.split('-').next())
             .and_then(|p| p.parse::<u32>().ok())
         else {
             continue;

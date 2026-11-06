@@ -510,9 +510,7 @@ impl Db {
                 let ValueRef::Text(stat) = row.get_ref(2).map_err(map_error)? else {
                     continue;
                 };
-                if !fold.add(tbl, idx, stat) {
-                    break;
-                }
+                fold.add(tbl, idx, stat);
             }
             Ok(fold.finish())
         })();
@@ -725,13 +723,16 @@ pub(crate) struct StatsFold {
 }
 
 impl StatsFold {
-    /// Adds one row; `false` once the response bounds are reached.
+    /// Adds one row: `false` when it is not kept (unparseable, or a new
+    /// table once the response bounds are reached; the tables already
+    /// kept are still updated, so the order of the rows cannot hide an
+    /// index row of theirs).
     pub(crate) fn add(&mut self, tbl: &[u8], idx: Option<&[u8]>, stat: &[u8]) -> bool {
         let Some(n) = first_integer(stat) else {
-            return true;
+            return false;
         };
         if tbl.is_empty() || tbl.len() > MAX_NAME {
-            return true;
+            return false;
         }
         let own = idx.is_none_or(|i| i == tbl);
         let key = {
@@ -747,7 +748,7 @@ impl StatsFold {
         });
         if let Some(i) = found {
             let (Some(row), Some(was_own)) = (self.out.get_mut(i), self.own.get_mut(i)) else {
-                return true;
+                return false;
             };
             if own && !*was_own {
                 row.rows = n;
@@ -757,10 +758,11 @@ impl StatsFold {
             }
             return true;
         }
-        self.bytes += 12 + tbl.len();
-        if self.out.len() >= MAX_STATS || self.bytes > SAMPLE_RESPONSE_BUDGET {
+        let bytes = self.bytes + 12 + tbl.len();
+        if self.out.len() >= MAX_STATS || bytes > SAMPLE_RESPONSE_BUDGET {
             return false;
         }
+        self.bytes = bytes;
         self.at.entry(key).or_default().push(self.out.len());
         self.out.push(crate::ipc::StatRow {
             name: Zeroizing::new(tbl.to_vec()),
@@ -783,6 +785,7 @@ fn first_integer(stat: &[u8]) -> Option<u64> {
         .iter()
         .copied()
         .take_while(u8::is_ascii_digit)
+        .take(20)
         .collect();
     if digits.is_empty() || digits.len() > 19 {
         return None;
@@ -866,7 +869,7 @@ pub(crate) mod tests {
     fn stats_fold(rows: &[StatInput<'_>]) -> Vec<(Vec<u8>, u64)> {
         let mut f = StatsFold::default();
         for (t, i, s) in rows {
-            assert!(f.add(t, *i, s));
+            f.add(t, *i, s);
         }
         f.finish()
             .into_iter()
@@ -911,18 +914,24 @@ pub(crate) mod tests {
     #[test]
     fn stat_rows_are_bounded_by_table() {
         let mut f = StatsFold::default();
-        let mut accepted = 0usize;
-        for i in 0..=MAX_STATS {
+        for i in 0..MAX_STATS {
             let t = format!("t{i}");
-            if !f.add(t.as_bytes(), None, b"1") {
-                break;
-            }
+            assert!(f.add(t.as_bytes(), Some(b"i"), b"1"));
             // A second row of the same table costs no entry.
-            assert!(f.add(t.as_bytes(), Some(b"i"), b"2"));
-            accepted += 1;
+            assert!(f.add(t.as_bytes(), Some(b"j"), b"2"));
         }
-        assert_eq!(accepted, MAX_STATS);
-        assert_eq!(f.finish().len(), MAX_STATS);
+        // Full: a new table is refused, ...
+        assert!(!f.add(b"new", None, b"9"));
+        // ... but the tables kept are still updated, by their own row and
+        // by a larger index count.
+        assert!(f.add(b"t0", None, b"7"));
+        assert!(f.add(b"t1", Some(b"k"), b"5"));
+        let out = f.finish();
+        assert_eq!(out.len(), MAX_STATS);
+        assert!(!out.iter().any(|r| r.name.as_slice() == b"new"));
+        assert_eq!(out.first().map(|r| r.rows), Some(7));
+        assert_eq!(out.get(1).map(|r| r.rows), Some(5));
+        assert_eq!(out.get(2).map(|r| r.rows), Some(2));
     }
 
     #[test]
@@ -930,6 +939,12 @@ pub(crate) mod tests {
         assert_eq!(first_integer(b"1200 3 1"), Some(1200));
         assert_eq!(first_integer(b"x"), None);
         assert_eq!(first_integer(b"99999999999999999999"), None);
+        assert_eq!(
+            first_integer(b"1234567890123456789"),
+            Some(1_234_567_890_123_456_789)
+        );
+        // A long run of digits is cut at 20 and refused, never collected.
+        assert_eq!(first_integer(&[b'1'; 100_000]), None);
     }
 
     /// No message survives the mapping (security review L1).

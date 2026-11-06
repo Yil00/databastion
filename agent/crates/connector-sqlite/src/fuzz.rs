@@ -220,7 +220,7 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The helper process's side: when [`SHM_HELPER_ENV`] is set, this process
 /// is the helper, and this function never returns. It answers `ready`,
 /// then, per line on its standard input, `L` (open the `-shm` read-only and
-/// take a shared POSIX lock on it, which covers the `DMS` byte, as an
+/// take a shared POSIX lock on its `DMS` byte alone, as an idle
 /// application's connection holds it: `locked` or `failed`) and `U`
 /// (close it, which drops the lock: `unlocked`); it exits at the end of
 /// its input, so it never outlives the process that started it, whatever
@@ -251,16 +251,14 @@ pub fn shm_helper_if_requested() {
                         | rustix::fs::OFlags::CLOEXEC,
                     rustix::fs::Mode::empty(),
                 )
-                .and_then(|fd| {
-                    rustix::fs::fcntl_lock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared)
-                        .map(|()| fd)
-                });
+                .ok()
+                .filter(lock_dms);
                 match fd {
-                    Ok(fd) => {
+                    Some(fd) => {
                         held = Some(fd);
                         answer(&mut out, "locked");
                     }
-                    Err(_) => answer(&mut out, "failed"),
+                    None => answer(&mut out, "failed"),
                 }
             }
             "U" => {
@@ -272,6 +270,23 @@ pub fn shm_helper_if_requested() {
     }
     drop(held);
     std::process::exit(0);
+}
+
+/// The `DMS` byte of the `-shm` (`UNIX_SHM_BASE + SQLITE_SHM_NLOCK`, as in
+/// `locks.rs`).
+const SHM_DMS: u8 = 128;
+
+/// A shared POSIX lock on the `DMS` byte alone, as an idle writer's
+/// connection holds it (`F_SETLK`, not waiting).
+fn lock_dms(fd: &rustix::fd::OwnedFd) -> bool {
+    let lock = libc::flock {
+        l_type: libc::F_RDLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: libc::off_t::from(SHM_DMS),
+        l_len: 1,
+        l_pid: 0,
+    };
+    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETLK(&lock)).is_ok()
 }
 
 /// A helper process that holds the fuzzed `-shm`'s `DMS` lock while the
