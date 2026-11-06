@@ -175,6 +175,21 @@ pub fn is_canonical_path(path: &Path) -> bool {
         && !text.split('/').any(|s| s == "." || s == "..")
 }
 
+/// The resolved form of a refused location (as the CAS loader resolves
+/// its paths): the canonical path when it exists, else its canonical
+/// parent and file name (a log not created yet), else `None`. The refused
+/// list holds both forms (SQLite review L4): a file `agent.yaml`
+/// references through a symbolic link is refused at its real place too.
+#[must_use]
+pub fn resolved_location(path: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return Some(p);
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    std::fs::canonicalize(parent).ok().map(|p| p.join(name))
+}
+
 /// Whether `path` is under (or equal to) one of `refused`, compared by
 /// component.
 #[must_use]
