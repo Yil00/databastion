@@ -103,7 +103,7 @@ pub(crate) const DATABASE_TRIGGERS: &str = "SELECT (SELECT COUNT(*) FROM RDB$TRI
 /// Which relations of the credential list exist in this database
 /// (decision 4, security review M5): a database can be its own security
 /// database. `SEC$GLOBAL_AUTH_MAPPING` is not probed (residual A,
-/// maintainer decision of 2026-11-06): every plain account reads every
+/// R11, accepted 2026-10-26): every plain account reads every
 /// global mapping (measured on 4.0 and 5.0), so its readability says
 /// nothing about the account; it stays always reported by Audit.
 pub(crate) const CREDENTIAL_RELATIONS: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME IN ('PLG$SRP', 'PLG$SRP_VIEW', 'PLG$USERS', 'PLG$VIEW_USERS', 'SEC$USERS', 'SEC$USER_ATTRIBUTES', 'RDB$CONFIG')";
@@ -1104,7 +1104,7 @@ mod tests {
         assert!(!checked(&format!("{VERSION} ")));
     }
 
-    /// Residual A (maintainer decision of 2026-11-06): every plain
+    /// Residual A (R11, accepted 2026-10-26): every plain
     /// account reads every global mapping, so `SEC$GLOBAL_AUTH_MAPPING`
     /// is neither listed nor probed by `check()`, and stays on Audit's
     /// always-reported credential list.
