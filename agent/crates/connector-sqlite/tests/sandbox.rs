@@ -5,6 +5,11 @@
 //! a descriptor without `O_CLOEXEC` (as cargo's jobserver pipes, PR #356),
 //! which `sandbox::early` must close. Needs Landlock; skipped without it
 //! unless `DATABASTION_IT_SQLITE_REQUIRE=1`.
+//!
+//! The child runs twice: as started by the agent, and behind a first
+//! seccomp filter that answers `ENOSYS` to `openat2`, as the agent's systemd
+//! unit does (`RestrictSUIDSGID=yes`): the grant is then built by the
+//! component walk, and every check must give the same answer.
 
 #![allow(
     clippy::unwrap_used,
@@ -23,6 +28,41 @@ use databastion_connector_sqlite::sandbox;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
 const CHILD: &str = "--sandbox-child";
+/// The child behind an `openat2` → `ENOSYS` filter (systemd's
+/// `RestrictSUIDSGID=yes`).
+const CHILD_NO_OPENAT2: &str = "--sandbox-child-no-openat2";
+
+/// What systemd's `RestrictSUIDSGID=yes` does to `openat2`: `ENOSYS`; every
+/// other call allowed.
+fn refuse_openat2_like_systemd() {
+    let rules = std::collections::BTreeMap::from([(libc::SYS_openat2, Vec::new())]);
+    #[cfg(target_arch = "x86_64")]
+    let arch = seccompiler::TargetArch::x86_64;
+    #[cfg(target_arch = "aarch64")]
+    let arch = seccompiler::TargetArch::aarch64;
+    let filter = seccompiler::SeccompFilter::new(
+        rules,
+        seccompiler::SeccompAction::Allow,
+        seccompiler::SeccompAction::Errno(u32::try_from(libc::ENOSYS).unwrap()),
+        arch,
+    )
+    .unwrap();
+    let program = seccompiler::BpfProgram::try_from(filter).unwrap();
+    seccompiler::apply_filter(&program).unwrap();
+    // The filter is in place: openat2 now answers ENOSYS.
+    let r = rustix::fs::openat2(
+        rustix::fs::CWD,
+        "/",
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        rustix::fs::ResolveFlags::empty(),
+    );
+    assert_eq!(
+        r.err(),
+        Some(rustix::io::Errno::NOSYS),
+        "openat2 not refused"
+    );
+}
 
 fn refused<T: std::fmt::Debug>(
     what: &str,
@@ -131,9 +171,17 @@ fn child(db: &Path, leaked: i32) {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some(CHILD) {
-        child(Path::new(&args[2]), args[3].parse().unwrap());
-        return ExitCode::SUCCESS;
+    match args.get(1).map(String::as_str) {
+        Some(CHILD) => {
+            child(Path::new(&args[2]), args[3].parse().unwrap());
+            return ExitCode::SUCCESS;
+        }
+        Some(CHILD_NO_OPENAT2) => {
+            refuse_openat2_like_systemd();
+            child(Path::new(&args[2]), args[3].parse().unwrap());
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
     }
     let required = std::env::var("DATABASTION_IT_SQLITE_REQUIRE").as_deref() == Ok("1");
     if !sandbox::landlock_available() {
@@ -151,25 +199,36 @@ fn main() -> ExitCode {
     let db: PathBuf = dir.join("app.db");
     std::fs::write(&db, b"SQLite format 3\0").unwrap();
     std::fs::write(dir.join("other.db"), b"x").unwrap();
-    // A descriptor the child inherits (no O_CLOEXEC).
-    let leaked = rustix::fs::open(&db, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
-    rustix::io::fcntl_setfd(&leaked, rustix::io::FdFlags::empty()).unwrap();
-    let out = Command::new(std::env::current_exe().unwrap())
-        .arg(CHILD)
-        .arg(&db)
-        .arg(format!("{}", leaked.as_raw_fd()))
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    drop(leaked);
+    let mut ok = true;
+    for (name, mode) in [
+        ("sandbox_refusals", CHILD),
+        ("sandbox_refusals_without_openat2", CHILD_NO_OPENAT2),
+    ] {
+        // A descriptor the child inherits (no O_CLOEXEC).
+        let leaked =
+            rustix::fs::open(&db, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        rustix::io::fcntl_setfd(&leaked, rustix::io::FdFlags::empty()).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .arg(mode)
+            .arg(&db)
+            .arg(format!("{}", leaked.as_raw_fd()))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        drop(leaked);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() && stdout.contains("sandbox-child-ok") {
+            println!("test {name} ... ok");
+        } else {
+            eprintln!("test {name} ... FAILED\n{stdout}\n{stderr}");
+            ok = false;
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if out.status.success() && stdout.contains("sandbox-child-ok") {
-        println!("test sandbox_refusals ... ok");
+    if ok {
         ExitCode::SUCCESS
     } else {
-        eprintln!("test sandbox_refusals ... FAILED\n{stdout}\n{stderr}");
         ExitCode::FAILURE
     }
 }
