@@ -566,7 +566,10 @@ pub(crate) struct Settings {
     pub(crate) aliases: Option<AliasMap>,
     /// Proof 11 holds (R1 rule 8).
     pub(crate) proof11: bool,
-    /// The agent's account (upper-cased, as the server stores it).
+    /// The agent's account as the server stores it and the trace log
+    /// prints it: the login the session sends (ASCII upper-cased, as an
+    /// unquoted name), compared exactly (review N5 of P10-F: a user created
+    /// with a quoted name of another case is another user).
     pub(crate) account: String,
     pub(crate) parse: ParseOptions,
     /// SuperServer proven (R6, R16): the internal shape applies.
@@ -3342,8 +3345,9 @@ impl Machine {
                 // R42 item 5: the attachment's lifetime holds the record's
                 // time (this attach's offset, else the confirmed one).
                 let t = self.record_time(rec.header.time, measured.or(self.offset));
-                let account = att.user.eq_ignore_ascii_case(&self.s.account)
-                    && att.role.is_none_or(|r| r == "NONE");
+                // Review N5 of P10-F: the user as stored, which the trace
+                // log prints verbatim (a quoted name keeps its case).
+                let account = att.user == self.s.account && att.role.is_none_or(|r| r == "NONE");
                 let mine = port.is_some_and(|p| self.ledger.is_own_attach(&label, id, p, Some(t)))
                     && account;
                 // L2 of the review of #418: the agent's session may not have
@@ -4421,8 +4425,7 @@ impl Machine {
         let Some(att) = rec.att else {
             return Some(false);
         };
-        if !att.user.eq_ignore_ascii_case(&self.s.account) || att.role.is_some_and(|r| r != "NONE")
-        {
+        if att.user != self.s.account || att.role.is_some_and(|r| r != "NONE") {
             return Some(false);
         }
         let label = self.s.databases[i].attach.clone();

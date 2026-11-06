@@ -651,6 +651,49 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     assert_eq!(m.offset_for_tests(), None);
 }
 
+/// Review N5 of P10-F: the agent's account is compared as stored (the
+/// trace log prints the user verbatim): a user of another case on the
+/// agent's attachment and port, with a credit left, is not the agent.
+#[test]
+fn the_own_account_is_compared_as_stored() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let account = |counted| FetchAccount {
+        counted,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    let v = crate::sql::VERSION;
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    for (user, own) in [
+        ("DATABASTION_AGENT", true),
+        ("databastion_agent", false),
+        ("Databastion_Agent", false),
+    ] {
+        let a = "24:0x7f0000000100";
+        let ledger = Arc::new(Ledger::default());
+        let (head, opened) = now_head(0);
+        ledger.register_at(APP, 3, 40003, 24, opened);
+        ledger.credit_at(APP, 3, v, account(1), opened);
+        let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+        feed_h(&head, &mut m, &cats, &attach_as(a, 3, user), 0);
+        let before = m.counts.own;
+        feed_h(
+            &head,
+            &mut m,
+            &cats,
+            &stmt(a, 3, 5, user, v, 1, &[("RDB$DATABASE", 1)]),
+            1000,
+        );
+        assert_eq!(m.counts.own, before + u64::from(own), "{user}");
+        // The credit is left for the agent's own record.
+        assert_eq!(ledger.credits_left().is_empty(), own, "{user}");
+    }
+}
+
 #[test]
 fn plausible_offsets() {
     for o in [0, 3600, -3600, 19_800, 20_700, -12_600, 3603, 3597] {
