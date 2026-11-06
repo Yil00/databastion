@@ -786,7 +786,7 @@ jobs:
           for t in "test sandbox_refusals ... ok" \
               "test sandbox_refusals_without_openat2 ... ok" \
               "test sandbox::tests::the_allow_list_refuses_everything_else ... ok" \
-              "test sandbox::tests::the_component_walk_resolves_as_openat2 ... ok" \
+              "test sandbox::tests::grant_opens_without_links ... ok" \
               "test the_reader_is_sandboxed_and_its_crashes_stay_its_own ... ok" \
               "test a_rollback_file_is_scanned_by_the_sandboxed_reader ... ok" \
               "test a_wal_file_is_read_while_another_process_writes_and_nothing_changes ... ok"; do
