@@ -345,8 +345,13 @@ readers_detail() {
 # contract's default poll_interval_s is 10) for its stream to read that check's records, its last
 # TRACE_FINI included, then a graceful stop. A graceful stop in the middle of a check keeps that
 # check's credits (the ledgers are written at the stop, a statement in flight credited as lost), so
-# its records stay the agent's own; only a kill in the middle of a check is the residual (a crash
-# between two writes), which the unquiesced-restart step below tests.
+# its records stay the agent's own. A kill in the middle of a check leaves a residual with a usable
+# checkpoint (not "a crash between two writes", where the checkpoint is not used): killed between
+# the session's CURRENT_CONNECTION and the ledger write its registration schedules, the check's
+# records come back as one-object events of the agent's account (always-reported relations), not
+# `*`, not ambiguous, no level cap; killed after that write, a statement credited later is
+# ambiguous (`*`, always reported). The unquiesced-restart step below kills the agent right after a
+# check.
 quiesce_agent() {
   local n0 deadline
   [ -n "$(compose --profile tools ps -q "$1")" ] || return 0

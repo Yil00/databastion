@@ -502,10 +502,17 @@ impl Ledger {
         }
         drop(s);
         // The session's credits are all issued: written soon, so that an
-        // agent stopped right after a check still has them (R25 item 7),
-        // on a blocking thread, never from async code or a `Drop` (review
-        // L2), one write for the sessions that end meanwhile; without a
-        // runtime (tests), at the next checkpoint.
+        // agent stopped right after a check still has them (R25 item 7).
+        self.schedule_persist();
+    }
+
+    /// Marks the ledger changed and schedules its write on a blocking
+    /// thread, never from async code or a `Drop` (review L2), one write
+    /// for the changes made meanwhile; without a runtime (tests), at the
+    /// next checkpoint. At a session's end ([`Self::close`]) and at its
+    /// registration (`Session::register_own`, L1 of the review of #418:
+    /// a kill later in the session then still finds the attachment).
+    pub(crate) fn schedule_persist(self: &Arc<Self>) {
         self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(rt) = tokio::runtime::Handle::try_current()
             && !self

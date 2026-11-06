@@ -892,9 +892,14 @@ impl Runtime {
     }
 
     /// [`Connector::shutdown`] of every connector, together, within
-    /// [`SHUTDOWN_TIMEOUT`].
+    /// [`SHUTDOWN_TIMEOUT`], each isolated from a panic of another (the
+    /// hook logs it without its message).
     async fn shutdown_connectors(&self) {
-        let all = futures_util::future::join_all(self.connectors.iter().map(|c| c.shutdown()));
+        let all = futures_util::future::join_all(self.connectors.iter().map(|c| async move {
+            if crate::panics::guard(c.shutdown()).await.is_err() {
+                tracing::warn!(engine = %c.engine(), "connector shutdown panicked");
+            }
+        }));
         if tokio::time::timeout(SHUTDOWN_TIMEOUT, all).await.is_err() {
             tracing::warn!("connector shutdown not finished in time");
         }

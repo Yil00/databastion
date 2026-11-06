@@ -732,21 +732,46 @@ fn a_restart_right_after_a_check_finds_its_credits() {
 /// account. With the ledgers written at the stop
 /// ([`crate::own::persist_all`], the connector's `shutdown`), the records
 /// are the agent's own: no event, nothing ambiguous.
-/// `written_at_stop`: the port of the endpoint whose ledger the stop
-/// writes (the process's ledgers, as the connector has them); `None`: a
-/// ledger the stop does not write.
-fn stop_mid_check(name: &str, written_at_stop: Option<u16>) -> (Counts, CkptCounts, Vec<Emitted>) {
+///
+/// How the agent ends in the middle of the check (see
+/// [`stop_mid_check`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// SIGTERM: the core drops the session (its statement in flight
+    /// credited as lost, its attachment closed as lost), then the
+    /// connector's `shutdown` writes the endpoint's ledgers
+    /// ([`crate::own::persist_all`]); the port of that endpoint.
+    Stop(u16),
+    /// SIGKILL before the write the session's registration scheduled
+    /// landed: the ledger on disk was last written before the check.
+    KillBeforeRegistrationWrite,
+    /// SIGKILL after that write, and after a statement whose credit came
+    /// later.
+    KillAfterRegistrationWrite,
+}
+
+fn stop_mid_check(name: &str, end: End) -> (Counts, CkptCounts, Vec<Emitted>) {
     use crate::conn::{FetchAccount, FetchEnd};
+    let account = |end, counted| FetchAccount {
+        counted,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end,
+        ..FetchAccount::default()
+    };
     let dir = temp(name);
     first_start(&dir);
     let (head, opened) = now_head(3600);
     let classes = || vec![catalog(&[], &[], &[])];
     // The stream of the first process, with the endpoint's ledger: its last
     // checkpoint is written before the check starts.
-    let ledger = written_at_stop.map_or_else(
-        || Arc::new(Ledger::default()),
-        |port| crate::own::ledger_for(std::net::SocketAddr::from(([127, 0, 0, 2], port))),
-    );
+    let ledger = match end {
+        End::Stop(port) => {
+            crate::own::ledger_for(std::net::SocketAddr::from(([127, 0, 0, 2], port)))
+        }
+        _ => Arc::new(Ledger::default()),
+    };
     append(
         &dir,
         &attach("24:0x7f0000000300", 5, APP).replace(HEAD, &head),
@@ -755,42 +780,52 @@ fn stop_mid_check(name: &str, written_at_stop: Option<u16>) -> (Counts, CkptCoun
     p.read();
     p.spooled();
     p.commit();
-    // The check: its attachment, a statement that ended, then the stop
-    // while the second waits for its rows.
+    // The check: its attachment registered with the credit of a statement
+    // run before (`Session::register_own`).
     ledger.register_at(APP, 3, 40003, 24, opened);
     ledger.credit_at(
         APP,
         3,
         crate::sql::VERSION,
-        FetchAccount {
-            counted: 1,
-            requested: 64,
-            last: 64,
-            largest: 64,
-            end: FetchEnd::End,
-            ..FetchAccount::default()
-        },
+        account(FetchEnd::End, 1),
         opened,
     );
-    ledger.credit_at(
-        APP,
-        3,
-        crate::sql::IDENTITY,
-        FetchAccount {
-            counted: 0,
-            requested: 64,
-            last: 64,
-            largest: 64,
-            end: FetchEnd::Lost,
-            ..FetchAccount::default()
-        },
-        opened,
-    );
-    // The session's `Drop` (no runtime here: the write is only scheduled
-    // with one, and the runtime's shutdown cancels it).
-    ledger.close(APP, 3, true, Duration::from_secs(5));
-    if written_at_stop.is_some() {
-        crate::own::persist_all();
+    match end {
+        End::Stop(_) => {
+            // The second statement waits for its rows when the core drops
+            // the session (`Session::drop`; no runtime here, so the write
+            // it schedules does not run, as the runtime's shutdown cancels
+            // it), then the connector's `shutdown`.
+            ledger.credit_at(
+                APP,
+                3,
+                crate::sql::IDENTITY,
+                account(FetchEnd::Lost, 0),
+                opened,
+            );
+            ledger.close(APP, 3, true, Duration::from_secs(5));
+            crate::own::persist_all();
+        }
+        End::KillBeforeRegistrationWrite => {
+            ledger.credit_at(
+                APP,
+                3,
+                crate::sql::IDENTITY,
+                account(FetchEnd::End, 1),
+                opened,
+            );
+        }
+        End::KillAfterRegistrationWrite => {
+            // The write the registration scheduled.
+            ledger.persist();
+            ledger.credit_at(
+                APP,
+                3,
+                crate::sql::IDENTITY,
+                account(FetchEnd::End, 1),
+                opened,
+            );
+        }
     }
     drop(p);
     // The server wrote the check's records, and the detach of the dropped
@@ -840,7 +875,7 @@ fn stop_mid_check(name: &str, written_at_stop: Option<u16>) -> (Counts, CkptCoun
 
 #[test]
 fn a_stop_in_the_middle_of_a_check_keeps_its_credits() {
-    let (c, k, out) = stop_mid_check("stopcheck", Some(1));
+    let (c, k, out) = stop_mid_check("stopcheck", End::Stop(1));
     assert_eq!(k.restored, 1, "{k:?}");
     assert!(out.is_empty(), "{:?}", objects(&out));
     // Both statements (and the detach of the attachment) are its own.
@@ -849,14 +884,18 @@ fn a_stop_in_the_middle_of_a_check_keeps_its_credits() {
     assert_eq!(c.ambiguous, 0, "{c:?}");
 }
 
-/// The same cut without the ledgers written at the stop: the behaviour
-/// of every stop before the fix (the failed CI run: an event of the
-/// agent's account, one object, not `*`), and still that of a kill
-/// (SIGKILL, a crash) in the middle of a check, the residual "a crash
-/// between two writes" of the implementation note of 2026-11-01.
+/// What remains of a kill (SIGKILL, a crash) in the middle of a check,
+/// with a usable checkpoint (not the residual "a crash between two
+/// writes", where the checkpoint is not used). Killed between the
+/// session's `CURRENT_CONNECTION` and the ledger write its registration
+/// scheduled, the ledger on disk predates the check: its records are
+/// another client's, and its reads of always-reported relations are
+/// one-object events of the agent's account, not `*`, not ambiguous, with
+/// no level cap (the failed CI run's shape, and that of every stop before
+/// the fix).
 #[test]
-fn a_kill_in_the_middle_of_a_check_reports_its_records() {
-    let (c, k, out) = stop_mid_check("stopcheck-none", None);
+fn a_kill_before_the_registration_write_reports_its_records() {
+    let (c, k, out) = stop_mid_check("kill-before", End::KillBeforeRegistrationWrite);
     assert_eq!(k.restored, 1, "the checkpoint itself is usable: {k:?}");
     assert_eq!(c.own, 0, "{c:?}");
     assert_eq!(c.ambiguous, 0, "not ambiguous: another client's records");
@@ -864,6 +903,27 @@ fn a_kill_in_the_middle_of_a_check_reports_its_records() {
     assert!(
         out.iter()
             .all(|(_, e)| e.principal().account_name() == AGENT)
+    );
+}
+
+/// Killed after that write: the attachment and the credits written with
+/// it are restored, so those records are the agent's own; a statement
+/// credited after the write finds no credit: a text of the closed set on
+/// the agent's attachment, ambiguous (`*`, always reported, R8 item 4),
+/// which withholds Partial for up to 24 h. Loud, never another client's
+/// read.
+#[test]
+fn a_kill_after_the_registration_write_is_own_or_ambiguous() {
+    let (c, k, out) = stop_mid_check("kill-after", End::KillAfterRegistrationWrite);
+    assert_eq!(k.restored, 1, "{k:?}");
+    assert!(c.own >= 1, "the statement credited before the write: {c:?}");
+    assert_eq!(c.ambiguous, 1, "the statement credited after it: {c:?}");
+    assert!(!out.is_empty());
+    assert!(out.iter().all(|(_, e)| e.always_report()), "{out:?}");
+    assert!(
+        objects(&out).contains(&"*".to_owned()),
+        "{:?}",
+        objects(&out)
     );
 }
 

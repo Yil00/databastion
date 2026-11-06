@@ -726,6 +726,11 @@ impl Session {
         for (text, table, account) in std::mem::take(&mut self.own.early) {
             l.credit(&self.own.attach, id, &text, table.as_deref(), account);
         }
+        // L1 of the review of #418: written soon, so that a kill later in
+        // the session keeps the attachment (its records are then the
+        // agent's own, or, for a credit issued after this write, a text of
+        // the closed set with no credit: ambiguous, never another client's).
+        l.schedule_persist();
     }
 
     /// Test support: the session's place in `ledger` as [`connect`] gives
@@ -1149,7 +1154,10 @@ impl Drop for Session {
     /// credited as lost (R22 item 1: the attachment dropped with an answer
     /// unread), with what its fetch counted so far, so that its record is
     /// the agent's own within the lost bounds rather than a text of the
-    /// closed set with no credit (ambiguous, R8 item 4).
+    /// closed set with no credit (ambiguous, R8 item 4). This holds for
+    /// every drop: the agent's stop, and also a check cut by the core's
+    /// 10 s heartbeat check deadline (`CHECK_TIMEOUT`), whose statement in
+    /// flight is credited as lost too (N3 of the review of #418).
     fn drop(&mut self) {
         if !self.own.closed {
             self.broken = true;

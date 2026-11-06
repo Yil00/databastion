@@ -131,6 +131,10 @@ pub fn statement_checked(text: &str) -> bool {
     sql::checked(text)
 }
 
+/// At the agent's stop, how long the aborted early checks may take to end
+/// before the ledgers are written anyway (within the core's 5 s).
+const EARLY_CHECKS_AT_STOP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Firebird connector. One instance serves every declared Firebird target.
 #[derive(Default)]
 #[non_exhaustive]
@@ -298,8 +302,18 @@ impl Connector for FirebirdConnector {
         for t in &tasks {
             t.abort();
         }
-        for t in tasks {
-            let _ = t.await;
+        // N2 of the review of #418: the aborted checks get their own share
+        // of the core's budget; the ledgers are written whatever remains.
+        let ended = async {
+            for t in tasks {
+                let _ = t.await;
+            }
+        };
+        if tokio::time::timeout(EARLY_CHECKS_AT_STOP, ended)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Firebird early checks not ended at the stop");
         }
         if tokio::task::spawn_blocking(own::persist_all).await.is_err() {
             tracing::warn!("Firebird own-statement ledgers not saved at the stop");

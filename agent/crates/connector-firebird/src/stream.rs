@@ -614,6 +614,14 @@ pub(crate) struct Machine {
     /// R1 rule 11's learned floor per database identity.
     learned_floor: HashMap<DbId, u64>,
     watermark: HashMap<usize, u64>,
+    /// Bindings whose `ATTACH_DATABASE` had every condition of an own
+    /// attachment except the ledger's entry (the session registers its
+    /// `CURRENT_CONNECTION` after the server wrote the attach): the attach's
+    /// local port and printed time, judged again by the same criteria at the
+    /// binding's first record that reaches the own-record rule, never after
+    /// one of its records was judged otherwise. Not persisted (a restart
+    /// in between leaves the binding not the agent's own: reported).
+    own_pending: HashMap<Key, (u16, LogTime)>,
     internal: HashMap<DbId, Key>,
     gc_alone_since: HashMap<DbId, Instant>,
     window_until: Option<Instant>,
@@ -777,6 +785,7 @@ impl Machine {
             next_seq: 0,
             learned_floor: HashMap::new(),
             watermark: HashMap::new(),
+            own_pending: HashMap::new(),
             internal: HashMap::new(),
             gc_alone_since: HashMap::new(),
             window_until: None,
@@ -1376,6 +1385,7 @@ impl Machine {
         let groups: Vec<Group> = self.groups.drain(..).collect();
         self.pending_end.extend(groups);
         self.bindings.clear();
+        self.own_pending.clear();
         self.tra_pos.clear();
         self.tra_pos_entries = 0;
         self.by_addr.clear();
@@ -1551,6 +1561,7 @@ impl Machine {
     }
 
     fn remove_binding(&mut self, key: Key) -> Option<Binding> {
+        self.own_pending.remove(&key);
         if let Some(v) = self.tra_pos.remove(&key) {
             self.tra_pos_entries = self.tra_pos_entries.saturating_sub(v.len());
         }
@@ -3077,7 +3088,16 @@ impl Machine {
                 self.end_token(token);
                 self.normal(db, None)
             }
-            _ => self.attached_record(rec, key, token, pos, now, in_window, cat),
+            _ => {
+                let d = self.attached_record(rec, key, token, pos, now, in_window, cat);
+                // A record of the binding that does not reach the own-record
+                // rule is judged not the agent's own: the binding is never
+                // judged again (L2 of the review of #418).
+                if !matches!(d, Decision::Normal { key: Some(k), .. } if k == key) {
+                    self.own_pending.remove(&key);
+                }
+                d
+            }
         }
     }
 
@@ -3322,30 +3342,25 @@ impl Machine {
                 // R42 item 5: the attachment's lifetime holds the record's
                 // time (this attach's offset, else the confirmed one).
                 let t = self.record_time(rec.header.time, measured.or(self.offset));
-                let mine = port.is_some_and(|p| self.ledger.is_own_attach(&label, id, p, Some(t)))
-                    && att.user.eq_ignore_ascii_case(&self.s.account)
+                let account = att.user.eq_ignore_ascii_case(&self.s.account)
                     && att.role.is_none_or(|r| r == "NONE");
+                let mine = port.is_some_and(|p| self.ledger.is_own_attach(&label, id, p, Some(t)))
+                    && account;
+                // L2 of the review of #418: the agent's session may not have
+                // registered its attachment yet; judged again at its first
+                // record (`own_late`).
+                if !mine
+                    && account
+                    && !in_window
+                    && !ambiguous
+                    && let Some(p) = port
+                {
+                    self.own_pending.insert(key, (p, rec.header.time));
+                }
                 if mine {
                     self.watermark.entry(i).or_insert(id);
-                    // The clock offset (R40 item 2, R42): only from an own
-                    // attach outside a window and not ambiguous, rounded to
-                    // the grid, provisional until confirmed. A pending
-                    // change that needs the probe is not overwritten by a
-                    // later attach (R42 item 3).
-                    if !in_window
-                        && !ambiguous
-                        && let Some(o) = measured
-                        && !self.offset_pending.is_some_and(|p| p.2)
-                    {
-                        let needs_probe =
-                            self.offset.is_some_and(|cur| (o - cur).abs() > OFFSET_STEP);
-                        if needs_probe {
-                            // R42 item 3: the probe re-confirms it.
-                            self.check_requested = true;
-                        }
-                        if self.offset != Some(o) {
-                            self.offset_pending = Some((o, key, needs_probe));
-                        }
+                    if !in_window && !ambiguous {
+                        self.learn_offset(key, measured);
                     }
                 }
                 mine
@@ -4190,6 +4205,11 @@ impl Machine {
                 // agent's texts call no routine, and crediting it would drop
                 // the group's relations).
                 if let Some(k) = key
+                    && (window || ambiguous || folded)
+                {
+                    self.own_pending.remove(&k);
+                }
+                if let Some(k) = key
                     && !window
                     && !ambiguous
                     && !folded
@@ -4301,10 +4321,75 @@ impl Machine {
         self.put(out, db, ev, key);
     }
 
+    /// L2 of the review of #418: a binding whose `ATTACH_DATABASE` was read
+    /// before the agent's session registered its attachment is judged
+    /// again, once, at its first record after the attach that reaches the
+    /// own-record rule,
+    /// by the criteria of [`Self::attach`] (the ledger's own attachment of
+    /// that id and local port whose lifetime holds the attach's time; the
+    /// account and role were checked then), and only while the binding is
+    /// anchored, not poisoned and not tainted.
+    fn own_late(&mut self, key: Key) {
+        let Some((port, time)) = self.own_pending.remove(&key) else {
+            return;
+        };
+        let DbId::Declared(i) = key.0 else {
+            return;
+        };
+        let Some(b) = self.bindings.get(&key) else {
+            return;
+        };
+        if b.own || !b.anchored || b.poisoned || b.tainted || b.kind != Kind::User {
+            return;
+        }
+        let label = self.s.databases[i].attach.clone();
+        let measured = self
+            .ledger
+            .opened(&label, key.1)
+            .and_then(|o| o.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+            .and_then(|agent| grid_offset(agent - naive_seconds(time)));
+        let t = self.record_time(time, measured.or(self.offset));
+        if self.ledger.is_own_attach(&label, key.1, port, Some(t)) {
+            self.watermark.entry(i).or_insert(key.1);
+            self.learn_offset(key, measured);
+            if let Some(b) = self.bindings.get_mut(&key) {
+                b.own = true;
+            }
+        }
+    }
+
+    /// The clock offset (R40 item 2, R42) from an own attach outside a
+    /// window and not ambiguous, rounded to the grid, provisional until
+    /// confirmed. A pending change that needs the probe is not overwritten
+    /// by a later attach (R42 item 3).
+    fn learn_offset(&mut self, key: Key, measured: Option<i64>) {
+        if let Some(o) = measured
+            && !self.offset_pending.is_some_and(|p| p.2)
+        {
+            let needs_probe = self.offset.is_some_and(|cur| (o - cur).abs() > OFFSET_STEP);
+            if needs_probe {
+                // R42 item 3: the probe re-confirms it.
+                self.check_requested = true;
+            }
+            if self.offset != Some(o) {
+                self.offset_pending = Some((o, key, needs_probe));
+            }
+        }
+    }
+
     /// The own-record rule (decision 6, R8 item 4, R13, R22, R35).
     /// `Some(true)`: the agent's own (a credit consumed); `Some(false)`:
     /// not; `None`: a closed-set text with no credit left (loud).
     fn own_record(&mut self, rec: &Record<'_>, key: Key, d: &Draft, pos: u64) -> Option<bool> {
+        // The attach itself is judged by `attach` (the session registers
+        // after it); its later records judge it again.
+        if !matches!(
+            rec.header.event,
+            Event::AttachDatabase | Event::CreateDatabase
+        ) {
+            self.own_late(key);
+        }
         let Some(b) = self.bindings.get(&key) else {
             return Some(false);
         };
