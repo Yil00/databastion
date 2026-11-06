@@ -708,7 +708,14 @@ impl Session {
         let account = self.last_fetch;
         let table = self.own.table.take();
         match (&self.own.ledger, self.own.id) {
-            (Some(l), Some(id)) => l.credit(&self.own.attach, id, text, table.as_deref(), account),
+            (Some(l), Some(id)) => {
+                l.credit(&self.own.attach, id, text, table.as_deref(), account);
+                // The late-kill window (review of #418): written within
+                // `own::WRITE_EVERY`, so a kill after the statement keeps
+                // its credit; spaced, so a paced scan does not rewrite the
+                // ledger per table.
+                l.schedule_persist();
+            }
             (Some(_), None) if self.own.early.len() < 64 => {
                 self.own.early.push((text.to_owned(), table, account));
             }
