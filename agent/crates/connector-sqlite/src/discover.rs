@@ -17,9 +17,17 @@
 //!   `LIMIT` read, the scan order reversed by the seed's parity.
 //! - A reader that dies costs one unit (`skipped_error`); after 3 deaths
 //!   the scan stops for the target (`coverage.reader_process_failed`).
-//! - The reader is closed before a pause longer than 30 s and started again
-//!   with the full procedure afterwards; a file whose `(st_dev, st_ino)`
-//!   changed ends the scan (the rest `skipped_error`).
+//! - The reader is closed before a pause of 30 s or more (before each
+//!   unit, review L1), and when its CPU time reaches 45 s (review L6,
+//!   below its 60 s `RLIMIT_CPU`), and started again with the full
+//!   procedure at the next unit; a file whose `(st_dev, st_ino)` changed
+//!   ends the scan (the rest `skipped_error`).
+//! - Every statement's deadline is `sqlite.max_statement_ms`, and never more
+//!   than the job's clamped statement timeout (review L2).
+//! - A unit that gets `SQLITE_BUSY` is retried once at its next paced turn,
+//!   then counted `skipped_error` (decision 3, review L7): the catalog,
+//!   the statistics, `table_xinfo`, the rowid bounds and the sampling
+//!   statements alike.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -35,7 +43,8 @@ use databastion_core::{
 use zeroize::Zeroizing;
 
 use crate::check::{
-    self, ScanNotes, Stage, TargetState, death_outcome, open_request, outcome, request_deadline,
+    self, ScanNotes, Stage, TargetState, deadline_for, death_outcome, open_request_with, outcome,
+    scan_statement_ms,
 };
 use crate::ipc::{
     CatalogRow, Code, ColumnRow, Failure, MAX_COLUMNS, MAX_ROWS, OpenInfo, Request, Response,
@@ -52,6 +61,12 @@ pub const MAX_TABLE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_DEATHS: u64 = 3;
 /// A reader is closed before a pause at least this long.
 pub const CLOSE_BEFORE_PAUSE: Duration = Duration::from_secs(30);
+/// A reader is restarted between units once its CPU time reaches this
+/// (review L6): below its `RLIMIT_CPU` ([`crate::sandbox::CPU_SECONDS`]),
+/// so a reader that lives for a whole scan (a duty cycle near 100 %, where
+/// the pacing debt never reaches [`CLOSE_BEFORE_PAUSE`]) never gets
+/// `SIGXCPU` on a legitimate large file.
+pub const RESTART_AFTER_CPU: Duration = Duration::from_secs(45);
 /// SQLite's own name for the file's database (decision 6).
 pub const DATABASE: &str = "main";
 
@@ -87,8 +102,46 @@ struct Scan<'a> {
     /// The agent's own view of the file, checked against every reader's
     /// open answer (review N2).
     view: Option<check::AgentView>,
+    /// Every statement's deadline (review L2, [`scan_statement_ms`]).
+    statement_ms: u32,
     deaths: u64,
     notes: ScanNotes,
+}
+
+/// Whether the reader is closed before the next unit (reviews L1 and L6):
+/// the pause owed before it is 30 s or more, or the reader's CPU time
+/// reached [`RESTART_AFTER_CPU`] or cannot be read (fail closed: a new
+/// reader).
+fn restart_due(debt: Duration, cpu: Option<Duration>) -> bool {
+    debt >= CLOSE_BEFORE_PAUSE || cpu.is_none_or(|c| c >= RESTART_AFTER_CPU)
+}
+
+/// Whether a failed unit is retried once, at its next paced turn
+/// (decision 3): `SQLITE_BUSY`.
+fn retried(e: &UnitError) -> bool {
+    matches!(e, UnitError::Failed(f) if f.code == Code::Busy)
+}
+
+/// One paced unit of work (the scan's reader, or a test's script).
+trait Units {
+    async fn unit(
+        &mut self,
+        req: Request,
+    ) -> Result<Paced<Result<Response, UnitError>>, ConnectorError>;
+}
+
+/// Review L7: every unit goes through this. A unit that gets
+/// `SQLITE_BUSY` is sent once more, at its next paced turn (the second
+/// `unit` pays the pause first); its second answer is final, `SQLITE_BUSY`
+/// again included (counted `skipped_error` by the caller).
+async fn unit_retried<U: Units>(
+    u: &mut U,
+    req: Request,
+) -> Result<Paced<Result<Response, UnitError>>, ConnectorError> {
+    match u.unit(req.clone()).await? {
+        Paced::Done(Err(e)) if retried(&e) => u.unit(req).await,
+        other => Ok(other),
+    }
 }
 
 /// What a whole-scan stop means for the objects left.
@@ -139,9 +192,12 @@ impl Scan<'_> {
             return Ok(());
         }
         let mut r = ReaderProcess::spawn().map_err(UnitError::Dead)?;
-        let deadline = request_deadline(self.settings);
+        let deadline = deadline_for(self.statement_ms);
         match r
-            .call(&Request::Open(open_request(self.settings)), deadline)
+            .call(
+                &Request::Open(open_request_with(self.settings, self.statement_ms)),
+                deadline,
+            )
             .await
         {
             Ok(Response::Opened(info)) => {
@@ -197,12 +253,33 @@ impl Scan<'_> {
         }
     }
 
-    /// One request to the reader (started first if needed), paced.
+    /// Closes the reader before the next unit when [`restart_due`]: it is
+    /// started again (and checked against the scan's `(st_dev, st_ino)`)
+    /// by that unit.
+    async fn before_unit(&mut self) {
+        let Some(reader) = self.reader.as_ref() else {
+            return;
+        };
+        let cpu = reader.cpu_time();
+        if restart_due(self.job.pacer().debt(), cpu) {
+            if cpu.is_none_or(|c| c >= RESTART_AFTER_CPU) {
+                tracing::info!(
+                    target_id = %self.target.id,
+                    "sqlite reader restarted: CPU time limit near, or not readable"
+                );
+            }
+            self.close().await;
+        }
+    }
+
+    /// One request to the reader (started first if needed), paced. The
+    /// reader is closed first when [`restart_due`].
     async fn unit(
         &mut self,
         req: Request,
     ) -> Result<Paced<Result<Response, UnitError>>, ConnectorError> {
-        let deadline = request_deadline(self.settings);
+        self.before_unit().await;
+        let deadline = deadline_for(self.statement_ms);
         let paced = self
             .job
             .paced(async {
@@ -268,6 +345,15 @@ impl Scan<'_> {
     }
 }
 
+impl Units for Scan<'_> {
+    async fn unit(
+        &mut self,
+        req: Request,
+    ) -> Result<Paced<Result<Response, UnitError>>, ConnectorError> {
+        Scan::unit(self, req).await
+    }
+}
+
 /// Runs a Discovery scan of one `sqlite` target.
 pub async fn discover(
     job: &ScanJob,
@@ -285,6 +371,7 @@ pub async fn discover(
         reader: None,
         opened: None,
         view: None,
+        statement_ms: scan_statement_ms(settings, job.statement_timeout_ms()),
         deaths: 0,
         notes: ScanNotes::default(),
     };
@@ -308,7 +395,7 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
     }
     // The open procedure and the catalog: the first statement reads the
     // schema.
-    let rows = match scan.unit(Request::Catalog).await? {
+    let rows = match unit_retried(scan, Request::Catalog).await? {
         Paced::OutOfTime => {
             job.skip_out_of_time(sink, 1);
             return Ok(());
@@ -328,6 +415,16 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
             tracing::info!(
                 target_id = %scan.target.id,
                 "sqlite file in rollback-journal mode not read (sqlite.rollback_mode: skip)"
+            );
+            return Ok(());
+        }
+        Paced::Done(Err(UnitError::Failed(f))) if f.code == Code::Busy => {
+            // `SQLITE_BUSY` twice (decision 3): the database counted
+            // `skipped_error`, the scan goes on to its end.
+            sink.add_coverage(cov(|c| c.error = 1));
+            tracing::info!(
+                target_id = %scan.target.id,
+                "sqlite catalog busy twice: the file is counted skipped_error"
             );
             return Ok(());
         }
@@ -367,10 +464,10 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
         "sqlite catalog read"
     );
     let estimated = if stat1 {
-        match scan.unit(Request::Stats).await? {
+        match unit_retried(scan, Request::Stats).await? {
             Paced::Done(Ok(Response::Stats(rows))) => rows
                 .into_iter()
-                .filter_map(|r| Some((String::from_utf8(r.name.to_vec()).ok()?, r.rows)))
+                .filter_map(|r| Some((std::str::from_utf8(&r.name).ok()?.to_owned(), r.rows)))
                 .collect(),
             Paced::OutOfTime => {
                 job.skip_out_of_time(sink, tables.len());
@@ -382,9 +479,8 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
         HashMap::new()
     };
     for (i, table) in tables.iter().enumerate() {
-        if job.pacer().debt() >= CLOSE_BEFORE_PAUSE {
-            scan.close().await;
-        }
+        // The turn below pays the pause: the reader is closed before it.
+        scan.before_unit().await;
         if job.turn().await? == Paced::OutOfTime {
             job.skip_out_of_time(sink, tables.len() - i);
             return Ok(());
@@ -487,6 +583,40 @@ fn response_fits(range: SampleRange, limit: u32, columns: usize, got: &Sampled) 
     shape && rowid
 }
 
+/// A sampled TEXT (or INTEGER) value as text for the classifiers (review
+/// L3). SQLite does not check that TEXT is UTF-8: a value written in
+/// Latin-1 or another 8-bit encoding is classified with each invalid
+/// sequence replaced by U+FFFD, as `String::from_utf8_lossy` does
+/// (decision 6 samples every TEXT value; dropping it would hide its
+/// ASCII-only content, an e-mail address or an IBAN, from Discovery).
+/// The string is allocated once at its final size, so no partial copy is
+/// left behind by a reallocation; the source is the caller's zeroizing
+/// buffer and the result is a `RawValue`, zeroized on drop.
+pub(crate) fn text_value(v: &[u8]) -> RawValue {
+    RawValue::new(lossy_utf8(v))
+}
+
+/// [`text_value`]'s text: `v` itself when it is UTF-8, otherwise each
+/// invalid sequence replaced by U+FFFD, in one allocation of the final
+/// size.
+fn lossy_utf8(v: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(v) {
+        return s.to_owned();
+    }
+    let size: usize = v
+        .utf8_chunks()
+        .map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 })
+        .sum();
+    let mut s = String::with_capacity(size);
+    for c in v.utf8_chunks() {
+        s.push_str(c.valid());
+        if !c.invalid().is_empty() {
+            s.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    s
+}
+
 /// The per-table outcome counters.
 fn count_failure(sink: &FindingSink, f: &Failure) {
     sink.add_coverage(cov(|c| match f.code {
@@ -542,7 +672,7 @@ fn table_failed(scan: &Scan<'_>, e: &UnitError, table: &str) -> Option<Stop> {
 
 macro_rules! unit_or {
     ($scan:expr, $req:expr, $table:expr) => {
-        match $scan.unit($req).await? {
+        match unit_retried($scan, $req).await? {
             Paced::OutOfTime => return Ok(Some(Stop::OutOfTime)),
             Paced::Done(Ok(r)) => Ok(r),
             Paced::Done(Err(e)) => Err(e),
@@ -575,7 +705,7 @@ async fn sample_table(
     // be a full table scan here).
     let names: Vec<String> = columns
         .iter()
-        .filter_map(|c| String::from_utf8(c.name.to_vec()).ok())
+        .filter_map(|c| std::str::from_utf8(&c.name).ok().map(str::to_owned))
         .collect();
     let kind = cas_guard::recognize(job.cas_stores(), [name], names.iter().map(String::as_str));
     if kind.is_some() {
@@ -680,26 +810,6 @@ async fn sample_table(
                     }
                     continue 'chunks;
                 }
-                Err(UnitError::Failed(f)) if f.code == Code::Busy => {
-                    // Retried once at the next paced turn.
-                    match unit_or!(
-                        scan,
-                        Request::Sample(SampleRequest {
-                            table: table.name.clone(),
-                            alias: if plain { None } else { alias },
-                            columns: chunk.to_vec(),
-                            range,
-                            limit: n - rows,
-                        }),
-                        name
-                    ) {
-                        Ok(Response::Sample(s)) => s,
-                        Ok(_) => {
-                            return Ok(table_failed(scan, &UnitError::Dead(Death::Protocol), name));
-                        }
-                        Err(e) => return Ok(table_failed(scan, &e, name)),
-                    }
-                }
                 Err(e) => return Ok(table_failed(scan, &e, name)),
             };
             // Review L8: a response that does not fit its request is a
@@ -724,9 +834,7 @@ async fn sample_table(
                         limited = true;
                         break;
                     }
-                    if let Ok(s) = String::from_utf8(v.to_vec()) {
-                        col.push(RawValue::new(s));
-                    }
+                    col.push(text_value(&v));
                 }
             }
             // Continue a range the response bound cut.
@@ -889,6 +997,146 @@ mod tests {
         let mut bad = ok(2, Some(9));
         bad.values[0].pop();
         assert!(!response_fits(SampleRange::From(5), 10, 1, &bad), "ragged");
+    }
+
+    /// Reviews L1 and L6: the reader is closed before a pause of 30 s or
+    /// more, and once its CPU time reaches 45 s (or cannot be read), never
+    /// otherwise.
+    #[test]
+    fn the_reader_restarts_before_long_pauses_and_near_its_cpu_limit() {
+        let s = Duration::from_secs;
+        assert!(!restart_due(Duration::ZERO, Some(Duration::ZERO)));
+        assert!(!restart_due(s(29), Some(s(44))));
+        assert!(!restart_due(
+            Duration::from_millis(29_999),
+            Some(Duration::from_millis(44_999))
+        ));
+        assert!(restart_due(s(30), Some(Duration::ZERO)), "a 30 s pause");
+        assert!(restart_due(s(700), Some(s(1))), "a killed unit's pause");
+        assert!(restart_due(Duration::ZERO, Some(s(45))), "near RLIMIT_CPU");
+        assert!(restart_due(Duration::ZERO, Some(s(59))));
+        assert!(restart_due(Duration::ZERO, None), "CPU time not readable");
+        // A 0.5 s unit at a 1 % duty cycle owes about 50 s.
+        assert!(restart_due(
+            databastion_core::pacing::pause_after(Duration::from_millis(500), 1),
+            Some(Duration::ZERO)
+        ));
+        let cpu_limit = Duration::from_secs(crate::sandbox::CPU_SECONDS);
+        assert!(RESTART_AFTER_CPU < cpu_limit);
+        // A unit runs at most its statement deadline plus 2 s before it is
+        // killed: a reader under the restart point never reaches the limit.
+        let longest =
+            check::deadline_for(databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE.1);
+        assert!(RESTART_AFTER_CPU + longest < cpu_limit);
+    }
+
+    /// A scripted reader: the answers of successive units, and the requests
+    /// it got.
+    struct Script {
+        answers: std::collections::VecDeque<Result<Response, UnitError>>,
+        got: Vec<Request>,
+    }
+
+    impl Units for Script {
+        async fn unit(
+            &mut self,
+            req: Request,
+        ) -> Result<Paced<Result<Response, UnitError>>, ConnectorError> {
+            self.got.push(req);
+            Ok(Paced::Done(self.answers.pop_front().unwrap_or_else(|| {
+                unreachable!("more units than scripted")
+            })))
+        }
+    }
+
+    fn busy() -> Result<Response, UnitError> {
+        Err(UnitError::Failed(Failure::new(Code::Busy)))
+    }
+
+    async fn run_script(
+        req: Request,
+        answers: Vec<Result<Response, UnitError>>,
+    ) -> (Result<Response, UnitError>, Vec<Request>) {
+        let mut s = Script {
+            answers: answers.into(),
+            got: Vec::new(),
+        };
+        let out = match unit_retried(&mut s, req).await {
+            Ok(Paced::Done(r)) => r,
+            _ => unreachable!("scripted units are done"),
+        };
+        assert!(s.answers.is_empty(), "every scripted answer used");
+        (out, s.got)
+    }
+
+    /// Review L7: every kind of unit that gets `SQLITE_BUSY` is sent once
+    /// more (the same request), and its second answer is final; other
+    /// failures and deaths are not retried.
+    #[tokio::test]
+    async fn busy_units_are_retried_once() {
+        let t = || Zeroizing::new(b"clients".to_vec());
+        let requests = [
+            Request::Catalog,
+            Request::Stats,
+            Request::Columns(t()),
+            Request::Bounds(t(), RowidAlias::Rowid),
+            Request::Sample(SampleRequest {
+                table: t(),
+                alias: Some(RowidAlias::Rowid),
+                columns: vec![Zeroizing::new(b"email".to_vec())],
+                range: SampleRange::From(1),
+                limit: 10,
+            }),
+        ];
+        for req in requests {
+            // Busy, then an answer: the answer.
+            let (out, got) =
+                run_script(req.clone(), vec![busy(), Ok(Response::Bounds(None))]).await;
+            assert!(matches!(out, Ok(Response::Bounds(None))));
+            assert!(got.len() == 2 && got.iter().all(|g| *g == req));
+            // Busy twice: the second Busy is final (skipped_error).
+            let (out, got) = run_script(req.clone(), vec![busy(), busy()]).await;
+            assert!(matches!(out, Err(UnitError::Failed(f)) if f.code == Code::Busy));
+            assert_eq!(got.len(), 2);
+            // Any other failure, or a death: not retried.
+            let (out, got) = run_script(
+                req.clone(),
+                vec![Err(UnitError::Failed(Failure::new(Code::Corrupt)))],
+            )
+            .await;
+            assert!(matches!(out, Err(UnitError::Failed(f)) if f.code == Code::Corrupt));
+            assert_eq!(got.len(), 1);
+            let (out, got) =
+                run_script(req.clone(), vec![Err(UnitError::Dead(Death::Deadline))]).await;
+            assert!(matches!(out, Err(UnitError::Dead(Death::Deadline))));
+            assert_eq!(got.len(), 1);
+        }
+        // A Busy failure is counted `skipped_error` once it is final.
+        let (sink, _rx) = FindingSink::channel(4);
+        count_failure(&sink, &Failure::new(Code::Busy));
+        assert_eq!(sink.coverage_for_tests().unwrap_or_default().error, 1);
+    }
+
+    /// Review L3: invalid UTF-8 is replaced, one U+FFFD per invalid
+    /// sequence, as `String::from_utf8_lossy`; valid text is unchanged.
+    #[test]
+    fn text_values_are_decoded_lossily() {
+        for v in [
+            b"jos\xe9@example.fr".as_slice(),
+            b"M\xfcller",
+            b"\xff\xfe",
+            b"\xe2\x82",
+            b"plain@example.com",
+            "\u{e9}lodie".as_bytes(),
+            b"",
+        ] {
+            let want = String::from_utf8_lossy(v);
+            let got = lossy_utf8(v);
+            assert_eq!(got, want.as_ref(), "{v:?}");
+            // One allocation of the final size: no reallocation left a
+            // partial copy behind.
+            assert_eq!(got.capacity(), got.len(), "{v:?}");
+        }
     }
 
     #[test]

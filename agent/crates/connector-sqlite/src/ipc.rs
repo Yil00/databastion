@@ -365,6 +365,78 @@ impl Failure {
     }
 }
 
+/// The engine code the agent keeps for a reader's code that is not a SQLite
+/// result code of [`SQLITE_ERROR_CODES`] (review L8). It is no SQLite code
+/// (the largest is `SQLITE_IOERR_CODEC`, 9226), and fits `EngineCode`.
+pub const ENGINE_CODE_OTHER: i32 = 65_535;
+
+/// SQLite's error result codes (SQLite 3.53, `sqlite3.h`): per primary
+/// code, the largest extended code number (`primary | (n << 8)`, `n` in
+/// `1..=max`), and the extended numbers outside that run. `SQLITE_OK`,
+/// `SQLITE_ROW`, `SQLITE_DONE` and their extended codes are not errors and
+/// never name a failure.
+const SQLITE_ERROR_CODES: [(i32, u8); 28] = [
+    (1, 6),   // SQLITE_ERROR: MISSING_COLLSEQ … UNABLE
+    (2, 0),   // SQLITE_INTERNAL
+    (3, 0),   // SQLITE_PERM
+    (4, 0),   // SQLITE_ABORT (ABORT_ROLLBACK, 2, below)
+    (5, 3),   // SQLITE_BUSY: RECOVERY, SNAPSHOT, TIMEOUT
+    (6, 2),   // SQLITE_LOCKED: SHAREDCACHE, VTAB
+    (7, 0),   // SQLITE_NOMEM
+    (8, 6),   // SQLITE_READONLY: RECOVERY … DIRECTORY
+    (9, 0),   // SQLITE_INTERRUPT
+    (10, 36), // SQLITE_IOERR: READ … CODEC
+    (11, 3),  // SQLITE_CORRUPT: VTAB, SEQUENCE, INDEX
+    (12, 0),  // SQLITE_NOTFOUND
+    (13, 0),  // SQLITE_FULL
+    (14, 6),  // SQLITE_CANTOPEN: NOTEMPDIR … SYMLINK
+    (15, 0),  // SQLITE_PROTOCOL
+    (16, 0),  // SQLITE_EMPTY
+    (17, 0),  // SQLITE_SCHEMA
+    (18, 0),  // SQLITE_TOOBIG
+    (19, 12), // SQLITE_CONSTRAINT: CHECK … DATATYPE
+    (20, 0),  // SQLITE_MISMATCH
+    (21, 0),  // SQLITE_MISUSE
+    (22, 0),  // SQLITE_NOLFS
+    (23, 1),  // SQLITE_AUTH: AUTH_USER
+    (24, 0),  // SQLITE_FORMAT
+    (25, 0),  // SQLITE_RANGE
+    (26, 0),  // SQLITE_NOTADB
+    (27, 3),  // SQLITE_NOTICE: RECOVER_WAL, RECOVER_ROLLBACK, RBU
+    (28, 1),  // SQLITE_WARNING: AUTOINDEX
+];
+
+/// Review L8: the engine code the agent keeps from a reader's failure.
+/// Only SQLite's primary and extended error result codes (a closed list)
+/// pass; anything else, which a compromised reader could choose, becomes
+/// [`ENGINE_CODE_OTHER`].
+#[must_use]
+pub fn sqlite_engine_code(code: i32) -> i32 {
+    let primary = code & 0xFF;
+    let extended = code >> 8;
+    let known = SQLITE_ERROR_CODES.iter().any(|&(p, max)| {
+        p == primary
+            && (extended == 0
+                || (1..=i32::from(max)).contains(&extended)
+                // SQLITE_ABORT_ROLLBACK (4 | 2 << 8): the only extended
+                // code of SQLITE_ABORT.
+                || (p == 4 && extended == 2))
+    });
+    if known { code } else { ENGINE_CODE_OTHER }
+}
+
+impl Failure {
+    /// The same failure with its engine code checked by
+    /// [`sqlite_engine_code`] (the agent's side of a reader response).
+    #[must_use]
+    pub fn with_known_engine_code(self) -> Self {
+        Self {
+            engine_code: self.engine_code.map(sqlite_engine_code),
+            ..self
+        }
+    }
+}
+
 /// The path and file rules of decision 2, by name (logged with the target
 /// id, never the path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1342,6 +1414,74 @@ mod tests {
 
     fn body(frame: &[u8]) -> &[u8] {
         frame.get(4..).unwrap()
+    }
+
+    /// Review L8: only SQLite's error result codes pass from a reader; any
+    /// other value becomes the fixed "other" code.
+    #[test]
+    fn only_sqlite_result_codes_are_kept() {
+        for known in [
+            1,              // SQLITE_ERROR
+            5,              // SQLITE_BUSY
+            5 | (3 << 8),   // SQLITE_BUSY_TIMEOUT
+            8 | (3 << 8),   // SQLITE_READONLY_ROLLBACK
+            10 | (36 << 8), // SQLITE_IOERR_CODEC
+            11,             // SQLITE_CORRUPT
+            11 | (3 << 8),  // SQLITE_CORRUPT_INDEX
+            4 | (2 << 8),   // SQLITE_ABORT_ROLLBACK
+            19 | (12 << 8), // SQLITE_CONSTRAINT_DATATYPE
+            23 | (1 << 8),  // SQLITE_AUTH_USER
+            26,             // SQLITE_NOTADB
+            28 | (1 << 8),  // SQLITE_WARNING_AUTOINDEX
+            267,            // SQLITE_CORRUPT_VTAB
+        ] {
+            assert_eq!(sqlite_engine_code(known), known, "{known}");
+        }
+        for other in [
+            0,              // SQLITE_OK
+            100,            // SQLITE_ROW
+            101,            // SQLITE_DONE
+            1 << 8,         // SQLITE_OK_LOAD_PERMANENTLY
+            29,             // past SQLITE_WARNING
+            1 | (7 << 8),   // past SQLITE_ERROR_UNABLE
+            4 | (1 << 8),   // not an extended SQLITE_ABORT code
+            10 | (37 << 8), // past SQLITE_IOERR_CODEC
+            2 | (1 << 8),   // SQLITE_INTERNAL has none
+            -1,
+            -255,
+            i32::MIN,
+            i32::MAX,
+            0x7FFF_FF05,
+        ] {
+            assert_eq!(sqlite_engine_code(other), ENGINE_CODE_OTHER, "{other}");
+        }
+        assert_eq!(sqlite_engine_code(ENGINE_CODE_OTHER), ENGINE_CODE_OTHER);
+        let f = Failure {
+            code: Code::Corrupt,
+            engine_code: Some(-42),
+            rule: None,
+        };
+        assert_eq!(
+            f.with_known_engine_code().engine_code,
+            Some(ENGINE_CODE_OTHER)
+        );
+        assert_eq!(
+            Failure::new(Code::Busy)
+                .with_known_engine_code()
+                .engine_code,
+            None
+        );
+    }
+
+    proptest! {
+        /// Whatever a reader sends, the code kept is a listed one or the
+        /// "other" code.
+        #[test]
+        fn kept_engine_codes_are_closed(code in any::<i32>()) {
+            let kept = sqlite_engine_code(code);
+            prop_assert!(kept == code || kept == ENGINE_CODE_OTHER);
+            prop_assert!(kept > 0 && kept <= 0xFFFF);
+        }
     }
 
     fn requests() -> Vec<Request> {

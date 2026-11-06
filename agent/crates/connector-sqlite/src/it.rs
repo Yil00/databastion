@@ -516,6 +516,7 @@ fn writable_files_and_mounts_are_refused() {
         refuse_agent_writable: false,
         require_read_only_fs: true,
         exact_descriptor_set: false,
+        open_no_links: true,
     };
     assert_eq!(open_code(&p, true, read_only_fs_only), Code::NotReadOnlyFs);
 }
@@ -805,4 +806,123 @@ fn utf16_files_are_read_as_utf8() {
         panic!()
     };
     assert_eq!(p.encoding, 2);
+}
+
+/// Review L3: a TEXT value that is not UTF-8 (Latin-1 bytes, which SQLite
+/// stores as given) comes out of the reader as its bytes, and the agent
+/// classifies it with each invalid sequence replaced, so its ASCII content
+/// is still found; nothing is dropped silently.
+#[test]
+fn latin1_text_is_classified_not_dropped() {
+    let d = Dir::new("latin1");
+    let p = d.path("l1.db");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch("PRAGMA journal_mode = DELETE; CREATE TABLE t (v TEXT);")
+        .unwrap();
+    // `M\xfcller <mullerN@example.fr>` in Latin-1, as a legacy application
+    // writes it: the name is not UTF-8, the address is ASCII.
+    for i in 0..20 {
+        c.execute(
+            "INSERT INTO t VALUES (CAST(X'4DFC6C6C6572203C6D756C6C6572' || ?1 || \
+             X'406578616D706C652E66723E' AS TEXT))",
+            [i.to_string()],
+        )
+        .unwrap();
+    }
+    let kinds: Vec<String> = c
+        .prepare("SELECT typeof(v) FROM t")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(kinds.len() == 20 && kinds.iter().all(|k| k == "text"));
+    drop(c);
+    let mut s = session(&p);
+    let _ = catalog(&mut s);
+    let a = sampled(sample(
+        &mut s,
+        "t",
+        Some(RowidAlias::Rowid),
+        &["v"],
+        SampleRange::From(1),
+        50,
+    ));
+    let raw: Vec<&[u8]> = a.values[0]
+        .iter()
+        .map(|v| v.as_deref().unwrap().as_slice())
+        .collect();
+    assert_eq!(raw.len(), 20);
+    assert_eq!(raw[0], b"M\xfcller <muller0@example.fr>");
+    assert!(std::str::from_utf8(raw[0]).is_err());
+    let values: Vec<_> = raw.iter().map(|v| crate::discover::text_value(v)).collect();
+    let samples: Vec<_> = values.iter().map(|v| v.as_sample()).collect();
+    let found = databastion_core::ScanJob::default().classify("contact", &samples);
+    assert!(
+        found.iter().any(|f| f.classifier().as_str() == "pii.email"),
+        "the e-mail addresses are still classified"
+    );
+}
+
+/// Review N2: the response budget is checked before a row is added, so a
+/// cut response never passes it, and its continuation starts after the
+/// last row kept.
+#[test]
+fn a_cut_response_stays_within_its_budget() {
+    let d = Dir::new("budget");
+    let p = d.path("b.db");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT);",
+    )
+    .unwrap();
+    for _ in 0..400 {
+        c.execute(
+            "INSERT INTO t (a, b) VALUES (?1, ?2)",
+            ["a".repeat(4_000), "b".repeat(3_000)],
+        )
+        .unwrap();
+    }
+    drop(c);
+    let mut s = session(&p);
+    let _ = catalog(&mut s);
+    let a = sampled(sample(
+        &mut s,
+        "t",
+        Some(RowidAlias::Rowid),
+        &["a", "b"],
+        SampleRange::From(1),
+        400,
+    ));
+    assert!(a.truncated && a.rows > 0 && a.rows < 400, "{}", a.rows);
+    let bytes: usize = a
+        .values
+        .iter()
+        .flatten()
+        .map(|v| crate::ipc::CELL_OVERHEAD + v.as_ref().map_or(0, |b| b.len()))
+        .sum();
+    assert!(
+        bytes <= crate::ipc::MAX_RESPONSE - 64 * 1024,
+        "{bytes} over the budget"
+    );
+    // The budget would have taken one more row than it holds only by
+    // passing it.
+    let row = 2 * crate::ipc::CELL_OVERHEAD + 7_000;
+    assert!(bytes + row > crate::ipc::MAX_RESPONSE - 64 * 1024);
+    assert!(Response::Sample(a.clone()).encode().is_ok());
+    let last = a.last_rowid.unwrap();
+    assert_eq!(last, i64::from(a.rows));
+    let b = sampled(sample(
+        &mut s,
+        "t",
+        Some(RowidAlias::Rowid),
+        &["a", "b"],
+        SampleRange::From(last + 1),
+        10,
+    ));
+    assert_eq!(
+        (b.rows, b.last_rowid, b.truncated),
+        (10, Some(last + 10), false)
+    );
 }

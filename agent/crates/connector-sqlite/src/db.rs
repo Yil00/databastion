@@ -607,26 +607,43 @@ impl Db {
                 ..Sampled::default()
             };
             let mut bytes = 0usize;
+            let mut cells: Vec<Option<Zeroizing<Vec<u8>>>> = Vec::with_capacity(out.values.len());
             while let Some(row) = rows.next().map_err(map_error)? {
-                if req.alias.is_some()
-                    && let ValueRef::Integer(id) = row.get_ref(0).map_err(map_error)?
-                {
-                    out.last_rowid = Some(id);
-                }
-                for (i, col) in out.values.iter_mut().enumerate() {
+                let rowid = match req.alias {
+                    Some(_) => match row.get_ref(0).map_err(map_error)? {
+                        ValueRef::Integer(id) => Some(id),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                cells.clear();
+                let mut row_bytes = 0usize;
+                for i in 0..out.values.len() {
                     let cell = match row.get_ref(first + i).map_err(map_error)? {
                         ValueRef::Text(t) => Some(cut(t)),
                         ValueRef::Integer(v) => Some(Zeroizing::new(sql::decimal(v).into_bytes())),
                         _ => None,
                     };
-                    bytes += CELL_OVERHEAD + cell.as_ref().map_or(0, |c| c.len());
-                    col.push(cell);
+                    row_bytes += CELL_OVERHEAD + cell.as_ref().map_or(0, |c| c.len());
+                    cells.push(cell);
                 }
-                out.rows += 1;
-                if bytes > SAMPLE_RESPONSE_BUDGET && out.rows < req.limit {
+                // Review N2: the budget is checked before the row is added.
+                // A row that would pass it is left for the continuation
+                // (from the last rowid kept); the first row of a response
+                // is always kept (at most 64 values of 4 096 bytes, far
+                // below the budget).
+                if out.rows > 0 && bytes + row_bytes > SAMPLE_RESPONSE_BUDGET {
                     out.truncated = true;
                     break;
                 }
+                bytes += row_bytes;
+                if rowid.is_some() {
+                    out.last_rowid = rowid;
+                }
+                for (col, cell) in out.values.iter_mut().zip(cells.drain(..)) {
+                    col.push(cell);
+                }
+                out.rows += 1;
             }
             Ok(out)
         })();
@@ -682,7 +699,8 @@ impl Db {
 }
 
 /// A value cut to [`MAX_VALUE`] bytes on a character boundary (invalid
-/// UTF-8 is kept as it is, cut at the bound: the agent drops it).
+/// UTF-8 is kept as it is, cut at the bound: the agent classifies it with
+/// its invalid sequences replaced, review L3).
 fn cut(t: &[u8]) -> Zeroizing<Vec<u8>> {
     if t.len() <= MAX_VALUE {
         return Zeroizing::new(t.to_vec());

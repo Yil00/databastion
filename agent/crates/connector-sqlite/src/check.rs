@@ -247,20 +247,50 @@ pub fn pre_check(settings: &SqliteSettings) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The open request of a target.
+/// The open request of a target, for `check()`: the statement deadline is
+/// `sqlite.max_statement_ms`.
 #[must_use]
 pub fn open_request(settings: &SqliteSettings) -> OpenRequest {
+    open_request_with(settings, settings.max_statement_ms())
+}
+
+/// The open request of a target with the statement deadline
+/// `max_statement_ms` (a scan's: [`scan_statement_ms`]).
+#[must_use]
+pub fn open_request_with(settings: &SqliteSettings, max_statement_ms: u32) -> OpenRequest {
     OpenRequest {
         path: zeroize::Zeroizing::new(files::path_bytes(settings.path())),
-        max_statement_ms: settings.max_statement_ms(),
+        max_statement_ms,
         rollback_read: settings.rollback_mode() == RollbackMode::Read,
     }
 }
 
-/// The deadline of one request.
+/// The statement deadline of a scan (decision 3, review L2):
+/// `sqlite.max_statement_ms`, and never more than the job's clamped
+/// statement timeout. Both are at least 50 ms (the job's at least 100 ms),
+/// so the result stays in the reader's range
+/// ([`databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE`]); it is
+/// clamped to it all the same.
+#[must_use]
+pub fn scan_statement_ms(settings: &SqliteSettings, job_statement_timeout_ms: u32) -> u32 {
+    let (lo, hi) = databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE;
+    settings
+        .max_statement_ms()
+        .min(job_statement_timeout_ms)
+        .clamp(lo, hi)
+}
+
+/// The deadline of one request, for `check()`.
 #[must_use]
 pub fn request_deadline(settings: &SqliteSettings) -> Duration {
-    Duration::from_millis(u64::from(settings.max_statement_ms())) + DEADLINE_SLACK
+    deadline_for(settings.max_statement_ms())
+}
+
+/// The deadline of one request whose statement deadline is
+/// `max_statement_ms`: plus 2 s for the IPC and the reader's own checks.
+#[must_use]
+pub fn deadline_for(max_statement_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(max_statement_ms)) + DEADLINE_SLACK
 }
 
 fn log_refusal(target_id: &str, f: Failure, stage: Stage) {
@@ -487,6 +517,56 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L2: a scan's statement deadline is the smaller of
+    /// `sqlite.max_statement_ms` and the job's clamped statement timeout,
+    /// always inside the reader's range, and the open request and the
+    /// request deadline carry it.
+    #[test]
+    fn the_scan_deadline_never_exceeds_the_job_statement_timeout() {
+        use databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE;
+        use databastion_core::config::{Limits, TargetConfig};
+        let settings = |ms| SqliteSettings::for_tests("/srv/a.db".into(), ms, RollbackMode::Skip);
+        assert_eq!(scan_statement_ms(&settings(500), 30_000), 500);
+        assert_eq!(scan_statement_ms(&settings(500), 120), 120);
+        assert_eq!(scan_statement_ms(&settings(50), 100), 50);
+        assert_eq!(scan_statement_ms(&settings(5_000), 4_000), 4_000);
+        let (lo, hi) = MAX_STATEMENT_MS_RANGE;
+        for ms in [lo, 100, 500, hi] {
+            for job in [0, 1, 99, 100, 101, 499, 500, 5_000, 30_000, u32::MAX] {
+                let got = scan_statement_ms(&settings(ms), job);
+                assert!((lo..=hi).contains(&got), "{ms} {job} {got}");
+                assert!(got <= ms, "{ms} {job} {got}");
+                assert!(got <= job.max(lo), "{ms} {job} {got}");
+            }
+        }
+        // From a job clamped by the local limits.
+        let limits = Limits {
+            statement_timeout_ms: 200,
+            ..Limits::default()
+        };
+        let s = settings(500);
+        let target = TargetConfig::sqlite_for_tests("t", s.clone());
+        let key = std::sync::Arc::new(
+            databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap_or_else(|_| {
+                unreachable!("a 32-byte key");
+            }),
+        );
+        let job = databastion_core::ScanJob::new(
+            databastion_core::ScanParams::contract_defaults(),
+            &target,
+            &limits,
+            key,
+        );
+        let ms = scan_statement_ms(&s, job.statement_timeout_ms());
+        assert_eq!(ms, 200);
+        assert_eq!(open_request_with(&s, ms).max_statement_ms, 200);
+        assert_eq!(
+            deadline_for(ms),
+            Duration::from_millis(200) + DEADLINE_SLACK
+        );
+        assert_eq!(open_request(&s).max_statement_ms, 500);
+    }
 
     /// Every code has a row of decision 7's table, and the notes are the
     /// registered SQLite ones.
