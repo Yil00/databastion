@@ -1249,11 +1249,14 @@ fn the_agent_never_enables_sqlite_fuzzing() {
     }
 }
 
-/// The code lines of a source before its test module: up to a
-/// `#[cfg(test)]` attribute whose item is `mod tests` (other attributes may
-/// stand between them). A bare `mod tests {` does not end the scan
-/// (security review L1 of #416).
-fn lines_before_cfg_test_mod(text: &str) -> Vec<&str> {
+/// The code lines of a source outside its test modules: a `#[cfg(test)]`
+/// attribute whose item is an inline `mod tests { … }` (other attributes
+/// may stand between them) skips that module's brace-balanced body, and
+/// the scan goes on after it (#416 final review N-L1: code placed after the
+/// test module is still checked); `#[cfg(test)] mod tests;` is a
+/// declaration, skipped alone (its file is scanned as a source of its own).
+/// A bare `mod tests {` is scanned (security review L1 of #416).
+fn lines_outside_cfg_test_mods(text: &str) -> Vec<&str> {
     let lines: Vec<&str> = code_lines(text).collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -1261,21 +1264,80 @@ fn lines_before_cfg_test_mod(text: &str) -> Vec<&str> {
         if lines[i].trim() == "#[cfg(test)]" {
             let item = lines[i + 1..]
                 .iter()
-                .map(|l| l.trim())
-                .find(|l| !l.is_empty() && !l.starts_with("#["));
-            if item.is_some_and(|l| {
-                l.starts_with("mod tests ")
-                    || l.starts_with("mod tests{")
-                    || l.starts_with("mod tests;")
-                    || l.starts_with("pub(crate) mod tests ")
-            }) {
-                break;
+                .position(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with("#[")
+                })
+                .map(|k| i + 1 + k);
+            if let Some(at) = item {
+                let l = lines[at].trim();
+                let l = l.strip_prefix("pub(crate) ").unwrap_or(l);
+                if l.starts_with("mod tests;") {
+                    i = at + 1;
+                    continue;
+                }
+                if l.starts_with("mod tests ") || l.starts_with("mod tests{") {
+                    i = match module_end(&lines, at) {
+                        Some(end) => end + 1,
+                        // Unbalanced: nothing after it is taken as test code.
+                        None => at + 1,
+                    };
+                    continue;
+                }
             }
         }
         out.push(lines[i]);
         i += 1;
     }
     out
+}
+
+/// The index of the line that closes the brace-balanced item starting at
+/// line `start` (braces inside string and character literals, and after a
+/// `//`, are not counted); `None` when it never closes.
+fn module_end(lines: &[&str], start: usize) -> Option<usize> {
+    let mut depth = 0i64;
+    let mut opened = false;
+    let mut in_str = false;
+    for (k, line) in lines.iter().enumerate().skip(start) {
+        let b = line.as_bytes();
+        let mut j = 0;
+        while j < b.len() {
+            let c = b[j];
+            if in_str {
+                match c {
+                    b'\\' => j += 1,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+            } else {
+                match c {
+                    b'/' if b.get(j + 1) == Some(&b'/') => break,
+                    b'"' => in_str = true,
+                    // A character literal (`'{'`, `'\''`), not a lifetime.
+                    b'\'' if b.get(j + 2) == Some(&b'\'') => j += 2,
+                    b'\'' if b.get(j + 1) == Some(&b'\\') => {
+                        // To its closing quote, after the escaped character.
+                        j += b
+                            .get(j + 3..)
+                            .and_then(|r| r.iter().position(|x| *x == b'\''))
+                            .map_or(0, |p| p + 3);
+                    }
+                    b'{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        if opened && depth <= 0 {
+            return Some(k);
+        }
+    }
+    None
 }
 
 /// Every identifier-like token of `line` (`[A-Za-z0-9_]+`) that names
@@ -1384,7 +1446,7 @@ fn openat2_outside_tests() -> Vec<(String, String)> {
                 continue;
             }
             let text = fs::read_to_string(source).unwrap();
-            for l in lines_before_cfg_test_mod(&text) {
+            for l in lines_outside_cfg_test_mods(&text) {
                 if openat2_tokens(l) > 0 {
                     found.push((shown.clone(), l.trim().to_owned()));
                 }
@@ -1425,7 +1487,7 @@ fn openat2_only_through_core_fs() {
         );
     }
     let text = fs::read_to_string(&core_fs).unwrap();
-    for l in lines_before_cfg_test_mod(&text) {
+    for l in lines_outside_cfg_test_mods(&text) {
         for banned in [
             "tracing",
             "log::",
@@ -1460,11 +1522,35 @@ fn openat2_rule_helpers() {
     }
     assert_eq!(openat2_tokens("rustix::fs::openat(CWD, p, f, m)"), 0);
     let text = "fn a() {}\nmod tests {\nfn b() { openat2(); }\n}\n";
-    assert_eq!(lines_before_cfg_test_mod(text).len(), 4);
+    assert_eq!(lines_outside_cfg_test_mods(text).len(), 4);
     let text = "fn a() {}\n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\nfn b() {}\n}\n";
-    assert_eq!(lines_before_cfg_test_mod(text), ["fn a() {}"]);
+    assert_eq!(lines_outside_cfg_test_mods(text), ["fn a() {}"]);
     let text = "#[cfg(test)]\nfn helper() {}\nfn c() {}\n";
-    assert_eq!(lines_before_cfg_test_mod(text).len(), 3);
+    assert_eq!(lines_outside_cfg_test_mods(text).len(), 3);
+    // #416 final review N-L1: a function after the inline test module is
+    // scanned, the module's body (braces in literals included) is not.
+    let text = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() {\n        let s = \"}}\";\n        let c = '}';\n        let q = '\\'';\n        openat2(); // }\n    }\n}\nfn after() { openat2(); }\n";
+    assert_eq!(
+        lines_outside_cfg_test_mods(text),
+        ["fn a() {}", "fn after() { openat2(); }"]
+    );
+    let found: usize = lines_outside_cfg_test_mods(text)
+        .iter()
+        .map(|l| openat2_tokens(l))
+        .sum();
+    assert_eq!(found, 1);
+    // `#[cfg(test)] mod tests;` is a declaration, not a cut-off.
+    let text = "fn a() {}\n#[cfg(test)]\nmod tests;\nfn after() { openat2(); }\n";
+    assert_eq!(
+        lines_outside_cfg_test_mods(text),
+        ["fn a() {}", "fn after() { openat2(); }"]
+    );
+    // A one-line module, and a `pub(crate)` one.
+    let text = "#[cfg(test)]\nmod tests { fn t() {} }\n#[cfg(test)]\npub(crate) mod tests {\n}\nfn z() {}\n";
+    assert_eq!(lines_outside_cfg_test_mods(text), ["fn z() {}"]);
+    // Never closed: the rest is scanned (fail closed).
+    let text = "#[cfg(test)]\nmod tests {\nfn y() { openat2(); }\n";
+    assert_eq!(lines_outside_cfg_test_mods(text).len(), 1);
     let fb = workspace_root().join("crates/connector-firebird/src");
     let mut src = Vec::new();
     rust_sources(&fb, &mut src);
