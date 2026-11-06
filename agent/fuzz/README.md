@@ -45,6 +45,7 @@ tests of each connector (`src/proptests.rs`).
 | `firebird_proc_net_tcp` | `…::fuzz::proc_net_tcp` | `/proc/net/tcp` tables for the peer-uid rule (decision 3, security review L1): the right row or none |
 | `firebird_catalog` | `…::fuzz::catalog` | Discovery's reads (decision 5): rows of the relation list, the column list or a sampling statement, through the catalog parsing, the conversions, the column batches and built statements, and the sampled values kept or dropped |
 | `firebird_trace_log` | `…::fuzz::trace_log` | The system audit trace log ([ADR-0060](../../docs/adr/0060-firebird-connector.md) decision 6, "Parsing a hostile text log"): lines assembled into bounded records, each parsed under the 4.0 and 5.0 name-line grammars, converted with a fixed catalog and made an event |
+| `firebird_trace_stream` | `…::fuzz::trace_stream` | The Audit stream's multi-record state machine ([ADR-0060](../../docs/adr/0060-firebird-connector.md) R1, R5, R7, R25 and R29; review L1 of P10-F): the first byte selects the settings (grammar, proof 11, SuperServer, a confirmed run), the rest is lines assembled into records and pushed into one stream with a fixed catalog and ledger; a line of one byte `0x01` or `0x02` advances the reading clock by 11 s or 61 s and runs the reading-time bounds, `0x03` confirms another run. No record may panic (the isolation counter stays 0) and the state stays within every cap. Seeded by `firebird_trace_seed.py` with whole records of the recorded logs of `crates/connector-firebird/testdata/` |
 | `firebird_trace_conf` | `…::fuzz::trace_conf` | The configuration files of the Audit proofs (decision 6, refinement R2): `firebird.conf`, `databases.conf` and the trace configuration, which is then evaluated against one declared database |
 | `firebird_host_identity` | `…::fuzz::host_identity` | The identity files of the readers check ([ADR-0060](../../docs/adr/0060-firebird-connector.md) refinement of 2026-10-31, R45 item 7): the passwd, group, subordinate id, `nsswitch.conf` and `mountinfo` grammars, and the mount-id lookup: the only entry with the id, or none (R52 item 4) |
 | `firebird_checkpoint` | `…::fuzz::checkpoint` | The Audit stream's persisted parser checkpoint ([ADR-0060](../../docs/adr/0060-firebird-connector.md) R25 items 7 and 9): the checkpoint body, the persisted ledger, the envelope, and the parser state restored into a stream (after its identity and run): refused whole or restored within the stream's bounds, and a restored state restores to itself |
@@ -69,7 +70,8 @@ YAML input rarely gets past the `--- !<class>` header the pre-scanner requires. 
 `cas_audit_log` with the token request and response records of the redacted CAS 8.0.2 excerpt
 `crates/connector-cas/fixtures/cas-8.0.2-oauth-oidc-audit.jsonl` (fake user, every token and ticket
 replaced): all of them as one input, and each request with its response, so the correlation state
-sees request and response pairs from the start. The other targets start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
+sees request and response pairs from the start. It seeds `firebird_trace_stream` with whole records
+of the recorded Firebird trace logs (`firebird_trace_seed.py`, the pinned dev images' fake data). The other targets start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
 
 Longer campaigns with AddressSanitizer need a nightly toolchain and cargo-fuzz:
 

@@ -321,8 +321,8 @@ impl Ledger {
     }
 
     /// Test support: a credit issued at `at` (the record times of the
-    /// stream tests are fixed).
-    #[cfg(test)]
+    /// stream tests are fixed; the fuzz target `trace_stream`).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn credit_at(
         &self,
         attach: &str,
@@ -337,8 +337,9 @@ impl Ledger {
         }
     }
 
-    /// Test support: an attachment opened at `opened`.
-    #[cfg(test)]
+    /// Test support: an attachment opened at `opened` (and the fuzz
+    /// target `trace_stream`).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn register_at(
         &self,
         attach: &str,
