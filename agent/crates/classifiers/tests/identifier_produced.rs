@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use databastion_classifiers::detect::scan_tokens;
 use databastion_classifiers::names::{
     self, IDENTIFIER_PRODUCED_RULES, PathPart, normalize_field_path, normalize_ldap_attribute,
     normalize_ldap_dn, normalize_path,
@@ -203,6 +204,70 @@ fn alphabet() -> impl Strategy<Value = String> {
     prop::collection::vec(pieces, 0..24).prop_map(|v| v.concat())
 }
 
+/// The indices of the `.`-separated parts of `input` that one detector
+/// token spans together with the refused value (at part `at`): read as the
+/// names module reads a name, raw and with the ASCII separators as spaces.
+fn joined_with_value(input: &str, value: &str, at: usize) -> Vec<usize> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for part in input.split('.') {
+        ranges.push(offset..offset + part.len());
+        offset += part.len() + 1;
+    }
+    let n = value.split('.').count();
+    let value_range = ranges[at].start..ranges[at + n - 1].end;
+    let spaced: String = input
+        .chars()
+        .map(|c| {
+            if matches!(c, '.' | '_' | '-' | '/') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let overlap =
+        |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| a.start < b.end && b.start < a.end;
+    let tokens: Vec<_> = scan_tokens(input, &|_| true)
+        .into_iter()
+        .chain(scan_tokens(&spaced, &|_| true))
+        .map(|t| t.range)
+        .filter(|t| overlap(t, &value_range))
+        .collect();
+    ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| tokens.iter().any(|t| overlap(t, r)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The CI failure on #419: `txyy` after the dotted MAC `be45.f207.2c8b`
+/// completes `BE45 F207 2C8B TXYY`, an IBAN whose check digits hold
+/// (country length and mod 97, the classifier's rule). The whole IBAN is a
+/// value: `txyy` is masked with it (fail closed), the word after it kept.
+/// With a neighbour whose checksum fails (`txyz`), only the MAC is masked.
+#[test]
+fn a_neighbour_completing_an_iban_is_masked_with_the_value() {
+    let keys = |s: &'static str| s.split('.').map(PathPart::Key).collect::<Vec<_>>();
+    for (input, want) in [
+        ("be45.f207.2c8b.txyy.gg", "*.gg"),
+        ("be45.f207.2c8b.txyz.gg", "*.txyz.gg"),
+    ] {
+        assert_eq!(normalize_path(input).as_str(), want, "{input}");
+        assert_eq!(normalize_field_path(&keys(input)).as_str(), want, "{input}");
+    }
+    assert_eq!(
+        joined_with_value("be45.f207.2c8b.txyy.gg", "be45.f207.2c8b", 0),
+        [0, 1, 2, 3]
+    );
+    assert!(
+        joined_with_value("be45.f207.2c8b.txyz.gg", "be45.f207.2c8b", 0)
+            .iter()
+            .all(|i| *i < 3)
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4000))]
 
@@ -372,12 +437,17 @@ proptest! {
             prop_assert!(!out.contains(&value), "{:?} -> {:?}", input, out);
             // Words of non-hexadecimal letters are kept (first names
             // excepted), unless the whole name is `*` (the digit bounds of
-            // rule 5 count the neighbouring words' digits too).
-            for w in pre.iter().chain(&post).filter(|w| {
+            // rule 5 count the neighbouring words' digits too), or the word
+            // and the value together are one detected value (an IBAN read
+            // across the dots: masking the word too is fail closed, keeping
+            // it would send part of the value).
+            let joined = joined_with_value(&input, &value, pre.len());
+            for w in pre.iter().chain(&post).enumerate().filter(|(i, w)| {
                 out != "*"
                     && w.chars().all(|c| ('g'..='z').contains(&c))
                     && !names::segment_looks_like_value(w)
-            }) {
+                    && !joined.contains(&(if *i < pre.len() { *i } else { *i + 1 }))
+            }).map(|(_, w)| w) {
                 prop_assert!(out.split('.').any(|s| s.trim_end_matches("[]") == w), "{:?} -> {:?} lost {:?}", input, out, w);
             }
         }
