@@ -825,7 +825,7 @@ fn latin1_text_is_classified_not_dropped() {
         c.execute(
             "INSERT INTO t VALUES (CAST(X'4DFC6C6C6572203C6D756C6C6572' || ?1 || \
              X'406578616D706C652E66723E' AS TEXT))",
-            [i.to_string()],
+            [format!("{i}")],
         )
         .unwrap();
     }

@@ -144,6 +144,76 @@ async fn unit_retried<U: Units>(
     }
 }
 
+/// A reader the idle check can stop and look up (the scan's reader
+/// process, or a test's stand-in).
+trait Pausable {
+    /// `SIGSTOP`, and whether the kernel reports it stopped.
+    async fn pause(&mut self) -> bool;
+    /// Its process id.
+    fn pid(&self) -> Option<u32>;
+}
+
+impl Pausable for ReaderProcess {
+    async fn pause(&mut self) -> bool {
+        ReaderProcess::pause(self).await
+    }
+
+    fn pid(&self) -> Option<u32> {
+        ReaderProcess::pid(self)
+    }
+}
+
+/// What the idle check decided for the reader after a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleAction {
+    /// No check: the reader is gone (or was never opened), or the unit did
+    /// not run.
+    NotChecked,
+    /// Stopped, holding no more than an idle connection: kept, stopped
+    /// until its next request.
+    Keep,
+    /// Holding more: killed (counted as a death).
+    Kill,
+    /// Not stopped, or its locks not readable: restarted (fail closed).
+    Restart,
+}
+
+/// Whether the reader is checked after a unit's outcome (review M1): after
+/// any answer, a failure answer included, since a reader that answered is
+/// still alive and would otherwise run unchecked through the pause; not
+/// after a death (it is gone) or a unit that did not run.
+fn idle_check_due(paced: &Paced<Result<Response, UnitError>>) -> bool {
+    matches!(paced, Paced::Done(Ok(_) | Err(UnitError::Failed(_))))
+}
+
+/// The idle check after a unit (reviews L3, N1, N2 and M1): when
+/// [`idle_check_due`] and a reader is alive, it is stopped first, then its
+/// locks are read (`locks`, `/proc/locks` in production) against the
+/// agent's own view of the file.
+async fn idle_check<R: Pausable>(
+    paced: &Paced<Result<Response, UnitError>>,
+    reader: Option<&mut R>,
+    view: Option<check::AgentView>,
+    locks: impl FnOnce(u32, check::AgentView) -> Option<bool>,
+) -> IdleAction {
+    if !idle_check_due(paced) {
+        return IdleAction::NotChecked;
+    }
+    let (Some(reader), Some(view)) = (reader, view) else {
+        return IdleAction::NotChecked;
+    };
+    let verdict = if reader.pause().await {
+        reader.pid().and_then(|pid| locks(pid, view))
+    } else {
+        None
+    };
+    match verdict {
+        Some(true) => IdleAction::Keep,
+        Some(false) => IdleAction::Kill,
+        None => IdleAction::Restart,
+    }
+}
+
 /// What a whole-scan stop means for the objects left.
 enum Stop {
     /// `skipped_error`.
@@ -298,33 +368,28 @@ impl Scan<'_> {
         // connection. It is stopped first, and stays stopped until its next
         // request, so it cannot drop its locks for the check and take them
         // again during the pause; the policy is the agent's view (N2).
-        if let Paced::Done(Ok(_)) = &paced
-            && let (Some(reader), Some(view)) = (self.reader.as_mut(), self.view)
-        {
-            let verdict = if reader.pause().await {
-                reader
-                    .pid()
-                    .and_then(|pid| crate::locks::idle_ok_now(pid, view.id, view.shm_ino, view.wal))
-            } else {
-                None
-            };
-            match verdict {
-                Some(true) => {}
-                Some(false) => {
-                    tracing::warn!(
-                        target_id = %self.target.id,
-                        "sqlite reader held a lock while idle: killed"
-                    );
-                    if let Some(mut r) = self.reader.take() {
-                        r.kill().await;
-                    }
-                    self.died(Death::Protocol);
-                    return Ok(Paced::Done(Err(UnitError::Dead(Death::Protocol))));
+        // Review M1: after a failure answer too, whenever the reader is
+        // still alive.
+        let action = idle_check(&paced, self.reader.as_mut(), self.view, |pid, view| {
+            crate::locks::idle_ok_now(pid, view.id, view.shm_ino, view.wal)
+        })
+        .await;
+        match action {
+            IdleAction::NotChecked | IdleAction::Keep => {}
+            IdleAction::Kill => {
+                tracing::warn!(
+                    target_id = %self.target.id,
+                    "sqlite reader held a lock while idle: killed"
+                );
+                if let Some(mut r) = self.reader.take() {
+                    r.kill().await;
                 }
-                // Not stopped, or not readable: fail closed, the reader is
-                // restarted.
-                None => self.close().await,
+                self.died(Death::Protocol);
+                return Ok(Paced::Done(Err(UnitError::Dead(Death::Protocol))));
             }
+            // Not stopped, or not readable: fail closed, the reader is
+            // restarted.
+            IdleAction::Restart => self.close().await,
         }
         match &paced {
             Paced::Done(Err(UnitError::Dead(d))) => self.died(*d),
@@ -1028,6 +1093,159 @@ mod tests {
         let longest =
             check::deadline_for(databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE.1);
         assert!(RESTART_AFTER_CPU + longest < cpu_limit);
+    }
+
+    /// A stand-in reader: this test process (so a lock the test holds is
+    /// "the reader's"), recording whether it was stopped.
+    struct FakeReader {
+        stops: bool,
+        paused: u32,
+    }
+
+    impl Pausable for FakeReader {
+        async fn pause(&mut self) -> bool {
+            self.paused += 1;
+            self.stops
+        }
+
+        fn pid(&self) -> Option<u32> {
+            Some(std::process::id())
+        }
+    }
+
+    fn failed(code: Code) -> Paced<Result<Response, UnitError>> {
+        Paced::Done(Err(UnitError::Failed(Failure::new(code))))
+    }
+
+    /// Review M1: after a failure answer, the reader that is still alive is
+    /// stopped and its locks checked, exactly as after a success; it is
+    /// killed when it holds a lock, kept when idle, restarted when it
+    /// cannot be judged. A dead reader and a unit that did not run are not
+    /// checked.
+    #[tokio::test]
+    async fn a_reader_that_answers_a_failure_is_stopped_and_checked() {
+        let view = check::AgentView {
+            id: crate::files::Identity { dev: 1, ino: 2 },
+            wal: false,
+            shm_ino: 0,
+        };
+        let non_terminal = [
+            Code::Busy,
+            Code::Corrupt,
+            Code::TooBig,
+            Code::NoMemory,
+            Code::NoSuchTable,
+            Code::ViewProhibited,
+            Code::Interrupted,
+            Code::Internal,
+            Code::SideFileAppeared,
+        ];
+        for code in non_terminal {
+            for (verdict, want) in [
+                (Some(false), IdleAction::Kill),
+                (Some(true), IdleAction::Keep),
+                (None, IdleAction::Restart),
+            ] {
+                let mut r = FakeReader {
+                    stops: true,
+                    paused: 0,
+                };
+                let got = idle_check(&failed(code), Some(&mut r), Some(view), |pid, v| {
+                    assert_eq!((pid, v), (std::process::id(), view));
+                    verdict
+                })
+                .await;
+                assert_eq!((got, r.paused), (want, 1), "{code:?}");
+            }
+            // Not stopped: restarted, its locks never read.
+            let mut r = FakeReader {
+                stops: false,
+                paused: 0,
+            };
+            let got = idle_check(&failed(code), Some(&mut r), Some(view), |_, _| {
+                unreachable!("locks read without the reader stopped")
+            })
+            .await;
+            assert_eq!((got, r.paused), (IdleAction::Restart, 1));
+        }
+        // A success, as before.
+        let mut r = FakeReader {
+            stops: true,
+            paused: 0,
+        };
+        let ok = Paced::Done(Ok(Response::Bounds(None)));
+        assert_eq!(
+            idle_check(&ok, Some(&mut r), Some(view), |_, _| Some(false)).await,
+            IdleAction::Kill
+        );
+        // Not checked: a death, a unit that did not run, no reader.
+        for paced in [
+            Paced::Done(Err(UnitError::Dead(Death::Deadline))),
+            Paced::OutOfTime,
+        ] {
+            let mut r = FakeReader {
+                stops: true,
+                paused: 0,
+            };
+            let got = idle_check(&paced, Some(&mut r), Some(view), |_, _| Some(false)).await;
+            assert_eq!((got, r.paused), (IdleAction::NotChecked, 0));
+        }
+        assert_eq!(
+            idle_check::<FakeReader>(&failed(Code::Corrupt), None, Some(view), |_, _| Some(false))
+                .await,
+            IdleAction::NotChecked
+        );
+    }
+
+    /// Review M1 with a real lock: the stand-in reader (this process) holds
+    /// SQLite's `SHARED` lock on a rollback-mode file, inside a read
+    /// transaction, and "answers" `Failed(Corrupt)`; the check reads the
+    /// real `/proc/locks` and the reader is killed.
+    #[tokio::test]
+    async fn a_failing_reader_holding_a_shared_lock_is_killed() {
+        use std::os::unix::fs::MetadataExt;
+        let d = crate::it::Dir::new("m1-lock");
+        let p = d.path("held.db");
+        let c = rusqlite::Connection::open(&p).unwrap_or_else(|_| unreachable!());
+        c.execute_batch(
+            "PRAGMA journal_mode = DELETE; CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('x');",
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let m = std::fs::metadata(&p).unwrap_or_else(|_| unreachable!());
+        let view = check::AgentView {
+            id: crate::files::Identity {
+                dev: m.dev(),
+                ino: m.ino(),
+            },
+            wal: false,
+            shm_ino: 0,
+        };
+        // A read transaction: SQLite holds the SHARED lock until it ends.
+        c.execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .unwrap_or_else(|_| unreachable!());
+        let mut r = FakeReader {
+            stops: true,
+            paused: 0,
+        };
+        let got = idle_check(
+            &failed(Code::Corrupt),
+            Some(&mut r),
+            Some(view),
+            |pid, v| crate::locks::idle_ok_now(pid, v.id, v.shm_ino, v.wal),
+        )
+        .await;
+        assert_eq!((got, r.paused), (IdleAction::Kill, 1));
+        // The RESERVED byte of a write transaction (another rollback-mode
+        // lock an idle reader never holds).
+        c.execute_batch("COMMIT; BEGIN IMMEDIATE;")
+            .unwrap_or_else(|_| unreachable!());
+        let got = idle_check(&failed(Code::Busy), Some(&mut r), Some(view), |pid, v| {
+            crate::locks::idle_ok_now(pid, v.id, v.shm_ino, v.wal)
+        })
+        .await;
+        assert_eq!(got, IdleAction::Kill);
+        c.execute_batch("ROLLBACK;")
+            .unwrap_or_else(|_| unreachable!());
     }
 
     /// A scripted reader: the answers of successive units, and the requests

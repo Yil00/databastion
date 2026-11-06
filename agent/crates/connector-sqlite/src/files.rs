@@ -67,12 +67,24 @@ pub struct Policy {
     pub exact_descriptor_set: bool,
     /// Open the check descriptor with `databastion_core::fs::open_no_links`
     /// (review N4: no link followed in any component, not only the last).
-    /// Off in the reader process only: its seccomp filter refuses
-    /// `openat2` with `EPERM` (not the `ENOSYS` that selects the core's
-    /// component walk), and there the Landlock grant, built with
-    /// `open_no_links` and checked against the paths after
-    /// `restrict_self`, already binds every file it can open to its
-    /// inode; the last component is opened `O_NOFOLLOW`.
+    ///
+    /// Off in the reader process only, where the last component is opened
+    /// `O_NOFOLLOW` and the sandbox already gives what the walk would
+    /// (accepted in the re-review of #417):
+    /// - Landlock grants `ReadFile` only on the inodes of the grant (the
+    ///   database and the side files present at open), whose descriptors
+    ///   are opened with `open_no_links` and checked against an `lstat` of
+    ///   their paths after `restrict_self`: a path that resolves anywhere
+    ///   else, through a link or a swapped ancestor, cannot be opened;
+    /// - the directory rule grants `ReadDir` only, never `ReadFile` on
+    ///   anything new in it;
+    /// - the descriptor's `(st_dev, st_ino)` is the session's identity,
+    ///   checked by `bind_main` (decision 2 step 6), by `recheck` before
+    ///   every unit, and by the agent against its own view of the file
+    ///   (review N2);
+    /// - `open_no_links` in the reader would need its seccomp filter to
+    ///   answer `openat2` with `ENOSYS` (it refuses it with `EPERM`), a
+    ///   wider filter for no gain.
     pub open_no_links: bool,
 }
 
