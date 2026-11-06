@@ -781,7 +781,14 @@ over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`,
   (ADR-0059 decision 2). The run checks the owners and modes, the read-only mount and that no
   refusal note (`coverage.filesystem_not_read_only`, `privilege.database_file_writable`,
   `coverage.reader_sandbox_unavailable`…) is reported; the reader's Landlock and seccomp calls run
-  under Docker's default seccomp profile (it allows the `landlock_*` calls since Docker 25).
+  under Docker's default seccomp profile (it allows the `landlock_*` calls since Docker 25). The run
+  asserts that profile (ROADMAP P10-A): no seccomp option on the agent's container and the daemon's
+  built-in default (`docker info`), its filter on the agent process (`Seccomp: 2`), the Landlock
+  ABI a container with the agent's options reads under it (`landlock_create_ruleset` with
+  `LANDLOCK_CREATE_RULESET_VERSION`, logged with the Docker version and the kernel), and, during
+  the paced scan, a reader paused between two units (so past its open, which it answers only once
+  its Landlock ruleset is enforced and its own filter applied; there is no fallback) with
+  `NoNewPrivs: 1`, `Seccomp: 2` and one seccomp filter more than the agent's.
 - **Checks**: the three targets online, reachable, Audit level None with no source, the agent page
   showing "Discovery only"; one scan per target checked against
   [`dev/ground-truth.json`](../dev/ground-truth.json) restricted to that target's file (`file`):
@@ -823,6 +830,63 @@ at most 1980 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/i
 change. It is required through `CI result`, like `e2e-cas`, `e2e-sqlserver` and `e2e-redis`
 (since #358). Locally: `e2e/sqlite.sh`
 (`E2E_SKIP_BUILD=1` reuses the images; logs in `e2e/.logs-sqlite`).
+
+### SQLite reader under the systemd unit
+ROADMAP P10-A ([ADR-0059](../docs/adr/0059-sqlite-connector.md) decision 4, "the systemd unit must
+allow what the reader needs"). [`sqlite-unit.sh`](sqlite-unit.sh), run as root where systemd is
+PID 1, installs the agent `.deb` (if given), seeds a small rollback-journal file
+(`root:databastion 0640` in a `0750` directory under `/srv`, read-only for the unit through
+`ProtectSystem=strict`) and starts `databastion-agent.service` itself, with a drop-in under `/run`
+that replaces `ExecStart`, `Restart` and the output redirection (`StandardOutput`,
+`StandardError`) only: every other property of the shipped
+[`databastion-agent.service`](../deploy/deb/databastion-agent.service) applies, its
+`SystemCallFilter` lines included. `ExecStart` is [`sqlite_unit_driver.py`](sqlite_unit_driver.py),
+the agent's stand-in: it checks the unit's filter is in effect (`bind()` refused with `EPERM`) and
+answers `openat2` with `ENOSYS` (`RestrictSUIDSGID=yes`, so the reader's grant is built by its
+component walk), starts the installed binary's reader mode as the agent does (`posix_spawn`, the
+mode as its only argument, `argv[0]` `/proc/self/exe` as the agent gives it, though the file
+executed is `/usr/bin/databastion-agent`, the same binary, since the stand-in is Python; an empty
+environment, one end of a socket pair as its standard input) and drives one unit
+of work over the reader's IPC: open (the reader's seccomp filter must stack on the unit's: one
+filter more), catalog (the seeded table), a sample of 10 rows (no value printed), close; the reader
+must exit 0 and the unit end `Result=success`. The script also checks the unit's filter as this
+systemd resolved it (`systemctl show -p SystemCallFilter`: `landlock_*`, `seccomp`, `prctl`,
+`execve` allowed; `bind`, `listen`, `accept*`, `io_uring_*` not). The only difference from the
+agent: the reader's parent is the stand-in, not `databastion-agent run` (which needs an enrolled
+identity and a console); both run under the same unit and start the reader the same way.
+
+CI: job `deb-install` of [`packaging.yml`](../.github/workflows/packaging.yml), on Debian 12
+(systemd 252) and Ubuntu 24.04 (systemd 255), amd64 and arm64, in a throwaway privileged container
+of the pinned image with systemd as PID 1 (`--privileged` turns Docker's seccomp profile off: that
+profile is `e2e-sqlite`'s). The runner's kernel is Ubuntu's, so this proves the unit and systemd
+252, not Debian 12's own kernel.
+
+**Debian 12's own kernel (manual).** GitHub has no Debian runner image; a nested VM is possible
+(KVM on the standard Linux runners, Debian's `genericcloud` image) but not set up. On a throwaway
+Debian 12 VM booted on Debian's kernel (`linux-image-amd64` or `-arm64`, 6.1), as root, from a
+checkout of the branch and the `.deb` of the same commit (CI artifact `deb-<arch>`):
+
+```sh
+uname -r                                     # 6.1.0-<n>-amd64 (or -arm64)
+systemctl --version | head -n 1              # systemd 252 (252.<n>-1~deb12u<m>)
+cat /sys/kernel/security/lsm; echo           # must list landlock
+grep -E 'CONFIG_SECURITY_LANDLOCK=|CONFIG_LSM=' "/boot/config-$(uname -r)"
+python3 -I -c 'import ctypes; l = ctypes.CDLL(None, use_errno=True); print(l.syscall(444, None, 0, 1), ctypes.get_errno())'
+                                             # expected: "2 0" (Landlock ABI 2 on Linux 6.1)
+apt-get install -y python3                   # if missing (the sqlite3 module is in python3's stdlib)
+e2e/sqlite-unit.sh ./databastion-agent_<version>_<arch>.deb
+                                             # expected: "Landlock ABI: 2", the unit output line
+                                             # "sqlite-unit-check-ok ...", then "PASS"
+dpkg -P databastion-agent                    # afterwards
+```
+
+If `landlock` is missing from `/sys/kernel/security/lsm` (`CONFIG_SECURITY_LANDLOCK=y` but not in
+`CONFIG_LSM`), the reader refuses every SQLite target (`coverage.reader_sandbox_unavailable`):
+record it, then try again with `lsm=landlock,` followed by the listed modules on the kernel command
+line (`/etc/default/grub`, `update-grub`, reboot) to confirm that is the only cause. On ABI 2 the
+reader's ruleset is partly enforced by design (ABI 1 required; truncate, device `ioctl`, TCP and the
+scopes asked for best effort, none of them on 6.1); the read-only rule and the seccomp filter do not
+depend on them.
 
 ## Firebird target
 ROADMAP P10-D, [ADR-0060](../docs/adr/0060-firebird-connector.md) R39 (j) and the host-identity

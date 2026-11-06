@@ -11,7 +11,10 @@
 //!    - the declared file's directory, the file and its side files present
 //!      now are opened `O_PATH` with `openat2(RESOLVE_NO_SYMLINKS |
 //!      RESOLVE_NO_MAGICLINKS)`, so no symbolic link is followed while the
-//!      grant is built (review M1);
+//!      grant is built (review M1); where a seccomp filter answers `ENOSYS`
+//!      to `openat2` (systemd's `RestrictSUIDSGID=yes`, in the agent's
+//!      unit), one component at a time with `openat(O_PATH | O_NOFOLLOW)`,
+//!      with the same result;
 //!    - a Landlock ruleset handling every file system right (ABI 1 required,
 //!      later rights and the TCP rules best effort) grants, on those
 //!      descriptors only, `ReadDir` on the directory and `ReadFile` on the
@@ -173,19 +176,86 @@ fn close_inherited_descriptors() -> Result<(), Failure> {
 
 /// An `O_PATH` descriptor of `path`, no symbolic link followed anywhere in
 /// it (`openat2`, review M1).
+///
+/// `openat2` answers `ENOSYS` under the agent's systemd unit:
+/// `RestrictSUIDSGID=yes` makes systemd's seccomp filter refuse it with
+/// that error (it cannot inspect the mode inside `struct open_how`), so
+/// that callers fall back to `openat`. Every kernel with Landlock has
+/// `openat2`, so only a filter gives this answer; the same resolution is
+/// then done one component at a time ([`open_path_walk`]), with the same
+/// result and the same errors.
 fn open_path(path: &Path, directory: bool) -> Result<OwnedFd, rustix::io::Errno> {
     let kind = if directory {
         OFlags::DIRECTORY
     } else {
         OFlags::NOFOLLOW
     };
-    rustix::fs::openat2(
+    match rustix::fs::openat2(
         CWD,
         path,
         OFlags::PATH | OFlags::CLOEXEC | kind,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
+    ) {
+        Err(rustix::io::Errno::NOSYS) => open_path_walk(path, directory),
+        other => other,
+    }
+}
+
+/// [`open_path`] without `openat2`: from `/`, each component of the
+/// absolute `path` opened `O_PATH | O_NOFOLLOW` relative to the previous
+/// one, so no symbolic link (magic links included) is ever followed. As
+/// `openat2` with `RESOLVE_NO_SYMLINKS`: a component that is a symbolic
+/// link is refused with `ELOOP`, except the last one of a file
+/// (`O_PATH | O_NOFOLLOW` opens the link itself, which [`Grant::verify`]
+/// then refuses: it is not a regular file); a component before the last,
+/// or the last when `directory`, that is not a directory with `ENOTDIR`.
+/// The path must be canonical (`files::check_ancestors` ran first), and
+/// its text is checked, not `Path::components()` (which drops an interior
+/// `.`, a repeated `/` and a trailing `/`): a path that does not start with
+/// `/`, ends with `/`, or has an empty, `.` or `..` segment is refused with
+/// `EINVAL` before any open ([`grant_failure`]: `Rule::NotCanonical`).
+fn open_path_walk(path: &Path, directory: bool) -> Result<OwnedFd, rustix::io::Errno> {
+    use rustix::fs::FileType;
+    use std::os::unix::ffi::OsStrExt;
+    let text = path.as_os_str().as_bytes();
+    let Some(rest) = text.strip_prefix(b"/") else {
+        return Err(rustix::io::Errno::INVAL);
+    };
+    let names: Vec<&[u8]> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split(|b| *b == b'/').collect()
+    };
+    if names
+        .iter()
+        .any(|n| n.is_empty() || *n == b"." || *n == b"..")
+    {
+        return Err(rustix::io::Errno::INVAL);
+    }
+    let flags = OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let mut current = rustix::fs::open("/", flags | OFlags::DIRECTORY, Mode::empty())?;
+    for (i, name) in names.iter().enumerate() {
+        let next = rustix::fs::openat(
+            &current,
+            std::ffi::OsStr::from_bytes(name),
+            flags,
+            Mode::empty(),
+        )?;
+        let kind = FileType::from_raw_mode(rustix::fs::fstat(&next)?.st_mode);
+        let last = i + 1 == names.len();
+        if kind == FileType::Symlink {
+            if last && !directory {
+                return Ok(next);
+            }
+            return Err(rustix::io::Errno::LOOP);
+        }
+        if (!last || directory) && kind != FileType::Directory {
+            return Err(rustix::io::Errno::NOTDIR);
+        }
+        current = next;
+    }
+    Ok(current)
 }
 
 fn grant_failure(e: rustix::io::Errno) -> Failure {
@@ -196,6 +266,9 @@ fn grant_failure(e: rustix::io::Errno) -> Failure {
             Failure::rule(Code::PathRefused, Rule::SymlinkComponent)
         }
         rustix::io::Errno::NOTDIR => Failure::rule(Code::PathRefused, Rule::NotDirectory),
+        // Only the component walk gives EINVAL (a path that is not
+        // canonical): `openat2` is called with fixed, valid flags.
+        rustix::io::Errno::INVAL => Failure::rule(Code::PathRefused, Rule::NotCanonical),
         _ => Failure::new(Code::SandboxUnavailable),
     }
 }
@@ -723,6 +796,105 @@ mod tests {
         std::os::unix::fs::symlink("/", &link).unwrap();
         let e = Grant::open(&link.join("x.db")).unwrap_err();
         assert_eq!(e.rule, Some(Rule::SymlinkComponent), "{e:?}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The `openat2` fallback (`ENOSYS` under the systemd unit's
+    /// `RestrictSUIDSGID=yes`) resolves every path as `openat2` with
+    /// `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` does: the same inode,
+    /// or the same error.
+    #[test]
+    fn the_component_walk_resolves_as_openat2() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("databastion-sqlite-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.db"), b"x").unwrap();
+        symlink(&dir, base.join("dir-link")).unwrap();
+        symlink(dir.join("x.db"), dir.join("file-link")).unwrap();
+        symlink("missing", dir.join("dangling")).unwrap();
+        let resolve = |path: &Path, directory: bool| {
+            let kind = if directory {
+                OFlags::DIRECTORY
+            } else {
+                OFlags::NOFOLLOW
+            };
+            rustix::fs::openat2(
+                CWD,
+                path,
+                OFlags::PATH | OFlags::CLOEXEC | kind,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )
+        };
+        let id = |r: Result<OwnedFd, rustix::io::Errno>| {
+            r.map(|fd| {
+                let st = rustix::fs::fstat(&fd).unwrap();
+                (st.st_dev, st.st_ino)
+            })
+        };
+        let cases: Vec<(PathBuf, bool)> = vec![
+            (dir.clone(), true),
+            (dir.join("x.db"), false),
+            (dir.join("x.db"), true),
+            (dir.join("missing.db"), false),
+            (dir.join("x.db").join("below"), false),
+            (base.join("dir-link"), true),
+            (base.join("dir-link").join("x.db"), false),
+            (dir.join("file-link"), false),
+            (dir.join("dangling"), false),
+            (
+                PathBuf::from("/proc/self/root").join(dir.strip_prefix("/").unwrap()),
+                true,
+            ),
+            (PathBuf::from("/proc/self/fd"), true),
+        ];
+        for (path, directory) in cases {
+            let walked = id(open_path_walk(&path, directory));
+            let resolved = id(resolve(&path, directory));
+            assert_eq!(walked, resolved, "{path:?} directory {directory}");
+        }
+        // A final link opened as itself is never a granted file.
+        let link = open_path_walk(&dir.join("file-link"), false).unwrap();
+        assert_eq!(
+            rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&link).unwrap().st_mode),
+            rustix::fs::FileType::Symlink
+        );
+        // Not canonical: refused before any open, where `openat2` errors
+        // (`/d/x.db/`: ENOTDIR) or normalizes (`/d/./x.db`, `/d//x.db`).
+        let d = dir.to_str().unwrap();
+        for (path, directory) in [
+            ("relative/x.db".to_owned(), false),
+            ("/srv/../etc/x.db".to_owned(), false),
+            (format!("{d}/./x.db"), false),
+            (format!("{d}//x.db"), false),
+            (format!("{d}/x.db/"), false),
+            (format!("{d}/"), true),
+            (format!("{d}/."), true),
+        ] {
+            let resolved = id(resolve(Path::new(&path), directory));
+            assert_eq!(
+                id(open_path_walk(Path::new(&path), directory)),
+                Err(rustix::io::Errno::INVAL),
+                "{path} (openat2: {resolved:?})"
+            );
+        }
+        assert_eq!(
+            id(resolve(Path::new(&format!("{d}/x.db/")), false)),
+            Err(rustix::io::Errno::NOTDIR)
+        );
+        assert_eq!(
+            grant_failure(rustix::io::Errno::INVAL).rule,
+            Some(Rule::NotCanonical)
+        );
+        assert_eq!(
+            grant_failure(rustix::io::Errno::INVAL).code,
+            Code::PathRefused
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 }
