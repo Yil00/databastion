@@ -1126,9 +1126,38 @@ fn sqlite_errors_are_never_formatted() {
 
 /// ADR-0059 decision 4: the only process the agent's code starts is its
 /// own binary, in the SQLite reader mode (`/proc/self/exe sqlite-reader`):
-/// one `Command::new` in the crates' code, test code aside.
+/// one `Command::new` in the crates' code, test code aside, and no other
+/// line that names a process `Command` or calls `.spawn()` (a process can
+/// be started from a `Command` built elsewhere; security review L1 of
+/// #413). The SQLite fuzz entry points (`connector-sqlite/src/fuzz.rs`,
+/// whose `-shm` helper is started from a `Command` its fuzz target builds)
+/// are exempt only while that module is compiled for tests and the
+/// `fuzzing` feature alone, a feature the agent never enables
+/// ([`the_agent_never_enables_sqlite_fuzzing`]).
 #[test]
 fn the_only_spawned_process_is_the_sqlite_reader() {
+    let starts_a_process = |l: &str| {
+        l.contains("Command::new")
+            || l.contains(".spawn()")
+            || (l.contains("process::") && l.contains("Command"))
+    };
+    let lib =
+        fs::read_to_string(workspace_root().join("crates/connector-sqlite/src/lib.rs")).unwrap();
+    let lib_lines: Vec<&str> = code_lines(&lib).map(str::trim).collect();
+    let fuzz_mod = lib_lines
+        .iter()
+        .position(|l| *l == "pub mod fuzz;")
+        .expect("connector-sqlite declares `pub mod fuzz;`");
+    let attributes: Vec<&str> = lib_lines[..fuzz_mod]
+        .iter()
+        .rev()
+        .take_while(|l| l.starts_with("#["))
+        .copied()
+        .collect();
+    assert!(
+        attributes.contains(&"#[cfg(any(test, feature = \"fuzzing\"))]"),
+        "`pub mod fuzz` must be compiled for tests and the fuzzing feature only: {attributes:?}"
+    );
     let mut found = Vec::new();
     for source in all_crate_sources() {
         let shown = source.display().to_string();
@@ -1137,23 +1166,85 @@ fn the_only_spawned_process_is_the_sqlite_reader() {
             || shown.contains("/it.rs")
             || shown.contains("/it_")
             || shown.contains("testserver")
+            || shown.ends_with("connector-sqlite/src/fuzz.rs")
         {
             continue;
         }
         let text = fs::read_to_string(&source).unwrap();
         for l in code_lines(&text).take_while(|l| !l.trim_end().ends_with("mod tests {")) {
-            if l.contains("Command::new") {
+            if starts_a_process(l) {
                 found.push((shown.clone(), l.trim().to_owned()));
             }
         }
     }
-    assert_eq!(found.len(), 1, "{found:?}");
-    let (file, line) = &found[0];
-    assert!(file.ends_with("connector-sqlite/src/process.rs"), "{file}");
-    assert!(line.contains("Command::new(executable())"), "{line}");
+    for (file, _) in &found {
+        assert!(
+            file.ends_with("connector-sqlite/src/process.rs"),
+            "{found:?}"
+        );
+    }
+    let lines: Vec<&str> = found.iter().map(|(_, l)| l.as_str()).collect();
+    assert_eq!(
+        lines,
+        [
+            "let mut command = tokio::process::Command::new(executable());",
+            "let child = command.spawn().map_err(|_| Death::Spawn)?;",
+        ],
+        "{found:?}"
+    );
     let process =
         fs::read_to_string(workspace_root().join("crates/connector-sqlite/src/process.rs"))
             .unwrap();
     assert!(process.contains("PathBuf::from(\"/proc/self/exe\")"));
     assert!(process.contains(".env_clear()"));
+}
+
+/// Security review L1 of #413: no crate of the agent workspace enables the
+/// SQLite connector's `fuzzing` feature (its fuzz entry points, and the
+/// `-shm` helper they start), neither in the resolved graph nor through a
+/// declared dependency or a feature of its own; only the fuzz workspace
+/// (`agent/fuzz`, outside this one) does.
+#[cfg(feature = "sqlite")]
+#[test]
+fn the_agent_never_enables_sqlite_fuzzing() {
+    const CRATE: &str = "databastion-connector-sqlite";
+    let metadata = cargo_metadata();
+    let nodes = resolved_nodes(&metadata);
+    let resolved: Vec<&String> = nodes
+        .iter()
+        .filter(|n| n.0 == CRATE)
+        .flat_map(|n| n.3.iter())
+        .collect();
+    assert!(
+        nodes.iter().any(|n| n.0 == CRATE),
+        "{CRATE} is not in the resolved graph"
+    );
+    assert!(
+        !resolved.iter().any(|f| *f == "fuzzing"),
+        "{CRATE} resolved with {resolved:?}"
+    );
+    for p in metadata["packages"].as_array().unwrap() {
+        let name = p["name"].as_str().unwrap();
+        if name == CRATE {
+            continue;
+        }
+        for d in p["dependencies"].as_array().unwrap() {
+            if d["name"] == CRATE {
+                let f = d["features"].as_array().unwrap();
+                assert!(
+                    !f.iter().any(|x| x == "fuzzing"),
+                    "{name} depends on {CRATE} with {f:?}"
+                );
+            }
+        }
+        for (feature, enables) in p["features"].as_object().unwrap() {
+            for e in enables.as_array().unwrap() {
+                let e = e.as_str().unwrap();
+                assert!(
+                    e != format!("{CRATE}/fuzzing") && e != format!("{CRATE}?/fuzzing"),
+                    "{name} feature {feature} enables {e}"
+                );
+            }
+        }
+    }
 }

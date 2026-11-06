@@ -248,16 +248,107 @@ fn a_rollback_file_is_read_with_the_opt_in_only() {
     let Response::Stats(stats) = s.handle(&Request::Stats) else {
         panic!()
     };
-    assert!(
-        stats
-            .iter()
-            .any(|r| r.name.as_slice() == b"strict_t" && r.rows == 50)
-    );
+    // Without an index, with an index (`clients_email`) and `WITHOUT
+    // ROWID` (`contacts`): every analyzed table has its estimate.
+    for (t, n) in [
+        ("strict_t", 50),
+        ("clients", 50),
+        ("contacts", 50),
+        ("big", 3),
+    ] {
+        assert!(
+            stats
+                .iter()
+                .any(|r| r.name.as_slice() == t.as_bytes() && r.rows == n),
+            "{t}"
+        );
+    }
     let Response::Pragmas(p) = s.handle(&Request::Pragmas) else {
         panic!()
     };
     assert!(!p.wal);
     assert_eq!(p.encoding, 1);
+    assert_eq!(s.handle(&Request::Close), Response::Closed);
+}
+
+/// The rows `ANALYZE` writes for tables with indexes (ADR-0059
+/// implementation note of 2026-10-24, item 3): one row per index, a NULL
+/// `idx` row only without a full index, `idx = tbl` for a `WITHOUT ROWID`
+/// primary key. Each analyzed table gets its own row count, once.
+#[test]
+fn row_estimates_cover_tables_with_an_index() {
+    let d = Dir::new("stats");
+    let p = d.path("stats.db");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "CREATE TABLE plain (v TEXT);
+         CREATE TABLE indexed (a TEXT, b INTEGER);
+         CREATE INDEX indexed_a ON indexed(a);
+         CREATE INDEX indexed_b ON indexed(b) WHERE b > 5;
+         CREATE TABLE part_only (a TEXT, b INTEGER);
+         CREATE INDEX part_only_b ON part_only(b) WHERE b > 3;
+         CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;
+         CREATE INDEX wr_v ON wr(v) WHERE v > 2;
+         CREATE TABLE empty_i (a TEXT);
+         CREATE INDEX empty_i_a ON empty_i(a);",
+    )
+    .unwrap();
+    for i in 0..10_i64 {
+        for t in [
+            "plain (v)",
+            "indexed (a, b)",
+            "part_only (a, b)",
+            "wr (k, v)",
+        ] {
+            let cols = if t.starts_with("plain") {
+                "?1"
+            } else {
+                "?1, ?2"
+            };
+            let sql = format!("INSERT INTO {t} VALUES ({cols})");
+            if cols == "?1" {
+                c.execute(&sql, [format!("k{i}")]).unwrap();
+            } else {
+                c.execute(&sql, rusqlite::params![format!("k{i}"), i])
+                    .unwrap();
+            }
+        }
+    }
+    c.execute_batch("ANALYZE; CREATE TABLE later (a TEXT); INSERT INTO later VALUES ('x');")
+        .unwrap();
+    // The layout this fold relies on.
+    let raw: Vec<(String, Option<String>)> = c
+        .prepare("SELECT tbl, idx FROM sqlite_stat1")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(raw.contains(&("plain".into(), None)));
+    assert!(raw.contains(&("indexed".into(), Some("indexed_a".into()))));
+    assert!(!raw.contains(&("indexed".into(), None)));
+    assert!(raw.contains(&("part_only".into(), None)));
+    assert!(raw.contains(&("wr".into(), Some("wr".into()))));
+    assert!(!raw.iter().any(|(t, _)| t == "empty_i" || t == "later"));
+    drop(c);
+    let mut s = session(&p);
+    let Response::Stats(stats) = s.handle(&Request::Stats) else {
+        panic!()
+    };
+    let mut got: Vec<(String, u64)> = stats
+        .iter()
+        .map(|r| (String::from_utf8(r.name.to_vec()).unwrap(), r.rows))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("indexed".to_owned(), 10),
+            ("part_only".to_owned(), 10),
+            ("plain".to_owned(), 10),
+            ("wr".to_owned(), 10),
+        ]
+    );
     assert_eq!(s.handle(&Request::Close), Response::Closed);
 }
 

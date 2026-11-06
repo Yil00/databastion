@@ -47,7 +47,11 @@ nix = { version = "0.31", default-features = false }
 [features]
 # Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
 # cargo-fuzz): never enabled by the agent binary.
-fuzzing = []
+# `nix/fs`: the fuzz harness's `-shm` helper takes the shared lock on the
+# `-shm` `DMS` byte alone (`fcntl(F_SETLK)` on one byte), as an idle
+# writer holds it; never in the agent binary (architecture test
+# `the_agent_never_enables_sqlite_fuzzing`).
+fuzzing = ["nix/fs"]
 # Test helpers for other crates' tests (enabled from their
 # `[dev-dependencies]` only, never by the agent binary): the reader executable
 # of the tests.
@@ -57,6 +61,8 @@ test-support = ["databastion-core/test-support"]
 databastion-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "process"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+# The fuzz module's tests (`cfg(test)`): the `fuzzing` feature's `nix/fs`.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 [lints]
 workspace = true
