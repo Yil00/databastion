@@ -619,7 +619,7 @@ pinned Python image as uid 10020, gid 10030, no network):
    each scan and its peak memory (cgroup anonymous memory, the readers included).
 
 [`sqliteload.py`](sqliteload.py) (unit tests in [`test_sqliteload.py`](test_sqliteload.py)) writes
-`results.json` and `results.md` with these checks, the criteria ADR-0059 proposes to the maintainer
+`results.json` and `results.md` with these checks, the criteria of ADR-0059 decision 10 (confirmed by the maintainer on 2026-11-06)
 (limits from `LOAD_LIMIT_SQLITE_<NAME>`):
 
 | Check | Criterion |
@@ -631,7 +631,7 @@ pinned Python image as uid 10020, gid 10030, no network):
 | `sqlite.wal.b<busy>.wal_peak_mib` | WAL mode: the `-wal` peak during the scan at most max(2 x the baseline's peak, the baseline's peak + 8 MiB): no checkpoint starvation |
 | `sqlite.rollback.b5000.failed_during_scan` | rollback mode with a 5 s busy timeout: no failed commit |
 | `sqlite.rollback.b5000.p99_added_ms` | rollback mode with a 5 s busy timeout: the commit p99 less than `max_statement_ms` (500 ms) above the baseline's |
-| `sqlite.rollback.b0.busy_during_scan` | rollback mode without a busy timeout: the `SQLITE_BUSY` count and rate **measured, not judged** (ADR-0059 open question 8: whether `rollback_mode` keeps its `skip` default) |
+| `sqlite.rollback.b0.busy_during_scan` | rollback mode without a busy timeout: the `SQLITE_BUSY` count and rate **measured, not judged** (ADR-0059 open question 8, answered on 2026-11-06: `rollback_mode` keeps its `skip` default) |
 | `agent.<mode>.b<busy>.cpu_cores_scan` | the agent and its readers under 2 % of one core over each scan (the analogue of the < 2 % criterion: SQLite's work happens on the application's host) |
 | `agent.memory_mb_peak`, `agent.no_loss` | at most 256 MiB at the peak; nothing dropped in the agent's log |
 
@@ -640,9 +640,10 @@ commit: a reader whose Landlock grant predates a new `-journal` loses its unit (
 implementation note, item 10), so the rollback scans' coverage (in the scans table) is part of the
 measurement; `LOAD_SQLITE_ROLLBACK_JOURNAL=truncate` or `persist` keeps one `-journal` for the run.
 
-**Status**: not run yet (it needs P10-E); the first run's figures go to
-[docs/08](../../docs/08-engine-capabilities.md#load-and-database-impact-measured) with the
-maintainer's decision on the criteria.
+**Status**: first run 40197453899; its figures are in
+[docs/08](../../docs/08-engine-capabilities.md#load-and-database-impact-measured), and the
+maintainer's decisions of 2026-11-06 (the criteria confirmed, `skip` kept, the `delete`-mode advice
+kept) in the ADR-0059 note of that date.
 
 ## Firebird target
 ROADMAP P10-D (the Firebird load run) and P10-B (measurements 8g and 3m, the checkpoint and ledger
