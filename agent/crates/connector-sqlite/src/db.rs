@@ -25,9 +25,9 @@ use zeroize::Zeroizing;
 
 use crate::auth::{self, Action, Template};
 use crate::ipc::{
-    CELL_OVERHEAD, CatalogRow, Code, ColumnRow, Failure, MAX_CATALOG, MAX_NAME, MAX_RESPONSE,
-    MAX_STATS, MAX_TABLE_COLUMNS, MAX_VALUE, PragmaInfo, RowidAlias, SampleRange, SampleRequest,
-    Sampled,
+    CELL_OVERHEAD, CatalogRow, Code, ColumnExpr, ColumnRow, Failure, MAX_CATALOG, MAX_COLUMNS,
+    MAX_NAME, MAX_RESPONSE, MAX_STATS, MAX_TABLE_COLUMNS, MAX_VALUE, PragmaInfo, RowidAlias,
+    SampleRange, SampleRequest, Sampled,
 };
 use crate::sql;
 
@@ -115,13 +115,13 @@ pub enum SelfCheckFailure {
 /// # Errors
 /// [`Code::SelfCheckFailed`].
 pub fn self_check() -> Result<(), Failure> {
-    let conn = Connection::open_in_memory_with_flags(
+    let mut conn = Connection::open_in_memory_with_flags(
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     )
     .map_err(|_| Failure::new(Code::SelfCheckFailed))?;
-    self_check_on(&conn, &expected()).map_err(|_| Failure::new(Code::SelfCheckFailed))
+    self_check_on(&mut conn, &expected()).map_err(|_| Failure::new(Code::SelfCheckFailed))
 }
 
 /// The self-check against `expected` on `conn` (the negative-control test
@@ -129,7 +129,7 @@ pub fn self_check() -> Result<(), Failure> {
 ///
 /// # Errors
 /// The first check that failed.
-pub fn self_check_on(conn: &Connection, expected: &Expected) -> Result<(), SelfCheckFailure> {
+pub fn self_check_on(conn: &mut Connection, expected: &Expected) -> Result<(), SelfCheckFailure> {
     // Read before anything sets them: the compile-time defaults.
     let defensive = conn
         .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
@@ -229,6 +229,21 @@ fn sqlite_code(extended: i32, message: Option<&str>) -> Code {
             Some(m) if m.starts_with("no such table") => Code::NoSuchTable,
             Some(m) if m.starts_with("no such column") => Code::NoRowid,
             Some(m) if m.starts_with("malformed database schema") => Code::UnrecognizedFormat,
+            // A function of a column's DEFAULT or STORED expression denied
+            // by the authorizer (`sqlite3FuncAuth`, SQLite 3.54+: plain
+            // SQLITE_ERROR, not SQLITE_AUTH; ADR-0059 refinement of
+            // 2026-11-07). The statement texts call only functions the
+            // authorizer allows, so the name comes from the file's schema.
+            Some(m) if m.starts_with("not authorized to use function") => {
+                Code::SchemaFunctionRefused
+            }
+            // An authorizer answer other than OK, DENY or IGNORE
+            // (`sqliteAuthBadReturnCode`). `rusqlite` 0.41.1 answers a
+            // caught panic of its hook with SQLITE_ERROR, which is the same
+            // value as SQLITE_DENY (1), so SQLite reads it as a denial
+            // today; a version answering another code would land here
+            // (security review L1 of #425): a denial all the same.
+            Some(m) if m.starts_with("authorizer malfunction") => Code::Auth,
             _ => Code::Internal,
         },
         _ => Code::Internal,
@@ -277,13 +292,22 @@ pub fn map_error(e: rusqlite::Error) -> Failure {
     }
 }
 
-fn install_authorizer(conn: &Connection, template: &Arc<Mutex<Template>>) -> Result<(), Failure> {
+fn install_authorizer(
+    conn: &mut Connection,
+    template: &Arc<Mutex<Template>>,
+) -> Result<(), Failure> {
     let state = Arc::clone(template);
     conn.authorizer(Some(move |ctx: AuthContext<'_>| {
         let current = state.lock().map(|t| t.clone()).unwrap_or(Template::None);
         let action = match ctx.action {
             AuthAction::Select => Action::Select,
-            AuthAction::Read { table_name, .. } => Action::Read { table: table_name },
+            AuthAction::Read {
+                table_name,
+                column_name,
+            } => Action::Read {
+                table: table_name,
+                column: column_name,
+            },
             AuthAction::Function { function_name } => Action::Function {
                 name: function_name,
             },
@@ -303,6 +327,42 @@ fn install_authorizer(conn: &Connection, template: &Arc<Mutex<Template>>) -> Res
         }
     }))
     .map_err(map_error)
+}
+
+/// The schema texts `Db::schema_texts_are_utf8` checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Utf8Texts<'a> {
+    /// Every column name (a statement naming the rowid).
+    names: bool,
+    /// The columns a sampling statement reads: when one of them has a
+    /// `DEFAULT` or a generated expression, the table's own schema text.
+    columns: &'a [Zeroizing<Vec<u8>>],
+}
+
+impl Utf8Texts<'static> {
+    /// The rowid-bounds statement: names only (it reads no column, so no
+    /// column expression is authorized).
+    const ROWID: Self = Self {
+        names: true,
+        columns: &[],
+    };
+}
+
+/// The longest schema text the reader copies to check (SQLite's own
+/// `SQLITE_LIMIT_SQL_LENGTH` bound for a statement it parsed).
+const MAX_SCHEMA_SQL: usize = 1_000_000;
+/// The `table` rows of one name `SCHEMA_SQL` may return (one in a file
+/// SQLite loads; more are checked all the same).
+const MAX_SCHEMA_ROWS: usize = 4;
+
+/// One `table_xinfo` row as the checks see it.
+struct XinfoRow {
+    /// The row as sent (its `expr` still [`ColumnExpr::None`]).
+    row: ColumnRow,
+    /// Whether the stored name is valid UTF-8.
+    name_utf8: bool,
+    /// Whether reading the column authorizes an expression's functions.
+    expr: bool,
 }
 
 /// An open, set-up connection to one declared file.
@@ -351,7 +411,7 @@ pub fn open(
             crate::ipc::Rule::DescriptorBinding,
         ));
     }
-    let db = Db {
+    let mut db = Db {
         conn,
         template: Arc::new(Mutex::new(Template::None)),
         deadline: Arc::new(AtomicU64::new(0)),
@@ -370,8 +430,8 @@ fn ms(d: Duration) -> u64 {
 
 impl Db {
     /// Decision 5's connection setup, in its order.
-    fn setup(&self) -> Result<(), Failure> {
-        let c = &self.conn;
+    fn setup(&mut self) -> Result<(), Failure> {
+        let c = &mut self.conn;
         for (limit, value) in [
             (Limit::SQLITE_LIMIT_ATTACHED, 0),
             (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 8),
@@ -503,13 +563,42 @@ impl Db {
         out
     }
 
+    /// Before the statistics statement (ADR-0059 refinement of
+    /// 2026-11-07, security review M1 of #425): `sqlite_stat1`'s schema
+    /// text must be valid UTF-8 ([`Code::NameNotUtf8`]), and the table must
+    /// have exactly the shape SQLite writes, `tbl`, `idx` and `stat`, plain
+    /// columns without a `DEFAULT` or a generated expression
+    /// ([`Code::StatsUnusable`]). A crafted `sqlite_stat1` could otherwise
+    /// make the statement authorize an expression's functions: refused when
+    /// off the list (the estimates silently lost), or a name that is not
+    /// UTF-8 handed to `rusqlite`'s conversion.
+    fn stat1_is_plain(&self) -> Result<(), Failure> {
+        const STAT1: &str = "sqlite_stat1";
+        self.schema_sql_is_utf8(STAT1)?;
+        let cols = self.xinfo(STAT1.as_bytes(), STAT1)?;
+        let expected: [&[u8]; 3] = [b"tbl", b"idx", b"stat"];
+        let plain = cols.len() == expected.len()
+            && cols.iter().zip(expected).all(|(c, e)| {
+                c.row.name.as_slice().eq_ignore_ascii_case(e) && c.row.hidden == 0 && !c.expr
+            });
+        if plain {
+            Ok(())
+        } else {
+            Err(Failure::new(Code::StatsUnusable))
+        }
+    }
+
     /// `sqlite_stat1` row counts, the first integer of `stat`, one per
-    /// table (see [`StatsFold`]).
+    /// table (see [`StatsFold`]), once `sqlite_stat1` passes
+    /// `stat1_is_plain`.
     ///
     /// # Errors
-    /// The mapped failure.
+    /// The mapped failure; [`Code::StatsUnusable`] and
+    /// [`Code::NameNotUtf8`] from `stat1_is_plain`.
     pub fn stats(&self) -> Result<Vec<crate::ipc::StatRow>, Failure> {
-        self.arm(Template::Stats);
+        self.arm_deadline();
+        self.stat1_is_plain()?;
+        self.set_template(Template::Stats);
         let out = (|| {
             let mut stmt = self.conn.prepare(sql::STATS).map_err(map_error)?;
             let mut rows = stmt.query([]).map_err(map_error)?;
@@ -539,32 +628,217 @@ impl Db {
         out
     }
 
-    /// `PRAGMA main.table_xinfo(<table>)`: `name`, `pk` and `hidden` only.
+    /// `PRAGMA main.table_xinfo(<table>)`: `name`, `pk` and `hidden`, and
+    /// for each column the authorizer's verdict on its `DEFAULT` or
+    /// `STORED` generated expression ([`ColumnExpr`], ADR-0059 refinement
+    /// of 2026-11-07).
+    ///
+    /// The verdict is what SQLite itself does, observed without running
+    /// anything: when an expression column can be sampled at all (a name
+    /// it can quote), the table's own schema text must be valid UTF-8
+    /// ([`Db::schema_sql_is_utf8`]; otherwise every expression column is
+    /// [`ColumnExpr::NotUtf8`]); then the plain sampling statement for the
+    /// expression columns, in groups of at most 64, is prepared and never
+    /// stepped. SQLite authorizes each expression's functions while it
+    /// prepares it; a group denied with "not authorized to use function"
+    /// ([`Code::SchemaFunctionRefused`]) is prepared again column by
+    /// column, and each denied column is [`ColumnExpr::Refused`]. So at
+    /// most one prepare per expression column and one per group: bounded
+    /// by [`MAX_TABLE_COLUMNS`], all under one statement deadline. Any
+    /// other failure fails the request (fail closed); a denial that the
+    /// schema text, checked again, explains is [`ColumnExpr::NotUtf8`].
     ///
     /// # Errors
     /// The mapped failure; [`Code::Internal`] for a name that cannot be
     /// quoted.
     pub fn columns(&self, table: &[u8]) -> Result<Vec<ColumnRow>, Failure> {
-        let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(table).map_err(|_| Failure::new(Code::Internal))?;
-        self.arm(Template::Columns(name.to_owned()));
+        self.arm_deadline();
+        let rows = self.xinfo(table, name)?;
+        let candidate: Vec<bool> = rows
+            .iter()
+            .map(|r| r.expr && sql::quote(&r.row.name).is_some())
+            .collect();
+        let mut out: Vec<ColumnRow> = rows.into_iter().map(|r| r.row).collect();
+        let names: Vec<&[u8]> = out
+            .iter()
+            .zip(&candidate)
+            .filter(|(_, k)| **k)
+            .map(|(c, _)| c.name.as_slice())
+            .collect();
+        if names.is_empty() {
+            return Ok(out);
+        }
+        let verdicts = match self.schema_sql_is_utf8(name) {
+            Ok(()) => self.probe_all(table, name, &names),
+            Err(f) if f.code == Code::NameNotUtf8 => Ok(vec![ColumnExpr::NotUtf8; names.len()]),
+            Err(f) => Err(f),
+        }?;
+        let mut verdicts = verdicts.into_iter();
+        for (c, k) in out.iter_mut().zip(&candidate) {
+            if *k {
+                c.expr = verdicts.next().unwrap_or(ColumnExpr::Refused);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The verdicts of [`Db::columns`] for the expression columns `names`,
+    /// in order.
+    fn probe_all(
+        &self,
+        table: &[u8],
+        name: &str,
+        names: &[&[u8]],
+    ) -> Result<Vec<ColumnExpr>, Failure> {
+        let mut out = Vec::with_capacity(names.len());
+        for group in names.chunks(MAX_COLUMNS) {
+            match self.probe(table, name, group) {
+                Ok(()) => out.extend(group.iter().map(|_| ColumnExpr::Listed)),
+                Err(f) if f.code == Code::SchemaFunctionRefused => {
+                    for col in group {
+                        out.push(match self.probe(table, name, &[col]) {
+                            Ok(()) => ColumnExpr::Listed,
+                            Err(g) if g.code == Code::SchemaFunctionRefused => ColumnExpr::Refused,
+                            Err(g) => return self.probe_failed(g, name, names.len()),
+                        });
+                    }
+                }
+                Err(f) => return self.probe_failed(f, name, names.len()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A probe failed otherwise than by an unlisted function: a denial
+    /// that the schema text, checked again, explains (the application
+    /// changed it since) makes every expression column
+    /// [`ColumnExpr::NotUtf8`]; anything else fails the request.
+    fn probe_failed(&self, f: Failure, name: &str, n: usize) -> Result<Vec<ColumnExpr>, Failure> {
+        if f.code == Code::Auth
+            && matches!(self.schema_sql_is_utf8(name), Err(g) if g.code == Code::NameNotUtf8)
+        {
+            return Ok(vec![ColumnExpr::NotUtf8; n]);
+        }
+        Err(f)
+    }
+
+    /// Before a statement that reads `table`: the schema texts of the table
+    /// that SQLite can hand to the authorizer must be valid UTF-8, or
+    /// [`Code::NameNotUtf8`]. Every column name (`table_xinfo`, hidden
+    /// columns included) when `texts.names` (a statement naming the rowid);
+    /// the table's own schema text ([`Db::schema_sql_is_utf8`]) when one of
+    /// `texts.columns` has a `DEFAULT` or a `STORED` generated expression.
+    ///
+    /// `rusqlite`'s authorizer hook converts each string argument with a
+    /// panic on invalid UTF-8 (0.40.2 and 0.41.1; no bytes variant). That
+    /// panic is caught by `rusqlite`, which answers SQLite `SQLITE_ERROR`,
+    /// the same value as `SQLITE_DENY` (1): SQLite reads it as a denial, so
+    /// the statement is refused, never allowed (were the answer another
+    /// code, SQLite would report "authorizer malfunction", mapped to
+    /// [`Code::Auth`] too). But the panic would abort a process whose panic
+    /// hook aborts (a fuzz target) and report a hostile file as an
+    /// authorizer bug. Two kinds of text from the file reach the authorizer:
+    ///
+    /// - When a statement names the rowid of a table that has an `INTEGER
+    ///   PRIMARY KEY` column, SQLite hands that column's name, as stored in
+    ///   the file's schema, to the authorizer (`sqlite3AuthRead`). The
+    ///   columns the reader's statements name are always valid UTF-8
+    ///   ([`sql::quote`]), and SQLite matches them only to a stored name
+    ///   equal but for ASCII case, so the rowid alias is the only name from
+    ///   the file the authorizer can receive there; every column is checked,
+    ///   not only the primary key's, so the rule does not depend on which
+    ///   column SQLite takes as the alias.
+    /// - Since SQLite 3.54, reading a column with a `DEFAULT` or a `STORED`
+    ///   generated expression hands every function name of that expression,
+    ///   as written in the schema, to the authorizer (`sqlite3ColumnExprAuth`,
+    ///   ADR-0059 refinement of 2026-11-07). Neither kind of expression
+    ///   needs to name a known function: a `DEFAULT` is not resolved when
+    ///   the schema is read, and while the schema is parsed SQLite does not
+    ///   report an unknown function in a generated expression either (so
+    ///   `g\xe4(a)` in a `STORED` expression loads). `table_xinfo` gives no
+    ///   text for a generated column, so the table's own `sql` is checked,
+    ///   whole: every expression's text is a part of it.
+    ///
+    /// It runs under the deadline its caller armed for the whole request
+    /// (`arm_deadline`), never one of its own.
+    ///
+    /// Residual race (fail closed): the application can change the schema
+    /// to such a text between this check and the prepare of the statement.
+    /// The panic is then caught as above and the statement is denied
+    /// (`SQLITE_AUTH`); `after_read_statement` checks the texts once more
+    /// and reports [`Code::NameNotUtf8`] rather than [`Code::Auth`] when it
+    /// finds such a text.
+    fn schema_texts_are_utf8(
+        &self,
+        table: &[u8],
+        name: &str,
+        texts: Utf8Texts<'_>,
+    ) -> Result<(), Failure> {
+        if !texts.names && texts.columns.is_empty() {
+            return Ok(());
+        }
+        let cols = self.xinfo(table, name)?;
+        if texts.names && cols.iter().any(|c| !c.name_utf8) {
+            return Err(Failure::new(Code::NameNotUtf8));
+        }
+        // A requested column is matched as SQLite matches it (equal but for
+        // ASCII case), so more columns match, never fewer.
+        let reads_expr = cols.iter().any(|c| {
+            c.expr
+                && texts
+                    .columns
+                    .iter()
+                    .any(|r| r.as_slice().eq_ignore_ascii_case(&c.row.name))
+        });
+        if reads_expr {
+            self.schema_sql_is_utf8(name)?;
+        }
+        Ok(())
+    }
+
+    /// `PRAGMA main.table_xinfo(<table>)` under the deadline already armed:
+    /// each column, whether its name is valid UTF-8, and whether reading it
+    /// makes SQLite authorize an expression's functions (a `DEFAULT` on a
+    /// plain column, or a `STORED` generated column). The `DEFAULT` text is
+    /// only tested for presence, never kept.
+    fn xinfo(&self, table: &[u8], name: &str) -> Result<Vec<XinfoRow>, Failure> {
+        let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
+        self.set_template(Template::Columns(name.to_owned()));
         let out = (|| {
             let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
             let mut rows = stmt.query([]).map_err(map_error)?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().map_err(map_error)? {
-                let name = match row.get_ref(1).map_err(map_error)? {
-                    ValueRef::Text(t) if t.len() <= MAX_NAME => Zeroizing::new(t.to_vec()),
-                    _ => Zeroizing::new(Vec::new()),
+                let (name, name_utf8) = match row.get_ref(1).map_err(map_error)? {
+                    ValueRef::Text(t) => (
+                        if t.len() <= MAX_NAME {
+                            Zeroizing::new(t.to_vec())
+                        } else {
+                            Zeroizing::new(Vec::new())
+                        },
+                        std::str::from_utf8(t).is_ok(),
+                    ),
+                    _ => (Zeroizing::new(Vec::new()), false),
                 };
                 let int = |i: usize| match row.get_ref(i) {
                     Ok(ValueRef::Integer(v)) => v,
                     _ => 0,
                 };
-                out.push(ColumnRow {
-                    name,
-                    pk: int(5),
-                    hidden: int(6),
+                let hidden = int(6);
+                let default = !matches!(row.get_ref(4).map_err(map_error)?, ValueRef::Null);
+                out.push(XinfoRow {
+                    row: ColumnRow {
+                        name,
+                        pk: int(5),
+                        hidden,
+                        expr: ColumnExpr::None,
+                    },
+                    name_utf8,
+                    // Hidden 1 (a virtual table's) and 2 (VIRTUAL generated)
+                    // are never sampled; any other value with a DEFAULT,
+                    // and 3 (STORED), is an expression column.
+                    expr: hidden == 3 || (default && hidden != 1 && hidden != 2),
                 });
                 if out.len() > MAX_TABLE_COLUMNS {
                     return Err(Failure::new(Code::TooBig));
@@ -576,50 +850,37 @@ impl Db {
         out
     }
 
-    /// Before a statement that reads the rowid of `table`: every column
-    /// name of the table (`table_xinfo`, hidden columns included) must be
-    /// valid UTF-8, or [`Code::NameNotUtf8`].
-    ///
-    /// When a statement names the rowid of a table that has an `INTEGER
-    /// PRIMARY KEY` column, SQLite hands that column's name, as stored in
-    /// the file's schema, to the authorizer (`sqlite3AuthRead`), and
-    /// `rusqlite`'s authorizer hook converts it with a panic on invalid
-    /// UTF-8 (0.40.2 and 0.41.1; no bytes variant). That panic is caught by
-    /// `rusqlite` and read by SQLite as `SQLITE_DENY` (so the statement is
-    /// refused, never allowed), but it would abort a process whose panic
-    /// hook aborts (a fuzz target) and report a hostile file as an
-    /// authorizer bug. The columns the reader's statements name are always
-    /// valid UTF-8 ([`sql::quote`]), and SQLite matches them only to a
-    /// stored name equal but for ASCII case, so the rowid alias is the only
-    /// name from the file the authorizer can receive; every column is
-    /// checked, not only the primary key's, so the rule does not depend on
-    /// which column SQLite takes as the alias.
-    ///
-    /// It runs under the deadline its caller armed for the whole request
-    /// (`arm_deadline`), never one of its own.
-    ///
-    /// Residual race (fail closed): the application can rename a column to
-    /// such a name between this check and the prepare of the rowid
-    /// statement. The panic is then caught as above and the statement is
-    /// denied (`SQLITE_AUTH`); `after_rowid_statement` checks the names
-    /// once more and reports [`Code::NameNotUtf8`] rather than
-    /// [`Code::Auth`] when it finds such a name.
-    fn rowid_names_are_utf8(&self, table: &[u8], name: &str) -> Result<(), Failure> {
-        let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
-        self.set_template(Template::Columns(name.to_owned()));
+    /// The ADR-0059 refinement of 2026-11-07's exception: the `sql` of the
+    /// `table` rows named `name` (ASCII case folded, as SQLite resolves
+    /// it), under the deadline already armed, must be valid UTF-8, or
+    /// [`Code::NameNotUtf8`]. The text is copied into a zeroizing buffer,
+    /// checked, and dropped: the only result is the verdict. A row whose
+    /// `sql` is not text, or longer than [`MAX_SCHEMA_SQL`], fails the
+    /// check; no row is [`Code::NoSuchTable`].
+    fn schema_sql_is_utf8(&self, name: &str) -> Result<(), Failure> {
+        self.set_template(Template::Schema);
         let out = (|| {
-            let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
-            let mut rows = stmt.query([]).map_err(map_error)?;
+            let mut stmt = self.conn.prepare(sql::SCHEMA_SQL).map_err(map_error)?;
+            let mut rows = stmt.query([name]).map_err(map_error)?;
             let mut n = 0usize;
             while let Some(row) = rows.next().map_err(map_error)? {
                 n += 1;
-                if n > MAX_TABLE_COLUMNS {
-                    return Err(Failure::new(Code::TooBig));
+                if n > MAX_SCHEMA_ROWS {
+                    return Err(Failure::new(Code::NameNotUtf8));
                 }
-                match row.get_ref(1).map_err(map_error)? {
-                    ValueRef::Text(t) if std::str::from_utf8(t).is_ok() => {}
-                    _ => return Err(Failure::new(Code::NameNotUtf8)),
+                let ValueRef::Text(t) = row.get_ref(0).map_err(map_error)? else {
+                    return Err(Failure::new(Code::NameNotUtf8));
+                };
+                if t.len() > MAX_SCHEMA_SQL {
+                    return Err(Failure::new(Code::NameNotUtf8));
                 }
+                let text: Zeroizing<Vec<u8>> = Zeroizing::new(t.to_vec());
+                if std::str::from_utf8(&text).is_err() {
+                    return Err(Failure::new(Code::NameNotUtf8));
+                }
+            }
+            if n == 0 {
+                return Err(Failure::new(Code::NoSuchTable));
             }
             Ok(())
         })();
@@ -627,9 +888,22 @@ impl Db {
         out
     }
 
+    /// Prepares, never steps, the plain sampling statement for `columns` of
+    /// `table` under the sampling template, under the deadline already
+    /// armed: SQLite authorizes the functions of their expressions while it
+    /// prepares it ([`Db::columns`]).
+    fn probe(&self, table: &[u8], name: &str, columns: &[&[u8]]) -> Result<(), Failure> {
+        let text = sql::sample(table, None, columns, SampleRange::Plain { reverse: false })
+            .ok_or_else(|| Failure::new(Code::Internal))?;
+        self.set_template(Template::Read(name.to_owned()));
+        let out = self.conn.prepare(&text).map(drop).map_err(map_error);
+        self.disarm();
+        out
+    }
+
     /// `min` / `max` of the rowid; [`Code::NoRowid`] for a `WITHOUT ROWID`
     /// table, [`Code::NameNotUtf8`] for a table with a column name that is
-    /// not UTF-8 (`rowid_names_are_utf8`).
+    /// not UTF-8 (`schema_texts_are_utf8`).
     ///
     /// # Errors
     /// The mapped failure.
@@ -637,8 +911,8 @@ impl Db {
         let text = sql::bounds(table, alias).ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(table).map_err(|_| Failure::new(Code::Internal))?;
         self.arm_deadline();
-        self.rowid_names_are_utf8(table, name)?;
-        self.set_template(Template::Read(name.to_owned()));
+        self.schema_texts_are_utf8(table, name, Utf8Texts::ROWID)?;
+        self.set_template(Template::Bounds(name.to_owned()));
         let out = self
             .conn
             .query_row(&text, [], |r| {
@@ -649,30 +923,36 @@ impl Db {
             })
             .map_err(map_error);
         self.disarm();
-        self.after_rowid_statement(out, table, name)
+        self.after_read_statement(out, table, name, Utf8Texts::ROWID)
     }
 
-    /// After a rowid statement whose names passed `rowid_names_are_utf8`:
-    /// a denial (`Code::Auth`) is checked once more, under the same
-    /// deadline, and reported as [`Code::NameNotUtf8`] when a column name
-    /// is no longer valid UTF-8 (the application renamed it in between).
-    fn after_rowid_statement<T>(
+    /// After a statement whose texts passed `schema_texts_are_utf8`: a
+    /// denial (`Code::Auth`) is checked once more, under the same deadline,
+    /// and reported as [`Code::NameNotUtf8`] when a checked text is no
+    /// longer valid UTF-8 (the application changed the schema in between).
+    fn after_read_statement<T>(
         &self,
         out: Result<T, Failure>,
         table: &[u8],
         name: &str,
+        texts: Utf8Texts<'_>,
     ) -> Result<T, Failure> {
         match out {
-            Err(f) if f.code == Code::Auth => match self.rowid_names_are_utf8(table, name) {
-                Err(g) if g.code == Code::NameNotUtf8 => Err(g),
-                _ => Err(f),
-            },
+            Err(f) if f.code == Code::Auth => {
+                match self.schema_texts_are_utf8(table, name, texts) {
+                    Err(g) if g.code == Code::NameNotUtf8 => Err(g),
+                    _ => Err(f),
+                }
+            }
             other => other,
         }
     }
 
     /// One sampling statement of decision 5's closed list; one by the
-    /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is.
+    /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is,
+    /// and one reading a column with a `DEFAULT` or a `STORED` expression
+    /// when the table's schema text is not valid UTF-8
+    /// (`schema_texts_are_utf8`).
     ///
     /// # Errors
     /// The mapped failure.
@@ -681,9 +961,11 @@ impl Db {
             .ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(&req.table).map_err(|_| Failure::new(Code::Internal))?;
         self.arm_deadline();
-        if req.alias.is_some() {
-            self.rowid_names_are_utf8(&req.table, name)?;
-        }
+        let texts = Utf8Texts {
+            names: req.alias.is_some(),
+            columns: &req.columns,
+        };
+        self.schema_texts_are_utf8(&req.table, name, texts)?;
         let reverse = matches!(req.range, SampleRange::Plain { reverse: true });
         self.conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, reverse)
@@ -750,10 +1032,7 @@ impl Db {
         let _ = self
             .conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, false);
-        if req.alias.is_some() {
-            return self.after_rowid_statement(out, &req.table, name);
-        }
-        out
+        self.after_read_statement(out, &req.table, name, texts)
     }
 
     /// The check pragmas.
@@ -917,6 +1196,34 @@ fn first_integer(stat: &[u8]) -> Option<u64> {
 pub(crate) mod tests {
     use super::*;
 
+    /// ADR-0059 refinement of 2026-11-07: SQLite 3.54 reports a function of
+    /// a column's `DEFAULT` or `STORED` expression denied by the authorizer
+    /// as `SQLITE_ERROR` with this message; it is mapped to
+    /// `schema_function_refused` (security review L3 of #425), other errors
+    /// are not.
+    #[test]
+    fn a_denied_schema_expression_function_is_auth() {
+        assert_eq!(
+            sqlite_code(
+                rc::ERROR,
+                Some("not authorized to use function: randomblob(16)")
+            ),
+            Code::SchemaFunctionRefused
+        );
+        // Security review L1 of #425: an authorizer answer SQLite does not
+        // know (a caught panic answered with another code) is a denial.
+        assert_eq!(
+            sqlite_code(rc::ERROR, Some("authorizer malfunction")),
+            Code::Auth
+        );
+        assert_eq!(sqlite_code(rc::AUTH, Some("not authorized")), Code::Auth);
+        assert_eq!(
+            sqlite_code(rc::ERROR, Some("near \"x\": syntax error")),
+            Code::Internal
+        );
+        assert_eq!(sqlite_code(rc::ERROR, None), Code::Internal);
+    }
+
     /// Review L1 of #423: the names check and the rowid statement of one
     /// request share one deadline (armed once), in bounds and in a rowid
     /// sample; review L2: a denial after a passed check is reported as
@@ -952,12 +1259,15 @@ pub(crate) mod tests {
         // A denial with valid names stays `auth`; other results pass.
         let auth = || Err::<(), _>(Failure::new(Code::Auth));
         assert_eq!(
-            db.after_rowid_statement(auth(), b"t", "t")
+            db.after_read_statement(auth(), b"t", "t", Utf8Texts::ROWID)
                 .unwrap_err()
                 .code,
             Code::Auth
         );
-        assert_eq!(db.after_rowid_statement(Ok(3), b"t", "t"), Ok(3));
+        assert_eq!(
+            db.after_read_statement(Ok(3), b"t", "t", Utf8Texts::ROWID),
+            Ok(3)
+        );
         assert_eq!(sets(), before + 2);
         let bad = d.path("bad.db");
         crate::it::non_utf8_schema(
@@ -967,7 +1277,7 @@ pub(crate) mod tests {
         );
         let db = open(&bad, 60_000, || Ok(())).unwrap();
         assert_eq!(
-            db.after_rowid_statement(auth(), b"t", "t")
+            db.after_read_statement(auth(), b"t", "t", Utf8Texts::ROWID)
                 .unwrap_err()
                 .code,
             Code::NameNotUtf8
@@ -984,7 +1294,7 @@ pub(crate) mod tests {
     fn the_self_check_passes_on_this_build() {
         self_check().unwrap();
         let e = expected();
-        assert_eq!(e.version, "3.53.2");
+        assert_eq!(e.version, "3.54.1");
         assert!(!e.source_id.is_empty());
     }
 
@@ -996,39 +1306,39 @@ pub(crate) mod tests {
         let mut wrong = expected();
         wrong.version = "3.40.1".to_owned();
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::Version)
         );
         let mut wrong = expected();
         wrong.source_id.push('x');
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::Version)
         );
         let mut wrong = expected();
         wrong.required.push("ENABLE_SOMETHING_ABSENT".to_owned());
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::MissingOption)
         );
         let mut wrong = expected();
         wrong.forbidden.push("THREADSAFE".to_owned());
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::ForbiddenOption)
         );
-        let changed = memory();
+        let mut changed = memory();
         changed.execute_batch("PRAGMA trusted_schema = 1").unwrap();
         assert_eq!(
-            self_check_on(&changed, &expected()),
+            self_check_on(&mut changed, &expected()),
             Err(SelfCheckFailure::TrustedSchema)
         );
-        let changed = memory();
+        let mut changed = memory();
         changed
             .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
             .unwrap();
         assert_eq!(
-            self_check_on(&changed, &expected()),
+            self_check_on(&mut changed, &expected()),
             Err(SelfCheckFailure::Defensive)
         );
     }

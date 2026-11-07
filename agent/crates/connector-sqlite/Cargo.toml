@@ -27,7 +27,7 @@ zeroize.workspace = true
 # ADR-0059 decision 1: exactly these features (agent/deny.toml allow-lists them;
 # architecture test `sqlite_features_are_the_reviewed_ones`). No load_extension,
 # vtab, functions, trace, backup, blob, serialize, session or integrations.
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "hooks", "limits"] }
 # The reader sandbox (ADR-0059 decision 4), scoped to this crate by agent/deny.toml.
 landlock = { version = "0.4.7", default-features = false }
 seccompiler = { version = "0.5.0", default-features = false }

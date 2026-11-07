@@ -124,6 +124,8 @@ pub fn outcome(code: Code) -> (FailureCode, Option<Stage>, Option<NoteCode>) {
         Code::Corrupt
         | Code::NoRowid
         | Code::NameNotUtf8
+        | Code::SchemaFunctionRefused
+        | Code::StatsUnusable
         | Code::NoSuchTable
         | Code::ViewProhibited
         | Code::Auth

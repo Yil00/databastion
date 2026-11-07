@@ -538,6 +538,18 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
                 job.skip_out_of_time(sink, tables.len());
                 return Ok(());
             }
+            // No row estimates, noted rather than hidden: a `sqlite_stat1`
+            // without the shape SQLite writes (`stats_unusable`, ADR-0059
+            // refinement of 2026-11-07), a schema text that is not UTF-8,
+            // or another failure. A code only, never a name.
+            Paced::Done(Err(UnitError::Failed(f))) => {
+                tracing::info!(
+                    target_id = %scan.target.id,
+                    code = f.code.as_str(),
+                    "sqlite_stat1 not used: no row estimates"
+                );
+                HashMap::new()
+            }
             _ => HashMap::new(),
         }
     } else {
@@ -686,7 +698,9 @@ fn lossy_utf8(v: &[u8]) -> String {
 fn count_failure(sink: &FindingSink, f: &Failure) {
     sink.add_coverage(cov(|c| match f.code {
         Code::Corrupt | Code::NotReadable => c.not_readable = 1,
-        Code::ViewProhibited | Code::NameNotUtf8 => c.unsupported = 1,
+        Code::ViewProhibited | Code::NameNotUtf8 | Code::SchemaFunctionRefused => {
+            c.unsupported = 1;
+        }
         Code::TooBig | Code::NoMemory | Code::WalTooLarge => c.limit = 1,
         _ => c.error = 1,
     }));
@@ -784,7 +798,12 @@ async fn sample_table(
     }
     let mut selected: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     for c in &columns {
-        if c.hidden == 2 {
+        // VIRTUAL generated columns, and (ADR-0059 refinement of
+        // 2026-11-07) columns whose DEFAULT or STORED expression names a
+        // function off the authorizer's list, or whose table's schema text
+        // is not UTF-8: not sampled, counted in
+        // `coverage.computed_columns_not_sampled`; the other columns are.
+        if c.hidden == 2 || c.expr.excluded() {
             scan.notes.computed_columns += 1;
             continue;
         }
@@ -964,6 +983,7 @@ async fn sample_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::ColumnExpr;
 
     fn row(name: &str, view: bool, rootpage: i64) -> CatalogRow {
         CatalogRow {
@@ -978,6 +998,7 @@ mod tests {
             name: Zeroizing::new(name.as_bytes().to_vec()),
             pk: 0,
             hidden: 0,
+            expr: ColumnExpr::None,
         }
     }
 

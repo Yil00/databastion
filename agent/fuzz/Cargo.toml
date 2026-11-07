@@ -42,7 +42,7 @@ serde_yaml_ng = "0.10"
 databastion-connector-sqlite = { path = "../crates/connector-sqlite", features = ["fuzzing"] }
 # AddressSanitizer for the bundled SQLite C code (feature `asan`, nightly
 # campaigns only: .github/scripts/fuzz-nightly.sh), never outside this workspace.
-libsqlite3-sys = { version = "=0.38.2", optional = true }
+libsqlite3-sys = { version = "=0.39.1", optional = true }
 
 [features]
 asan = ["dep:libsqlite3-sys", "libsqlite3-sys/with-asan"]

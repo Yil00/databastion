@@ -68,6 +68,33 @@ pub fn seed(path: &Path, wal: bool) {
     c.execute_batch("ANALYZE;").unwrap();
 }
 
+/// A rollback-mode file whose table `accounts` has columns with `DEFAULT`
+/// and `STORED` generated expressions (ADR-0059 refinement of
+/// 2026-11-07): `email` (plain), `email_low` (`STORED lower(email)`, a
+/// listed function), `created` (`DEFAULT CURRENT_TIMESTAMP`, listed),
+/// `uuid` (`DEFAULT (lower(hex(randomblob(16))))`, `randomblob` off the
+/// list) and `is_corp` (`STORED` with `LIKE`, the function `like`, off the
+/// list). Fake values only.
+pub fn seed_exprs(path: &Path) {
+    let c = Connection::open(path).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT,
+             email_low TEXT GENERATED ALWAYS AS (lower(email)) STORED,
+             created TEXT DEFAULT CURRENT_TIMESTAMP,
+             uuid TEXT DEFAULT (lower(hex(randomblob(16)))),
+             is_corp INTEGER GENERATED ALWAYS AS (email LIKE '%@example.com') STORED);",
+    )
+    .unwrap();
+    for i in 0..20 {
+        c.execute(
+            "INSERT INTO accounts (email) VALUES (?1)",
+            [format!("Account{i}@Example.com")],
+        )
+        .unwrap();
+    }
+}
+
 /// Writes a database from a SQL script as `dev/sqlite/build.py` does (the
 /// dev seed of ADR-0059 decision 10, written by the bundled library): the
 /// page size, `auto_vacuum` and text encoding first, then the journal
