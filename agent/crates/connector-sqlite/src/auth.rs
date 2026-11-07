@@ -7,7 +7,9 @@
 //! - `SQLITE_SELECT` is allowed.
 //! - `SQLITE_READ` only on the table the current statement template is
 //!   for: its one table for the rowid-bounds and sampling templates,
-//!   `sqlite_schema` (or `sqlite_master`) for the catalog only,
+//!   `sqlite_schema` (or `sqlite_master`) for the catalog (`type`, `name`,
+//!   `rootpage`) and the schema-text statement (`type`, `name`, `sql`)
+//!   only,
 //!   `sqlite_stat1` for the statistics only.
 //! - `SQLITE_FUNCTION` only for `typeof`, `octet_length`, `substr`, `min`,
 //!   `max` under the sampling template, `min` and `max` under the
@@ -43,8 +45,15 @@ pub enum Template {
     None,
     /// The self-check (in-memory connection).
     SelfCheck,
-    /// The catalog statement.
+    /// The catalog statement (`type`, `name`, `rootpage` of
+    /// `sqlite_schema`; never `sql`).
     Catalog,
+    /// One table's own schema text (`sql` of its `sqlite_schema` row, the
+    /// row chosen by the statement's bound name): the ADR-0059 refinement
+    /// of 2026-11-07's exception. The reader only checks that the text is
+    /// valid UTF-8 and finds nothing else in it; the text is never stored,
+    /// sent or logged.
+    Schema,
     /// The statistics statement.
     Stats,
     /// `table_xinfo` of this table.
@@ -64,10 +73,12 @@ pub enum Template {
 pub enum Action<'a> {
     /// `SQLITE_SELECT`.
     Select,
-    /// `SQLITE_READ` of a column of `table`.
+    /// `SQLITE_READ` of `column` of `table`.
     Read {
         /// The table.
         table: &'a str,
+        /// The column.
+        column: &'a str,
     },
     /// `SQLITE_FUNCTION`.
     Function {
@@ -86,6 +97,10 @@ pub enum Action<'a> {
     Other,
 }
 
+/// The `sqlite_schema` columns the catalog statement reads.
+const CATALOG_COLUMNS: [&str; 3] = ["type", "name", "rootpage"];
+/// The `sqlite_schema` columns the schema-text statement reads.
+const SCHEMA_COLUMNS: [&str; 3] = ["type", "name", "sql"];
 /// Functions the sampling statements call.
 const FUNCTIONS: [&str; 5] = ["typeof", "octet_length", "substr", "min", "max"];
 /// Functions the rowid-bounds statement calls.
@@ -169,8 +184,15 @@ pub fn allowed(template: &Template, action: Action<'_>, database: Option<&str>) 
             template,
             Template::None | Template::Columns(_) | Template::Pragma(_)
         ),
-        Action::Read { table } => match template {
-            Template::Catalog => eq(table, "sqlite_schema") || eq(table, "sqlite_master"),
+        Action::Read { table, column } => match template {
+            Template::Catalog => {
+                (eq(table, "sqlite_schema") || eq(table, "sqlite_master"))
+                    && CATALOG_COLUMNS.iter().any(|c| eq(column, c))
+            }
+            Template::Schema => {
+                (eq(table, "sqlite_schema") || eq(table, "sqlite_master"))
+                    && SCHEMA_COLUMNS.iter().any(|c| eq(column, c))
+            }
             Template::Stats => eq(table, "sqlite_stat1"),
             Template::Read(t) | Template::Bounds(t) => {
                 eq(table, t) && !eq(table, "sqlite_schema") && !eq(table, "sqlite_master")
@@ -209,27 +231,42 @@ mod tests {
         assert!(allowed(&read, Action::Select, None));
         assert!(allowed(
             &read,
-            Action::Read { table: "clients" },
+            Action::Read {
+                table: "clients",
+                column: "c"
+            },
             Some("main")
         ));
         assert!(allowed(
             &read,
-            Action::Read { table: "CLIENTS" },
+            Action::Read {
+                table: "CLIENTS",
+                column: "c"
+            },
             Some("main")
         ));
         assert!(!allowed(
             &read,
-            Action::Read { table: "other" },
+            Action::Read {
+                table: "other",
+                column: "c"
+            },
             Some("main")
         ));
         assert!(!allowed(
             &read,
-            Action::Read { table: "clients" },
+            Action::Read {
+                table: "clients",
+                column: "c"
+            },
             Some("temp")
         ));
         assert!(!allowed(
             &read,
-            Action::Read { table: "clients" },
+            Action::Read {
+                table: "clients",
+                column: "c"
+            },
             Some("aux")
         ));
         assert!(allowed(&read, Action::Function { name: "TypeOf" }, None));
@@ -252,20 +289,25 @@ mod tests {
         assert!(allowed(
             &cat,
             Action::Read {
-                table: "sqlite_master"
+                table: "sqlite_master",
+                column: "name"
             },
             Some("main")
         ));
         assert!(!allowed(
             &cat,
-            Action::Read { table: "clients" },
+            Action::Read {
+                table: "clients",
+                column: "c"
+            },
             Some("main")
         ));
         assert!(!allowed(&cat, Action::Function { name: "min" }, None));
         assert!(!allowed(
             &Template::Read("sqlite_master".into()),
             Action::Read {
-                table: "sqlite_master"
+                table: "sqlite_master",
+                column: "c"
             },
             Some("main")
         ));
@@ -408,6 +450,7 @@ mod tests {
             Template::Catalog,
             Template::Stats,
             Template::Columns("t".into()),
+            Template::Schema,
             Template::Bounds("t".into()),
             Template::Pragma("journal_mode"),
         ];
@@ -428,16 +471,95 @@ mod tests {
             assert!(!allowed(&bounds, Action::Function { name: f }, None), "{f}");
         }
         assert!(allowed(&bounds, Action::Select, None));
-        assert!(allowed(&bounds, Action::Read { table: "t" }, Some("main")));
-        assert!(!allowed(&bounds, Action::Read { table: "u" }, Some("main")));
+        assert!(allowed(
+            &bounds,
+            Action::Read {
+                table: "t",
+                column: "c"
+            },
+            Some("main")
+        ));
+        assert!(!allowed(
+            &bounds,
+            Action::Read {
+                table: "u",
+                column: "c"
+            },
+            Some("main")
+        ));
         assert!(!allowed(
             &Template::Bounds("sqlite_schema".into()),
             Action::Read {
-                table: "sqlite_schema"
+                table: "sqlite_schema",
+                column: "c"
             },
             Some("main")
         ));
         assert!(!allowed(&bounds, Action::Other, Some("main")));
+    }
+
+    /// ADR-0059 refinement of 2026-11-07: the schema-text statement reads
+    /// `type`, `name` and `sql` of `sqlite_schema` only, and calls nothing;
+    /// the catalog never reads `sql`.
+    #[test]
+    fn the_schema_text_template_reads_its_columns_only() {
+        let sch = Template::Schema;
+        assert!(allowed(&sch, Action::Select, None));
+        for (table, column) in [
+            ("sqlite_schema", "sql"),
+            ("SQLITE_MASTER", "SQL"),
+            ("sqlite_schema", "name"),
+            ("sqlite_schema", "type"),
+        ] {
+            assert!(allowed(&sch, Action::Read { table, column }, Some("main")));
+        }
+        for (table, column) in [
+            ("sqlite_schema", "rootpage"),
+            ("sqlite_schema", "tbl_name"),
+            ("t", "sql"),
+            ("sqlite_stat1", "stat"),
+        ] {
+            assert!(!allowed(&sch, Action::Read { table, column }, Some("main")));
+        }
+        assert!(!allowed(
+            &sch,
+            Action::Read {
+                table: "sqlite_schema",
+                column: "sql"
+            },
+            Some("temp")
+        ));
+        for f in FUNCTIONS.iter().chain(SCHEMA_EXPR_FUNCTIONS.iter()) {
+            assert!(!allowed(&sch, Action::Function { name: f }, None), "{f}");
+        }
+        assert!(!allowed(
+            &sch,
+            Action::Pragma {
+                name: "table_xinfo",
+                arg: Some("t")
+            },
+            Some("main")
+        ));
+        assert!(!allowed(&sch, Action::Other, Some("main")));
+        let cat = Template::Catalog;
+        for column in ["type", "name", "rootpage"] {
+            assert!(allowed(
+                &cat,
+                Action::Read {
+                    table: "sqlite_schema",
+                    column
+                },
+                Some("main")
+            ));
+        }
+        assert!(!allowed(
+            &cat,
+            Action::Read {
+                table: "sqlite_schema",
+                column: "sql"
+            },
+            Some("main")
+        ));
     }
 
     fn template() -> impl Strategy<Value = Template> {
@@ -445,6 +567,7 @@ mod tests {
             Just(Template::None),
             Just(Template::SelfCheck),
             Just(Template::Catalog),
+            Just(Template::Schema),
             Just(Template::Stats),
             "[a-zA-Z_]{1,8}".prop_map(Template::Columns),
             "[a-zA-Z_]{1,8}".prop_map(Template::Bounds),
@@ -481,7 +604,7 @@ mod tests {
         ) {
             let action = match kind {
                 0 => Action::Select,
-                1 => Action::Read { table: &name },
+                1 => Action::Read { table: &name, column: "c" },
                 2 => Action::Function { name: &name },
                 3 => Action::Pragma { name: &name, arg: arg.as_deref() },
                 _ => Action::Other,
@@ -505,7 +628,7 @@ mod tests {
                         prop_assert!(lower == "table_xinfo" || PRAGMAS.contains(&lower.as_str()));
                         prop_assert_eq!(lower == "table_xinfo", arg.is_some());
                     }
-                    Action::Read { .. } => prop_assert!(matches!(t, Template::Read(_) | Template::Bounds(_) | Template::Catalog | Template::Stats)),
+                    Action::Read { .. } => prop_assert!(matches!(t, Template::Read(_) | Template::Bounds(_) | Template::Catalog | Template::Schema | Template::Stats)),
                     _ => {}
                 }
             }

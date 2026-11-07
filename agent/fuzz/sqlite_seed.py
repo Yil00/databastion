@@ -1,4 +1,4 @@
-"""Writes five seed inputs of the sqlite_file fuzz target (ADR-0059), fake values only:
+"""Writes seven seed inputs of the sqlite_file fuzz target (ADR-0059), fake values only:
 
 - OUT: a small SQLite file in rollback mode, as the target's first length-prefixed part;
 - OUT-wal: a WAL file set (the main file, its -wal and the start of its -shm, saved while a
@@ -20,6 +20,11 @@
 - OUT-exprs: a small file whose columns have DEFAULT and STORED generated expressions, listed
   (lower, CURRENT_TIMESTAMP) and not (randomblob), which SQLite 3.54 sends to the authorizer
   when a sampling statement reads them (ADR-0059 refinement of 2026-11-07).
+- OUT-stored-names: a STORED generated column whose expression names a function that is not
+  valid UTF-8 (SQLite does not report it while it parses the schema; security review M1 of
+  #425).
+- OUT-stat1: a crafted sqlite_stat1 whose stat column has a DEFAULT naming such a function
+  (security review M1 of #425).
 
     python3 -I sqlite_seed.py OUT
 """
@@ -57,6 +62,18 @@ def main(out: str) -> None:
         f.write(part(non_utf8_names()))
     with open(out + "-exprs", "wb") as f:
         f.write(part(schema_exprs()))
+    with open(out + "-stored-names", "wb") as f:
+        f.write(part(rewritten_schema(
+            "",
+            "t",
+            b"CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT GENERATED ALWAYS AS (g\xe4(a)) STORED)",
+        )))
+    with open(out + "-stat1", "wb") as f:
+        f.write(part(rewritten_schema(
+            "ANALYZE;",
+            "sqlite_stat1",
+            b"CREATE TABLE sqlite_stat1(tbl,idx,stat DEFAULT (g\xe4(1)))",
+        )))
 
 
 # The -shm bytes kept: the two copies of the WAL index header and the checkpoint info (136
@@ -152,6 +169,26 @@ def schema_exprs() -> bytes:
             INSERT INTO t (email) VALUES ('Fake@Example.com');
             """
         )
+        c.close()
+        return open(path, "rb").read()
+
+
+def rewritten_schema(extra: str, name: str, schema: bytes) -> bytes:
+    """A small file with a table t of two rows, then `extra` (a script), then the schema text
+    of `name` replaced by `schema` (bytes, possibly not valid UTF-8): a hostile file."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rewritten.db")
+        c = sqlite3.connect(path, isolation_level=None)
+        c.executescript(
+            "PRAGMA page_size = 512; PRAGMA journal_mode = DELETE; "
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT); "
+            "INSERT INTO t (a, b) VALUES ('x@example.com', 'y@example.org'); " + extra
+        )
+        c.execute("PRAGMA writable_schema = ON")
+        c.execute(
+            "UPDATE sqlite_schema SET sql = CAST(? AS TEXT) WHERE name = ?", (schema, name)
+        )
+        c.execute("PRAGMA writable_schema = OFF")
         c.close()
         return open(path, "rb").read()
 

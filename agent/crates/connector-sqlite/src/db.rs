@@ -25,9 +25,9 @@ use zeroize::Zeroizing;
 
 use crate::auth::{self, Action, Template};
 use crate::ipc::{
-    CELL_OVERHEAD, CatalogRow, Code, ColumnRow, Failure, MAX_CATALOG, MAX_NAME, MAX_RESPONSE,
-    MAX_STATS, MAX_TABLE_COLUMNS, MAX_VALUE, PragmaInfo, RowidAlias, SampleRange, SampleRequest,
-    Sampled,
+    CELL_OVERHEAD, CatalogRow, Code, ColumnExpr, ColumnRow, Failure, MAX_CATALOG, MAX_COLUMNS,
+    MAX_NAME, MAX_RESPONSE, MAX_STATS, MAX_TABLE_COLUMNS, MAX_VALUE, PragmaInfo, RowidAlias,
+    SampleRange, SampleRequest, Sampled,
 };
 use crate::sql;
 
@@ -232,8 +232,18 @@ fn sqlite_code(extended: i32, message: Option<&str>) -> Code {
             // A function of a column's DEFAULT or STORED expression denied
             // by the authorizer (`sqlite3FuncAuth`, SQLite 3.54+: plain
             // SQLITE_ERROR, not SQLITE_AUTH; ADR-0059 refinement of
-            // 2026-11-07).
-            Some(m) if m.starts_with("not authorized to use function") => Code::Auth,
+            // 2026-11-07). The statement texts call only functions the
+            // authorizer allows, so the name comes from the file's schema.
+            Some(m) if m.starts_with("not authorized to use function") => {
+                Code::SchemaFunctionRefused
+            }
+            // An authorizer answer other than OK, DENY or IGNORE
+            // (`sqliteAuthBadReturnCode`). `rusqlite` 0.41.1 answers a
+            // caught panic of its hook with SQLITE_ERROR, which is the same
+            // value as SQLITE_DENY (1), so SQLite reads it as a denial
+            // today; a version answering another code would land here
+            // (security review L1 of #425): a denial all the same.
+            Some(m) if m.starts_with("authorizer malfunction") => Code::Auth,
             _ => Code::Internal,
         },
         _ => Code::Internal,
@@ -291,7 +301,13 @@ fn install_authorizer(
         let current = state.lock().map(|t| t.clone()).unwrap_or(Template::None);
         let action = match ctx.action {
             AuthAction::Select => Action::Select,
-            AuthAction::Read { table_name, .. } => Action::Read { table: table_name },
+            AuthAction::Read {
+                table_name,
+                column_name,
+            } => Action::Read {
+                table: table_name,
+                column: column_name,
+            },
             AuthAction::Function { function_name } => Action::Function {
                 name: function_name,
             },
@@ -315,20 +331,38 @@ fn install_authorizer(
 
 /// The schema texts `Db::schema_texts_are_utf8` checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Utf8Texts {
+struct Utf8Texts<'a> {
     /// Every column name (a statement naming the rowid).
     names: bool,
-    /// Every `DEFAULT` expression text (a sampling statement).
-    defaults: bool,
+    /// The columns a sampling statement reads: when one of them has a
+    /// `DEFAULT` or a generated expression, the table's own schema text.
+    columns: &'a [Zeroizing<Vec<u8>>],
 }
 
-impl Utf8Texts {
+impl Utf8Texts<'static> {
     /// The rowid-bounds statement: names only (it reads no column, so no
     /// column expression is authorized).
     const ROWID: Self = Self {
         names: true,
-        defaults: false,
+        columns: &[],
     };
+}
+
+/// The longest schema text the reader copies to check (SQLite's own
+/// `SQLITE_LIMIT_SQL_LENGTH` bound for a statement it parsed).
+const MAX_SCHEMA_SQL: usize = 1_000_000;
+/// The `table` rows of one name `SCHEMA_SQL` may return (one in a file
+/// SQLite loads; more are checked all the same).
+const MAX_SCHEMA_ROWS: usize = 4;
+
+/// One `table_xinfo` row as the checks see it.
+struct XinfoRow {
+    /// The row as sent (its `expr` still [`ColumnExpr::None`]).
+    row: ColumnRow,
+    /// Whether the stored name is valid UTF-8.
+    name_utf8: bool,
+    /// Whether reading the column authorizes an expression's functions.
+    expr: bool,
 }
 
 /// An open, set-up connection to one declared file.
@@ -529,13 +563,42 @@ impl Db {
         out
     }
 
+    /// Before the statistics statement (ADR-0059 refinement of
+    /// 2026-11-07, security review M1 of #425): `sqlite_stat1`'s schema
+    /// text must be valid UTF-8 ([`Code::NameNotUtf8`]), and the table must
+    /// have exactly the shape SQLite writes, `tbl`, `idx` and `stat`, plain
+    /// columns without a `DEFAULT` or a generated expression
+    /// ([`Code::StatsUnusable`]). A crafted `sqlite_stat1` could otherwise
+    /// make the statement authorize an expression's functions: refused when
+    /// off the list (the estimates silently lost), or a name that is not
+    /// UTF-8 handed to `rusqlite`'s conversion.
+    fn stat1_is_plain(&self) -> Result<(), Failure> {
+        const STAT1: &str = "sqlite_stat1";
+        self.schema_sql_is_utf8(STAT1)?;
+        let cols = self.xinfo(STAT1.as_bytes(), STAT1)?;
+        let expected: [&[u8]; 3] = [b"tbl", b"idx", b"stat"];
+        let plain = cols.len() == expected.len()
+            && cols.iter().zip(expected).all(|(c, e)| {
+                c.row.name.as_slice().eq_ignore_ascii_case(e) && c.row.hidden == 0 && !c.expr
+            });
+        if plain {
+            Ok(())
+        } else {
+            Err(Failure::new(Code::StatsUnusable))
+        }
+    }
+
     /// `sqlite_stat1` row counts, the first integer of `stat`, one per
-    /// table (see [`StatsFold`]).
+    /// table (see [`StatsFold`]), once `sqlite_stat1` passes
+    /// `stat1_is_plain`.
     ///
     /// # Errors
-    /// The mapped failure.
+    /// The mapped failure; [`Code::StatsUnusable`] and
+    /// [`Code::NameNotUtf8`] from `stat1_is_plain`.
     pub fn stats(&self) -> Result<Vec<crate::ipc::StatRow>, Failure> {
-        self.arm(Template::Stats);
+        self.arm_deadline();
+        self.stat1_is_plain()?;
+        self.set_template(Template::Stats);
         let out = (|| {
             let mut stmt = self.conn.prepare(sql::STATS).map_err(map_error)?;
             let mut rows = stmt.query([]).map_err(map_error)?;
@@ -565,57 +628,117 @@ impl Db {
         out
     }
 
-    /// `PRAGMA main.table_xinfo(<table>)`: `name`, `pk` and `hidden` only.
+    /// `PRAGMA main.table_xinfo(<table>)`: `name`, `pk` and `hidden`, and
+    /// for each column the authorizer's verdict on its `DEFAULT` or
+    /// `STORED` generated expression ([`ColumnExpr`], ADR-0059 refinement
+    /// of 2026-11-07).
+    ///
+    /// The verdict is what SQLite itself does, observed without running
+    /// anything: when an expression column can be sampled at all (a name
+    /// it can quote), the table's own schema text must be valid UTF-8
+    /// ([`Db::schema_sql_is_utf8`]; otherwise every expression column is
+    /// [`ColumnExpr::NotUtf8`]); then the plain sampling statement for the
+    /// expression columns, in groups of at most 64, is prepared and never
+    /// stepped. SQLite authorizes each expression's functions while it
+    /// prepares it; a group denied with "not authorized to use function"
+    /// ([`Code::SchemaFunctionRefused`]) is prepared again column by
+    /// column, and each denied column is [`ColumnExpr::Refused`]. So at
+    /// most one prepare per expression column and one per group: bounded
+    /// by [`MAX_TABLE_COLUMNS`], all under one statement deadline. Any
+    /// other failure fails the request (fail closed); a denial that the
+    /// schema text, checked again, explains is [`ColumnExpr::NotUtf8`].
     ///
     /// # Errors
     /// The mapped failure; [`Code::Internal`] for a name that cannot be
     /// quoted.
     pub fn columns(&self, table: &[u8]) -> Result<Vec<ColumnRow>, Failure> {
-        let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(table).map_err(|_| Failure::new(Code::Internal))?;
-        self.arm(Template::Columns(name.to_owned()));
-        let out = (|| {
-            let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
-            let mut rows = stmt.query([]).map_err(map_error)?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().map_err(map_error)? {
-                let name = match row.get_ref(1).map_err(map_error)? {
-                    ValueRef::Text(t) if t.len() <= MAX_NAME => Zeroizing::new(t.to_vec()),
-                    _ => Zeroizing::new(Vec::new()),
-                };
-                let int = |i: usize| match row.get_ref(i) {
-                    Ok(ValueRef::Integer(v)) => v,
-                    _ => 0,
-                };
-                out.push(ColumnRow {
-                    name,
-                    pk: int(5),
-                    hidden: int(6),
-                });
-                if out.len() > MAX_TABLE_COLUMNS {
-                    return Err(Failure::new(Code::TooBig));
-                }
+        self.arm_deadline();
+        let rows = self.xinfo(table, name)?;
+        let candidate: Vec<bool> = rows
+            .iter()
+            .map(|r| r.expr && sql::quote(&r.row.name).is_some())
+            .collect();
+        let mut out: Vec<ColumnRow> = rows.into_iter().map(|r| r.row).collect();
+        let names: Vec<&[u8]> = out
+            .iter()
+            .zip(&candidate)
+            .filter(|(_, k)| **k)
+            .map(|(c, _)| c.name.as_slice())
+            .collect();
+        if names.is_empty() {
+            return Ok(out);
+        }
+        let verdicts = match self.schema_sql_is_utf8(name) {
+            Ok(()) => self.probe_all(table, name, &names),
+            Err(f) if f.code == Code::NameNotUtf8 => Ok(vec![ColumnExpr::NotUtf8; names.len()]),
+            Err(f) => Err(f),
+        }?;
+        let mut verdicts = verdicts.into_iter();
+        for (c, k) in out.iter_mut().zip(&candidate) {
+            if *k {
+                c.expr = verdicts.next().unwrap_or(ColumnExpr::Refused);
             }
-            Ok(out)
-        })();
-        self.disarm();
-        out
+        }
+        Ok(out)
+    }
+
+    /// The verdicts of [`Db::columns`] for the expression columns `names`,
+    /// in order.
+    fn probe_all(
+        &self,
+        table: &[u8],
+        name: &str,
+        names: &[&[u8]],
+    ) -> Result<Vec<ColumnExpr>, Failure> {
+        let mut out = Vec::with_capacity(names.len());
+        for group in names.chunks(MAX_COLUMNS) {
+            match self.probe(table, name, group) {
+                Ok(()) => out.extend(group.iter().map(|_| ColumnExpr::Listed)),
+                Err(f) if f.code == Code::SchemaFunctionRefused => {
+                    for col in group {
+                        out.push(match self.probe(table, name, &[col]) {
+                            Ok(()) => ColumnExpr::Listed,
+                            Err(g) if g.code == Code::SchemaFunctionRefused => ColumnExpr::Refused,
+                            Err(g) => return self.probe_failed(g, name, names.len()),
+                        });
+                    }
+                }
+                Err(f) => return self.probe_failed(f, name, names.len()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A probe failed otherwise than by an unlisted function: a denial
+    /// that the schema text, checked again, explains (the application
+    /// changed it since) makes every expression column
+    /// [`ColumnExpr::NotUtf8`]; anything else fails the request.
+    fn probe_failed(&self, f: Failure, name: &str, n: usize) -> Result<Vec<ColumnExpr>, Failure> {
+        if f.code == Code::Auth
+            && matches!(self.schema_sql_is_utf8(name), Err(g) if g.code == Code::NameNotUtf8)
+        {
+            return Ok(vec![ColumnExpr::NotUtf8; n]);
+        }
+        Err(f)
     }
 
     /// Before a statement that reads `table`: the schema texts of the table
     /// that SQLite can hand to the authorizer must be valid UTF-8, or
-    /// [`Code::NameNotUtf8`]. From `table_xinfo` (hidden columns included):
-    /// every column name when `texts.names` (a statement naming the rowid),
-    /// every `DEFAULT` expression text when `texts.defaults` (a sampling
-    /// statement).
+    /// [`Code::NameNotUtf8`]. Every column name (`table_xinfo`, hidden
+    /// columns included) when `texts.names` (a statement naming the rowid);
+    /// the table's own schema text ([`Db::schema_sql_is_utf8`]) when one of
+    /// `texts.columns` has a `DEFAULT` or a `STORED` generated expression.
     ///
     /// `rusqlite`'s authorizer hook converts each string argument with a
     /// panic on invalid UTF-8 (0.40.2 and 0.41.1; no bytes variant). That
-    /// panic is caught by `rusqlite` and read by SQLite as `SQLITE_DENY` (so
-    /// the statement is refused, never allowed), but it would abort a
-    /// process whose panic hook aborts (a fuzz target) and report a hostile
-    /// file as an authorizer bug. Two texts of the file reach the
-    /// authorizer:
+    /// panic is caught by `rusqlite`, which answers SQLite `SQLITE_ERROR`,
+    /// the same value as `SQLITE_DENY` (1): SQLite reads it as a denial, so
+    /// the statement is refused, never allowed (were the answer another
+    /// code, SQLite would report "authorizer malfunction", mapped to
+    /// [`Code::Auth`] too). But the panic would abort a process whose panic
+    /// hook aborts (a fuzz target) and report a hostile file as an
+    /// authorizer bug. Two kinds of text from the file reach the authorizer:
     ///
     /// - When a statement names the rowid of a table that has an `INTEGER
     ///   PRIMARY KEY` column, SQLite hands that column's name, as stored in
@@ -629,14 +752,13 @@ impl Db {
     /// - Since SQLite 3.54, reading a column with a `DEFAULT` or a `STORED`
     ///   generated expression hands every function name of that expression,
     ///   as written in the schema, to the authorizer (`sqlite3ColumnExprAuth`,
-    ///   ADR-0059 refinement of 2026-11-07). A `DEFAULT` expression is not
-    ///   resolved when the schema is read, so it can name any function,
-    ///   including one whose name is not UTF-8; `table_xinfo` gives its
-    ///   text as written (`dflt_value`), and a function name is a part of
-    ///   that text. A generated expression is resolved when the schema is
-    ///   read: each function it names is a registered function (an ASCII
-    ///   name), or the schema does not load, so it needs no check (and
-    ///   `table_xinfo` does not give its text).
+    ///   ADR-0059 refinement of 2026-11-07). Neither kind of expression
+    ///   needs to name a known function: a `DEFAULT` is not resolved when
+    ///   the schema is read, and while the schema is parsed SQLite does not
+    ///   report an unknown function in a generated expression either (so
+    ///   `g\xe4(a)` in a `STORED` expression loads). `table_xinfo` gives no
+    ///   text for a generated column, so the table's own `sql` is checked,
+    ///   whole: every expression's text is a part of it.
     ///
     /// It runs under the deadline its caller armed for the whole request
     /// (`arm_deadline`), never one of its own.
@@ -651,37 +773,130 @@ impl Db {
         &self,
         table: &[u8],
         name: &str,
-        texts: Utf8Texts,
+        texts: Utf8Texts<'_>,
     ) -> Result<(), Failure> {
+        if !texts.names && texts.columns.is_empty() {
+            return Ok(());
+        }
+        let cols = self.xinfo(table, name)?;
+        if texts.names && cols.iter().any(|c| !c.name_utf8) {
+            return Err(Failure::new(Code::NameNotUtf8));
+        }
+        // A requested column is matched as SQLite matches it (equal but for
+        // ASCII case), so more columns match, never fewer.
+        let reads_expr = cols.iter().any(|c| {
+            c.expr
+                && texts
+                    .columns
+                    .iter()
+                    .any(|r| r.as_slice().eq_ignore_ascii_case(&c.row.name))
+        });
+        if reads_expr {
+            self.schema_sql_is_utf8(name)?;
+        }
+        Ok(())
+    }
+
+    /// `PRAGMA main.table_xinfo(<table>)` under the deadline already armed:
+    /// each column, whether its name is valid UTF-8, and whether reading it
+    /// makes SQLite authorize an expression's functions (a `DEFAULT` on a
+    /// plain column, or a `STORED` generated column). The `DEFAULT` text is
+    /// only tested for presence, never kept.
+    fn xinfo(&self, table: &[u8], name: &str) -> Result<Vec<XinfoRow>, Failure> {
         let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
         self.set_template(Template::Columns(name.to_owned()));
         let out = (|| {
             let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
             let mut rows = stmt.query([]).map_err(map_error)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(map_error)? {
+                let (name, name_utf8) = match row.get_ref(1).map_err(map_error)? {
+                    ValueRef::Text(t) => (
+                        if t.len() <= MAX_NAME {
+                            Zeroizing::new(t.to_vec())
+                        } else {
+                            Zeroizing::new(Vec::new())
+                        },
+                        std::str::from_utf8(t).is_ok(),
+                    ),
+                    _ => (Zeroizing::new(Vec::new()), false),
+                };
+                let int = |i: usize| match row.get_ref(i) {
+                    Ok(ValueRef::Integer(v)) => v,
+                    _ => 0,
+                };
+                let hidden = int(6);
+                let default = !matches!(row.get_ref(4).map_err(map_error)?, ValueRef::Null);
+                out.push(XinfoRow {
+                    row: ColumnRow {
+                        name,
+                        pk: int(5),
+                        hidden,
+                        expr: ColumnExpr::None,
+                    },
+                    name_utf8,
+                    // Hidden 1 (a virtual table's) and 2 (VIRTUAL generated)
+                    // are never sampled; any other value with a DEFAULT,
+                    // and 3 (STORED), is an expression column.
+                    expr: hidden == 3 || (default && hidden != 1 && hidden != 2),
+                });
+                if out.len() > MAX_TABLE_COLUMNS {
+                    return Err(Failure::new(Code::TooBig));
+                }
+            }
+            Ok(out)
+        })();
+        self.disarm();
+        out
+    }
+
+    /// The ADR-0059 refinement of 2026-11-07's exception: the `sql` of the
+    /// `table` rows named `name` (ASCII case folded, as SQLite resolves
+    /// it), under the deadline already armed, must be valid UTF-8, or
+    /// [`Code::NameNotUtf8`]. The text is copied into a zeroizing buffer,
+    /// checked, and dropped: the only result is the verdict. A row whose
+    /// `sql` is not text, or longer than [`MAX_SCHEMA_SQL`], fails the
+    /// check; no row is [`Code::NoSuchTable`].
+    fn schema_sql_is_utf8(&self, name: &str) -> Result<(), Failure> {
+        self.set_template(Template::Schema);
+        let out = (|| {
+            let mut stmt = self.conn.prepare(sql::SCHEMA_SQL).map_err(map_error)?;
+            let mut rows = stmt.query([name]).map_err(map_error)?;
             let mut n = 0usize;
             while let Some(row) = rows.next().map_err(map_error)? {
                 n += 1;
-                if n > MAX_TABLE_COLUMNS {
-                    return Err(Failure::new(Code::TooBig));
+                if n > MAX_SCHEMA_ROWS {
+                    return Err(Failure::new(Code::NameNotUtf8));
                 }
-                if texts.names {
-                    match row.get_ref(1).map_err(map_error)? {
-                        ValueRef::Text(t) if std::str::from_utf8(t).is_ok() => {}
-                        _ => return Err(Failure::new(Code::NameNotUtf8)),
-                    }
+                let ValueRef::Text(t) = row.get_ref(0).map_err(map_error)? else {
+                    return Err(Failure::new(Code::NameNotUtf8));
+                };
+                if t.len() > MAX_SCHEMA_SQL {
+                    return Err(Failure::new(Code::NameNotUtf8));
                 }
-                if texts.defaults {
-                    match row.get_ref(4).map_err(map_error)? {
-                        ValueRef::Text(t) if std::str::from_utf8(t).is_err() => {
-                            return Err(Failure::new(Code::NameNotUtf8));
-                        }
-                        ValueRef::Blob(_) => return Err(Failure::new(Code::NameNotUtf8)),
-                        _ => {}
-                    }
+                let text: Zeroizing<Vec<u8>> = Zeroizing::new(t.to_vec());
+                if std::str::from_utf8(&text).is_err() {
+                    return Err(Failure::new(Code::NameNotUtf8));
                 }
+            }
+            if n == 0 {
+                return Err(Failure::new(Code::NoSuchTable));
             }
             Ok(())
         })();
+        self.disarm();
+        out
+    }
+
+    /// Prepares, never steps, the plain sampling statement for `columns` of
+    /// `table` under the sampling template, under the deadline already
+    /// armed: SQLite authorizes the functions of their expressions while it
+    /// prepares it ([`Db::columns`]).
+    fn probe(&self, table: &[u8], name: &str, columns: &[&[u8]]) -> Result<(), Failure> {
+        let text = sql::sample(table, None, columns, SampleRange::Plain { reverse: false })
+            .ok_or_else(|| Failure::new(Code::Internal))?;
+        self.set_template(Template::Read(name.to_owned()));
+        let out = self.conn.prepare(&text).map(drop).map_err(map_error);
         self.disarm();
         out
     }
@@ -720,7 +935,7 @@ impl Db {
         out: Result<T, Failure>,
         table: &[u8],
         name: &str,
-        texts: Utf8Texts,
+        texts: Utf8Texts<'_>,
     ) -> Result<T, Failure> {
         match out {
             Err(f) if f.code == Code::Auth => {
@@ -735,7 +950,8 @@ impl Db {
 
     /// One sampling statement of decision 5's closed list; one by the
     /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is,
-    /// and every one when a column's `DEFAULT` text is not valid UTF-8
+    /// and one reading a column with a `DEFAULT` or a `STORED` expression
+    /// when the table's schema text is not valid UTF-8
     /// (`schema_texts_are_utf8`).
     ///
     /// # Errors
@@ -747,7 +963,7 @@ impl Db {
         self.arm_deadline();
         let texts = Utf8Texts {
             names: req.alias.is_some(),
-            defaults: true,
+            columns: &req.columns,
         };
         self.schema_texts_are_utf8(&req.table, name, texts)?;
         let reverse = matches!(req.range, SampleRange::Plain { reverse: true });
@@ -982,8 +1198,9 @@ pub(crate) mod tests {
 
     /// ADR-0059 refinement of 2026-11-07: SQLite 3.54 reports a function of
     /// a column's `DEFAULT` or `STORED` expression denied by the authorizer
-    /// as `SQLITE_ERROR` with this message; it is mapped to `auth` (and so
-    /// rechecked by `after_read_statement`), other errors are not.
+    /// as `SQLITE_ERROR` with this message; it is mapped to
+    /// `schema_function_refused` (security review L3 of #425), other errors
+    /// are not.
     #[test]
     fn a_denied_schema_expression_function_is_auth() {
         assert_eq!(
@@ -991,6 +1208,12 @@ pub(crate) mod tests {
                 rc::ERROR,
                 Some("not authorized to use function: randomblob(16)")
             ),
+            Code::SchemaFunctionRefused
+        );
+        // Security review L1 of #425: an authorizer answer SQLite does not
+        // know (a caught panic answered with another code) is a denial.
+        assert_eq!(
+            sqlite_code(rc::ERROR, Some("authorizer malfunction")),
             Code::Auth
         );
         assert_eq!(sqlite_code(rc::AUTH, Some("not authorized")), Code::Auth);

@@ -9,9 +9,16 @@
 use crate::ipc::{MAX_NAME, RowidAlias, SampleRange};
 
 /// The catalog: `table` and `view` rows of `sqlite_schema` (the `sql`
-/// column is never read).
+/// column is not read here; see [`SCHEMA_SQL`]).
 pub const CATALOG: &str =
     "SELECT type, name, rootpage FROM main.sqlite_schema WHERE type IN ('table', 'view')";
+/// One table's own schema text (ADR-0059 refinement of 2026-11-07): the
+/// `sql` of the `table` rows whose name is the bound `?1` (ASCII case
+/// folded, as SQLite resolves table names), read only to check that it is
+/// valid UTF-8 (`db::Db::schema_sql_is_utf8`). The only statement that
+/// reads `sql`.
+pub const SCHEMA_SQL: &str =
+    "SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = ?1 COLLATE NOCASE";
 /// `sqlite_stat1` rows: the table's own row and its indexes' rows, folded
 /// into one count per table by the reader (`db::StatsFold`).
 pub const STATS: &str = "SELECT tbl, idx, stat FROM main.sqlite_stat1";
@@ -52,6 +59,7 @@ pub fn statement_allow_list() -> &'static [(&'static str, &'static str)] {
     &[
         ("catalog", CATALOG),
         ("stats", STATS),
+        ("schema_sql", SCHEMA_SQL),
         ("journal_mode", PRAGMA_JOURNAL_MODE),
         ("schema_version", PRAGMA_SCHEMA_VERSION),
         ("page_size", PRAGMA_PAGE_SIZE),
