@@ -193,6 +193,31 @@ fn regex_keeps_unicode_case() {
     assert!(line.contains("\"unicode-case\""), "{line}");
 }
 
+/// The shipped agent panics on an integer overflow instead of wrapping
+/// (maintainer decision of 2026-11-07); panics stay catchable (`unwind`),
+/// which the per-connector and per-record isolation needs.
+#[test]
+fn release_profile_checks_overflows_and_unwinds() {
+    let root = fs::read_to_string(workspace_root().join("Cargo.toml")).unwrap();
+    let profile: Vec<&str> = root
+        .lines()
+        .skip_while(|l| l.trim() != "[profile.release]")
+        .skip(1)
+        .take_while(|l| !l.trim_start().starts_with('['))
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert!(profile.contains(&"overflow-checks = true"), "{profile:?}");
+    assert!(
+        !profile.iter().any(|l| l.starts_with("panic")),
+        "{profile:?}"
+    );
+    assert!(
+        !root.contains("[profile.release.package"),
+        "per-package override"
+    );
+}
+
 #[test]
 fn lockfile_has_no_openssl_native_tls_or_aws_lc() {
     let lock = fs::read_to_string(workspace_root().join("Cargo.lock")).unwrap();
