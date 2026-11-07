@@ -12,9 +12,10 @@
 #
 # Every seed is a committed fixture with fake values only (agent/crates/connector-cas/fixtures/
 # README.md: fake dev user, ticket and token ids, ID tokens, Authorization header and cookies
-# replaced by REDACTED / FAKE placeholders). Crash inputs are mutations of these seeds or of
-# libFuzzer's own random bytes, so they cannot hold a secret: never seed this corpus with real
-# log lines, server replies or service definitions (I2).
+# replaced by REDACTED / FAKE placeholders; the recorded Firebird trace logs of
+# agent/crates/connector-firebird/testdata/ hold the pinned dev images' fake data). Crash inputs
+# are mutations of these seeds or of libFuzzer's own random bytes, so they cannot hold a secret:
+# never seed this corpus with real log lines, server replies or service definitions (I2).
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -48,6 +49,8 @@ case "$TARGET" in
     cp "$FIXTURES"/registry/*.yml "$FIXTURES"/registry/*.yaml "$FIXTURES"/registry-hostile/*.yml "$CORPUS"/ ;;
   cas_audit_log) split -l 1 -a 3 -d "$FIXTURES/cas-8.0.2-oauth-oidc-audit.jsonl" "$CORPUS/fixture-" ;;
   sqlite_file) python3 -I "$FUZZ/sqlite_seed.py" "$CORPUS/seed" ;;
+  firebird_trace_stream)
+    python3 -I "$FUZZ/firebird_trace_seed.py" "$ROOT/agent/crates/connector-firebird/testdata" "$CORPUS" ;;
   *) ;; # the MongoDB and OpenLDAP targets start from an empty corpus, as in smoke.sh
 esac
 # The SQLite targets (ADR-0059 decision 5): the bundled C code with AddressSanitizer

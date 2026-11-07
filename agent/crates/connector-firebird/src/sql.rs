@@ -102,8 +102,11 @@ pub(crate) const DATABASE_TRIGGERS: &str = "SELECT (SELECT COUNT(*) FROM RDB$TRI
 
 /// Which relations of the credential list exist in this database
 /// (decision 4, security review M5): a database can be its own security
-/// database.
-pub(crate) const CREDENTIAL_RELATIONS: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME IN ('PLG$SRP', 'PLG$SRP_VIEW', 'PLG$USERS', 'PLG$VIEW_USERS', 'SEC$USERS', 'SEC$USER_ATTRIBUTES', 'SEC$GLOBAL_AUTH_MAPPING', 'RDB$CONFIG')";
+/// database. `SEC$GLOBAL_AUTH_MAPPING` is not probed (residual A,
+/// R11, accepted 2026-10-26): every plain account reads every
+/// global mapping (measured on 4.0 and 5.0), so its readability says
+/// nothing about the account; it stays always reported by Audit.
+pub(crate) const CREDENTIAL_RELATIONS: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME IN ('PLG$SRP', 'PLG$SRP_VIEW', 'PLG$USERS', 'PLG$VIEW_USERS', 'SEC$USERS', 'SEC$USER_ATTRIBUTES', 'RDB$CONFIG')";
 
 /// The one-bit readability probes of decision 4 (no row content
 /// returned), one constant text per relation of the closed credential
@@ -133,10 +136,6 @@ pub(crate) const PROBES: &[(&str, &str)] = &[
     (
         "SEC$USER_ATTRIBUTES",
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM SEC$USER_ATTRIBUTES WHERE SEC$USER_NAME <> CURRENT_USER) THEN 1 ELSE 0 END FROM RDB$DATABASE",
-    ),
-    (
-        "SEC$GLOBAL_AUTH_MAPPING",
-        "SELECT CASE WHEN EXISTS (SELECT 1 FROM SEC$GLOBAL_AUTH_MAPPING) THEN 1 ELSE 0 END FROM RDB$DATABASE",
     ),
     (
         "RDB$CONFIG",
@@ -643,6 +642,10 @@ pub(crate) mod charset {
 
 /// `isc_info_sql_stmt_select`.
 pub(crate) const STMT_SELECT: i64 = 1;
+/// `isc_info_sql_stmt_ddl`: also the type Firebird 4.0 and 5.0 give a
+/// session-management statement such as `SET SESSION IDLE TIMEOUT`
+/// (`dsql.cpp`, `TYPE_SESSION_MANAGEMENT`).
+pub(crate) const STMT_DDL: i64 = 5;
 
 /// A described output column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1099,6 +1102,27 @@ mod tests {
         ));
         assert!(!checked("SELECT * FROM CUSTOMERS"));
         assert!(!checked(&format!("{VERSION} ")));
+    }
+
+    /// Residual A (R11, accepted 2026-10-26): every plain
+    /// account reads every global mapping, so `SEC$GLOBAL_AUTH_MAPPING`
+    /// is neither listed nor probed by `check()`, and stays on Audit's
+    /// always-reported credential list.
+    #[test]
+    fn global_auth_mapping_is_not_probed_but_always_reported() {
+        assert!(PROBES.iter().all(
+            |(r, t)| *r != "SEC$GLOBAL_AUTH_MAPPING" && !t.contains("SEC$GLOBAL_AUTH_MAPPING")
+        ));
+        assert!(!CREDENTIAL_RELATIONS.contains("SEC$GLOBAL_AUTH_MAPPING"));
+        // Every probed relation is listed, and nothing else is.
+        for (r, _) in PROBES {
+            assert!(CREDENTIAL_RELATIONS.contains(&format!("'{r}'")), "{r}");
+        }
+        assert_eq!(CREDENTIAL_RELATIONS.matches('\'').count(), 2 * PROBES.len());
+        assert!(crate::trace_events::always_listed(
+            "SEC$GLOBAL_AUTH_MAPPING"
+        ));
+        assert!(crate::trace_events::CREDENTIAL_RELATIONS.contains(&"SEC$GLOBAL_AUTH_MAPPING"));
     }
 
     #[test]

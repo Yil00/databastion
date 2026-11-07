@@ -20,9 +20,9 @@ fn the_stream_across_a_server_rotation() {
     if !super::enabled() {
         return;
     }
-    let (Ok(log), Ok(ready)) = (
-        std::env::var("FIREBIRD_IT_ROTATION_LOG"),
-        std::env::var("FIREBIRD_IT_ROTATION_READY"),
+    let (Some(log), Some(ready)) = (
+        super::phase_var("FIREBIRD_IT_ROTATION_LOG"),
+        super::phase_var("FIREBIRD_IT_ROTATION_READY"),
     ) else {
         return;
     };

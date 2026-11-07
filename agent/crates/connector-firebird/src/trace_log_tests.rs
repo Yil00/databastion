@@ -407,6 +407,69 @@ fn headers_are_closed() {
     }
 }
 
+/// Review N2 of P10-F: the `FAILED ` / `UNAUTHORIZED ` prefixes only on
+/// the events the trace plugin writes with them (the pinned images'
+/// event names); on any other event the line is not a header.
+#[test]
+fn outcome_prefixes_only_on_the_events_that_have_them() {
+    let line = |ev: &str| format!("2026-10-30T15:22:38.3650 (24:0x7fdc1dd7adc0) {ev}");
+    for (name, _) in EVENTS {
+        let plain = header(line(name).as_bytes()).unwrap();
+        assert_eq!(plain.outcome, Outcome::Ok, "{name}");
+        let with = plain.event.has_outcome_forms();
+        for (prefix, outcome) in [
+            ("FAILED ", Outcome::Failed),
+            ("UNAUTHORIZED ", Outcome::Unauthorized),
+        ] {
+            let h = header(line(&format!("{prefix}{name}")).as_bytes());
+            assert_eq!(h.is_some(), with, "{prefix}{name}");
+            if let Some(h) = h {
+                assert_eq!((h.event, h.outcome), (plain.event, outcome));
+            }
+        }
+    }
+    for good in [
+        "FAILED ATTACH_DATABASE",
+        "UNAUTHORIZED ATTACH_DATABASE",
+        "FAILED CREATE_DATABASE",
+        "FAILED START_TRANSACTION",
+        "UNAUTHORIZED ROLLBACK_RETAINING",
+        "FAILED PREPARE_STATEMENT",
+        "FAILED EXECUTE_STATEMENT_START",
+        "UNAUTHORIZED EXECUTE_STATEMENT_FINISH",
+        "FAILED EXECUTE_STATEMENT_RESTART",
+        "FAILED EXECUTE_PROCEDURE_FINISH",
+        "UNAUTHORIZED EXECUTE_FUNCTION_START",
+        "FAILED EXECUTE_TRIGGER_FINISH",
+        "UNAUTHORIZED COMPILE_BLR",
+        "FAILED EXECUTE_BLR",
+        "FAILED EXECUTE_DYN",
+        "UNAUTHORIZED ATTACH_SERVICE",
+        "FAILED START_SERVICE",
+        "FAILED QUERY_SERVICE",
+        "UNAUTHORIZED DETACH_SERVICE",
+    ] {
+        assert!(header(line(good).as_bytes()).is_some(), "{good}");
+    }
+    for bad in [
+        "FAILED TRACE_INIT",
+        "UNAUTHORIZED TRACE_FINI",
+        "FAILED DETACH_DATABASE",
+        "FAILED DROP_DATABASE",
+        "FAILED FREE_STATEMENT",
+        "FAILED CLOSE_CURSOR",
+        "UNAUTHORIZED SET_CONTEXT",
+        "FAILED SWEEP_START",
+        "FAILED SWEEP_FAILED",
+        "UNAUTHORIZED PRIVILEGES_CHANGE",
+        "FAILED FAILED ATTACH_DATABASE",
+        "FAILED UNAUTHORIZED ATTACH_DATABASE",
+        "FAILED ERROR AT JStatement::execute",
+    ] {
+        assert!(header(line(bad).as_bytes()).is_none(), "{bad}");
+    }
+}
+
 const STATEMENT: &str = "2026-10-30T15:22:38.4210 (24:0x7fdc1dd7adc0) EXECUTE_STATEMENT_FINISH
 \t/data/app.fdb (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/41410)
 \t/usr/bin/app:28

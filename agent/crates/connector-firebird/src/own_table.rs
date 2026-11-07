@@ -312,11 +312,6 @@ const PROBE_ROWS: &[Row] = &[
     ),
     probe_row(
         sql::PROBES[6].1,
-        &["RDB$DATABASE", "SEC$GLOBAL_AUTH_MAPPING"],
-        MON_LOADING,
-    ),
-    probe_row(
-        sql::PROBES[7].1,
         &["RDB$DATABASE", "RDB$CONFIG"],
         CONFIG_LOADING,
     ),
@@ -487,7 +482,7 @@ mod tests {
             &acc(3)
         ));
         // The `RDB$CONFIG` probe: its R23 set, not the `MON$` one.
-        let cfg = sql::PROBES[7].1;
+        let cfg = sql::PROBES[6].1;
         assert!(matches(
             cfg,
             None,

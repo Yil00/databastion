@@ -39,7 +39,7 @@ fn file(var: &str) -> Option<Vec<u8>> {
     if !super::enabled() {
         return None;
     }
-    let path = std::env::var(var).ok()?;
+    let path = super::phase_var(var)?;
     Some(std::fs::read(path).expect("readable"))
 }
 

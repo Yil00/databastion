@@ -71,6 +71,7 @@ fn mode(p: &Path, m: u32) {
 #[test]
 fn prepare() {
     if phase().as_deref() != Some("prepare") {
+        eprintln!("skipped: FIREBIRD_UNIT_CHECK is not prepare (a phase of dev/firebird/it.sh)");
         return;
     }
     assert_eq!(
@@ -148,6 +149,7 @@ fn prepare() {
 #[test]
 fn check() {
     if phase().as_deref() != Some("check") {
+        eprintln!("skipped: FIREBIRD_UNIT_CHECK is not check (a phase of dev/firebird/it.sh)");
         return;
     }
     let (server, server_gid) = (

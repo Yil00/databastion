@@ -566,7 +566,10 @@ pub(crate) struct Settings {
     pub(crate) aliases: Option<AliasMap>,
     /// Proof 11 holds (R1 rule 8).
     pub(crate) proof11: bool,
-    /// The agent's account (upper-cased, as the server stores it).
+    /// The agent's account as the server stores it and the trace log
+    /// prints it: the login the session sends (ASCII upper-cased, as an
+    /// unquoted name), compared exactly (review N5 of P10-F: a user created
+    /// with a quoted name of another case is another user).
     pub(crate) account: String,
     pub(crate) parse: ParseOptions,
     /// SuperServer proven (R6, R16): the internal shape applies.
@@ -1861,6 +1864,80 @@ impl Machine {
     #[cfg(test)]
     pub(crate) fn ext_holds_for_tests(&self) -> usize {
         self.ext.len()
+    }
+
+    /// The first of the stream's caps (R1 rule 11, R25 items 4 and 6, R29)
+    /// the state is past, or an internal count that disagrees with what
+    /// it counts; `None` when the state is within every cap. For the fuzz
+    /// target `trace_stream` and the tests.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn caps_violated(&self) -> Option<&'static str> {
+        let undeclared = self
+            .seen_ids
+            .keys()
+            .chain(self.binding_count.keys())
+            .filter(|d| matches!(d, DbId::Undeclared(_)))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let per_db = self.binding_count.iter().all(|(d, n)| match d {
+            DbId::Declared(_) => *n <= MAX_BINDINGS_DECLARED,
+            DbId::Undeclared(_) => *n <= MAX_BINDINGS_UNDECLARED,
+        });
+        let per_binding = self.groups.iter().all(|g| {
+            self.groups.iter().filter(|o| o.key == g.key).count() <= MAX_GROUPS_PER_BINDING
+        });
+        let largest_group = self.groups.iter().map(Group::bytes).max().unwrap_or(0);
+        let checks: [(bool, &'static str); 16] = [
+            (self.failed_pids.len() <= MAX_FAILED_PIDS, "failed pids"),
+            (undeclared <= MAX_UNDECLARED, "undeclared identities"),
+            (per_db, "bindings per database"),
+            (
+                self.bindings.len() == self.binding_count.values().sum::<usize>(),
+                "binding count",
+            ),
+            (
+                self.seen_total == self.seen_ids.values().map(|s| s.set.len()).sum::<usize>(),
+                "seen ids count",
+            ),
+            (self.services.len() <= MAX_SERVICES, "services"),
+            (
+                self.token_ended_order.len() <= MAX_TOKENS_ENDED
+                    && self.token_ended.len() <= self.token_ended_order.len(),
+                "ended tokens",
+            ),
+            (self.ddl_open.len() <= MAX_DDL_OPEN, "DDL transactions"),
+            (self.groups.len() <= MAX_GROUPS, "groups"),
+            (per_binding, "groups per binding"),
+            // Checked before a group grows: at most one group past it.
+            (
+                self.group_bytes() <= MAX_STATE_BYTES + largest_group,
+                "group bytes",
+            ),
+            (self.held.len() <= MAX_HELD, "held events"),
+            (
+                self.held_bytes <= MAX_STATE_BYTES
+                    && self.held_bytes
+                        == self
+                            .held
+                            .iter()
+                            .map(|h| held_bytes(&h.event))
+                            .sum::<usize>(),
+                "held bytes",
+            ),
+            (
+                self.ext_events <= EXT_EVENTS && self.ext_bytes <= EXT_BYTES,
+                "external-source holds",
+            ),
+            (
+                self.tra_pos_entries == self.tra_pos.values().map(Vec::len).sum::<usize>(),
+                "transaction positions",
+            ),
+            (
+                self.state_bytes() <= MAX_STREAM_BYTES + 2 * MAX_STATE_BYTES + EXT_BYTES,
+                "stream state",
+            ),
+        ];
+        checks.iter().find(|(ok, _)| !ok).map(|(_, what)| *what)
     }
 
     /// R28 item 4, R41 item 8: what invalidates the dependent and
@@ -3342,8 +3419,9 @@ impl Machine {
                 // R42 item 5: the attachment's lifetime holds the record's
                 // time (this attach's offset, else the confirmed one).
                 let t = self.record_time(rec.header.time, measured.or(self.offset));
-                let account = att.user.eq_ignore_ascii_case(&self.s.account)
-                    && att.role.is_none_or(|r| r == "NONE");
+                // Review N5 of P10-F: the user as stored, which the trace
+                // log prints verbatim (a quoted name keeps its case).
+                let account = att.user == self.s.account && att.role.is_none_or(|r| r == "NONE");
                 let mine = port.is_some_and(|p| self.ledger.is_own_attach(&label, id, p, Some(t)))
                     && account;
                 // L2 of the review of #418: the agent's session may not have
@@ -4421,8 +4499,7 @@ impl Machine {
         let Some(att) = rec.att else {
             return Some(false);
         };
-        if !att.user.eq_ignore_ascii_case(&self.s.account) || att.role.is_some_and(|r| r != "NONE")
-        {
+        if att.user != self.s.account || att.role.is_some_and(|r| r != "NONE") {
             return Some(false);
         }
         let label = self.s.databases[i].attach.clone();

@@ -6,7 +6,8 @@
 # Builds the targets with libFuzzer's coverage instrumentation (the flags cargo-fuzz passes, without
 # a sanitizer: sanitizers need a nightly toolchain) plus debug assertions and overflow checks, then
 # runs each target for SECONDS from a temporary corpus (empty, or seeded with the committed CAS
-# fixtures for cas_registry, cas_registry_yaml, cas_registry_yaml_diff and cas_audit_log). Exits non-zero on the
+# fixtures for cas_registry, cas_registry_yaml, cas_registry_yaml_diff and cas_audit_log, and the
+# recorded Firebird trace logs for firebird_trace_stream). Exits non-zero on the
 # first crash, panic, timeout or out-of-memory; the crashing input is kept under
 # $CARGO_TARGET_DIR/fuzz-artifacts/ (never commit it if it was built from real data).
 # For longer campaigns, use cargo-fuzz on nightly (README.md).
@@ -50,6 +51,11 @@ seed() {
     sqlite_file)
       if command -v python3 >/dev/null 2>&1; then
         python3 -I "$HERE/sqlite_seed.py" "$2/seed" || true
+      fi ;;
+    # Whole records of the recorded Firebird trace logs, under -max_len (ADR-0060, review L1).
+    firebird_trace_stream)
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -I "$HERE/firebird_trace_seed.py" "$HERE/../crates/connector-firebird/testdata" "$2"
       fi ;;
   esac
 }

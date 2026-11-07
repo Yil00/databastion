@@ -1355,7 +1355,10 @@ impl AgentConfig {
     /// 2): the agent's state directory, the directory of `agent.yaml`,
     /// `/etc/databastion`, every file the configuration references (secret
     /// files, CA files, client keys and certificates, audit logs, CAS
-    /// registries) and the directory holding it, and the system roots.
+    /// registries) and the directory holding it, and the system roots;
+    /// each also in its resolved form (SQLite review L4: compared as text,
+    /// a location reached through a symbolic link would not be refused at
+    /// its real place).
     fn sqlite_refused_locations(&self, config_path: Option<&Path>) -> Vec<PathBuf> {
         let mut refused: Vec<PathBuf> = sqlite::SYSTEM_ROOTS.iter().map(PathBuf::from).collect();
         refused.push(self.state_dir.clone());
@@ -1411,6 +1414,11 @@ impl AgentConfig {
             }
             refused.push(f);
         }
+        let resolved: Vec<PathBuf> = refused
+            .iter()
+            .filter_map(|r| sqlite::resolved_location(r))
+            .collect();
+        refused.extend(resolved);
         refused.sort();
         refused.dedup();
         refused
@@ -2254,6 +2262,49 @@ targets:
             "  - id: crm-copy\n    engine: sqlite\n    sqlite:\n      path: /srv/crm/data/crm.db\n  - id: pg-main\n",
         );
         assert!(err(&dup).contains("duplicate_file"), "{}", err(&dup));
+    }
+
+    /// SQLite review L4: a refused location declared through a symbolic
+    /// link (here a secret file under a symlinked directory) is refused at
+    /// its real place too, and so is the real directory holding it.
+    #[test]
+    fn sqlite_refused_locations_are_resolved() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("databastion-l4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("secret"), b"x").unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let with = |db: &Path| {
+            SQLITE
+                .replace(
+                    "/etc/pg-secrets/pg-main",
+                    &format!("{}/link/secret", base.display()),
+                )
+                .replace("/srv/crm/data/crm.db", db.to_str().unwrap())
+        };
+        // The secret file itself, and a file next to it, at the real place.
+        for db in [real.join("secret"), real.join("app.db")] {
+            let e = err(&with(&db));
+            assert!(
+                e.contains("targets[0].sqlite.path") && e.contains("refused_location"),
+                "{}: {e}",
+                db.display()
+            );
+        }
+        // Elsewhere: accepted.
+        let other = base.join("data");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(parse(&with(&other.join("app.db"))).is_ok());
+        // The resolved form of a file not created yet: its real parent.
+        assert_eq!(
+            sqlite::resolved_location(&base.join("link").join("later.log")),
+            Some(real.join("later.log"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     const FIREBIRD: &str = "
