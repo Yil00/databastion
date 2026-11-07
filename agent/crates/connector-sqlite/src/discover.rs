@@ -686,7 +686,7 @@ fn lossy_utf8(v: &[u8]) -> String {
 fn count_failure(sink: &FindingSink, f: &Failure) {
     sink.add_coverage(cov(|c| match f.code {
         Code::Corrupt | Code::NotReadable => c.not_readable = 1,
-        Code::ViewProhibited => c.unsupported = 1,
+        Code::ViewProhibited | Code::NameNotUtf8 => c.unsupported = 1,
         Code::TooBig | Code::NoMemory | Code::WalTooLarge => c.limit = 1,
         _ => c.error = 1,
     }));
@@ -817,7 +817,19 @@ async fn sample_table(
             }
             Ok(Response::Bounds(Some(b))) => plan = Some(b),
             Ok(_) => return Ok(table_failed(scan, &UnitError::Dead(Death::Protocol), name)),
-            Err(UnitError::Failed(f)) if f.code == Code::NoRowid => plain = true,
+            // A column name that is not UTF-8: the rowid is not read
+            // (`Db::bounds`), the table is, by the plain read.
+            Err(UnitError::Failed(f)) if matches!(f.code, Code::NoRowid | Code::NameNotUtf8) => {
+                if f.code == Code::NameNotUtf8 {
+                    tracing::info!(
+                        target_id = %scan.target.id,
+                        object = normalize(name).as_str(),
+                        code = f.code.as_str(),
+                        "sqlite table read without its rowid"
+                    );
+                }
+                plain = true;
+            }
             Err(e) => return Ok(table_failed(scan, &e, name)),
         }
     }

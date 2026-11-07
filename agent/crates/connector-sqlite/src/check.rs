@@ -123,6 +123,7 @@ pub fn outcome(code: Code) -> (FailureCode, Option<Stage>, Option<NoteCode>) {
         Code::NoMemory | Code::TooBig => (F::ResourceLimit, None, None),
         Code::Corrupt
         | Code::NoRowid
+        | Code::NameNotUtf8
         | Code::NoSuchTable
         | Code::ViewProhibited
         | Code::Auth

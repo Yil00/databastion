@@ -241,6 +241,12 @@ pub enum Code {
     /// `SQLITE_AUTH`: the authorizer refused one of the reader's own
     /// statements (a bug).
     Auth,
+    /// A column of the table has a name that is not valid UTF-8, so a
+    /// statement reading its rowid is not prepared: SQLite would hand the
+    /// name of its rowid alias column to the authorizer, whose `rusqlite`
+    /// conversion panics on invalid UTF-8. The table can still be read
+    /// without its rowid (the plain read).
+    NameNotUtf8,
     /// The file is no longer the one opened.
     FileChanged,
     /// A side file appeared after the reader's grant was built (review L4):
@@ -252,7 +258,7 @@ pub enum Code {
     Internal,
 }
 
-const CODES: [Code; 26] = [
+const CODES: [Code; 27] = [
     Code::NotFound,
     Code::NotReadable,
     Code::PathRefused,
@@ -275,6 +281,7 @@ const CODES: [Code; 26] = [
     Code::NoSuchTable,
     Code::ViewProhibited,
     Code::Auth,
+    Code::NameNotUtf8,
     Code::FileChanged,
     Code::SideFileAppeared,
     Code::Protocol,
@@ -323,6 +330,7 @@ impl Code {
             Self::NoSuchTable => "no_such_table",
             Self::ViewProhibited => "view_prohibited",
             Self::Auth => "auth",
+            Self::NameNotUtf8 => "name_not_utf8",
             Self::FileChanged => "file_changed",
             Self::SideFileAppeared => "side_file_appeared",
             Self::Protocol => "protocol",
