@@ -34,7 +34,7 @@ The protocol is also concerned. `Engine` is a closed enum (`postgres, mysql, mar
 4. **Client library criteria.** A connector's client, own or third party:
    - uses **rustls** for TLS; no OpenSSL, `native-tls` or system TLS library (`agent/deny.toml`);
    - has a license on the `agent/deny.toml` allow-list (Apache-2.0, MIT, BSD, ISC, Zlib, CC0, Unicode-3.0), checked by cargo-deny; copyleft (GPL, LGPL, MPL) clients are refused;
-   - builds on the workspace MSRV (`rust-version`, 1.88 today), checked by the "Agent MSRV" job;
+   - builds on the workspace MSRV (`rust-version`, 1.89 today), checked by the "Agent MSRV" job;
    - spawns no process (no `sqlcmd`, `redis-cli`, `isql` or `sqlite3` binary) and links no C client library, unless the connector ADR justifies it and the `security-reviewer` accepts it; SQLite is the expected exception (the bundled SQLite C library, as no maintained pure-Rust reader exists), fuzzed on hostile files;
    - can bound every reply (size, count, time) before allocation, and parses untrusted server data with property tests and a fuzz target.
    The project's precedent is an own bounded client for a closed protocol subset (MySQL [ADR-0018](0018-mysql-mariadb-grants-and-connector.md), MongoDB [ADR-0026](0026-mongodb-connector.md), OpenLDAP [ADR-0029](0029-openldap-connector.md)). Candidates are evaluated in each connector ADR: for TDS, an existing crate (with its rustls support, TDS 8.0 strict encryption and maintenance status checked) against an own client; for RESP, an own client is expected (a small protocol); for Firebird, a pure-Rust wire client, noting that Firebird's wire encryption is not TLS (decision 6).

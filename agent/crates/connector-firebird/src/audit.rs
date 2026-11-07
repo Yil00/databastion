@@ -675,7 +675,7 @@ pub(crate) fn evaluate(
         let dir = input.server_pid.and_then(crate::fsread::server_binary_dir);
         let root_path = std::path::Path::new(&root);
         // Re-review note: `<root>/bin` only (the images' and the tarball's).
-        if !dir.is_some_and(|d| d == root_path.join("bin")) {
+        if dir.is_none_or(|d| d != root_path.join("bin")) {
             not_eval.push("server_layout_not_the_root");
         }
     }

@@ -199,8 +199,8 @@ pub(crate) fn check_blocking(
                 let mut evidence: Evidence = snap.evidence;
                 evidence.merge(&batch.evidence);
                 state.note_evidence(&batch.evidence);
-                let unsupported = (batch.json == 0 && batch.non_json > 0)
-                    || (batch.json == 0 && snap.format_unsupported);
+                let unsupported =
+                    batch.json == 0 && (batch.non_json > 0 || snap.format_unsupported);
                 if batch.headers || snap.headers_logged {
                     notes.push(CasNote::flag(CasNoteCode::SecurityAuditHeadersLogged));
                 }
