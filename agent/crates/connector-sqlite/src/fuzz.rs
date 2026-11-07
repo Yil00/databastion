@@ -173,7 +173,7 @@ fn run(main: &Path) -> u64 {
         };
         let columns: Vec<_> = cols
             .iter()
-            .filter(|c| c.hidden != 2 && crate::sql::quote(&c.name).is_some())
+            .filter(|c| c.hidden != 2 && !c.expr.excluded() && crate::sql::quote(&c.name).is_some())
             .take(crate::ipc::MAX_COLUMNS)
             .map(|c| c.name.clone())
             .collect();
@@ -496,6 +496,42 @@ mod tests {
             &p,
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
             b"CREATE TABLE t (i\xe4 INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        );
+        let input = part(&std::fs::read(&p).unwrap());
+        assert_eq!(file_counted(&input, None), (2, None));
+        assert_eq!(panics.load(Ordering::SeqCst), before);
+    }
+
+    /// SQLite 3.54 hands the function names of a column's `DEFAULT`
+    /// expression, as written in the schema, to the authorizer when the
+    /// column is read (ADR-0059 refinement of 2026-11-07); one that is not
+    /// UTF-8 would make `rusqlite`'s conversion panic. The table's schema
+    /// text is not UTF-8, so the pipeline leaves that column out (as the
+    /// scan does) and samples the others; nothing panics.
+    #[test]
+    fn a_default_function_name_that_is_not_utf8_does_not_panic() {
+        use std::sync::atomic::Ordering;
+        let _g = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let panics = crate::it::authorizer_utf8_panics();
+        let before = panics.load(Ordering::SeqCst);
+        let d = crate::it::Dir::new("fuzz-non-utf8-default");
+        let p = d.path("n.db");
+        crate::it::non_utf8_schema(
+            &p,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            b"CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (g\xe4(1)))",
+        );
+        let input = part(&std::fs::read(&p).unwrap());
+        assert_eq!(file_counted(&input, None), (2, None));
+        // The same name in a STORED expression (security review M1 of
+        // #425), and in a crafted sqlite_stat1's DEFAULT.
+        let p = d.path("s.db");
+        crate::it::non_utf8_schema(
+            &p,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            b"CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT GENERATED ALWAYS AS (g\xe4(a)) STORED)",
         );
         let input = part(&std::fs::read(&p).unwrap());
         assert_eq!(file_counted(&input, None), (2, None));

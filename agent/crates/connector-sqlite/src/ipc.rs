@@ -247,6 +247,17 @@ pub enum Code {
     /// conversion panics on invalid UTF-8. The table can still be read
     /// without its rowid (the plain read).
     NameNotUtf8,
+    /// A function a column's `DEFAULT` or `STORED` generated expression
+    /// names is not in the authorizer's closed list
+    /// (`auth::SCHEMA_EXPR_FUNCTIONS`, ADR-0059 refinement of 2026-11-07):
+    /// SQLite's "not authorized to use function". Counted `unsupported`;
+    /// rare, since such columns are excluded from samples
+    /// ([`ColumnExpr::Refused`]).
+    SchemaFunctionRefused,
+    /// `sqlite_stat1` does not have the shape SQLite writes (exactly `tbl`,
+    /// `idx`, `stat`, without a `DEFAULT` or a generated expression): its
+    /// row estimates are not used.
+    StatsUnusable,
     /// The file is no longer the one opened.
     FileChanged,
     /// A side file appeared after the reader's grant was built (review L4):
@@ -258,7 +269,7 @@ pub enum Code {
     Internal,
 }
 
-const CODES: [Code; 27] = [
+const CODES: [Code; 29] = [
     Code::NotFound,
     Code::NotReadable,
     Code::PathRefused,
@@ -283,6 +294,8 @@ const CODES: [Code; 27] = [
     Code::Auth,
     Code::NameNotUtf8,
     Code::FileChanged,
+    Code::SchemaFunctionRefused,
+    Code::StatsUnusable,
     Code::SideFileAppeared,
     Code::Protocol,
     Code::Internal,
@@ -331,6 +344,8 @@ impl Code {
             Self::ViewProhibited => "view_prohibited",
             Self::Auth => "auth",
             Self::NameNotUtf8 => "name_not_utf8",
+            Self::SchemaFunctionRefused => "schema_function_refused",
+            Self::StatsUnusable => "stats_unusable",
             Self::FileChanged => "file_changed",
             Self::SideFileAppeared => "side_file_appeared",
             Self::Protocol => "protocol",
@@ -571,6 +586,56 @@ pub struct ColumnRow {
     pub pk: i64,
     /// `hidden` (2: `VIRTUAL` generated, 3: `STORED` generated).
     pub hidden: i64,
+    /// Whether reading the column makes SQLite authorize the functions of
+    /// its `DEFAULT` or `STORED` generated expression, and the verdict.
+    pub expr: ColumnExpr,
+}
+
+/// The authorizer's verdict on a column's `DEFAULT` or `STORED` generated
+/// expression (ADR-0059 refinement of 2026-11-07), found by preparing,
+/// never running, a sampling statement that reads the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnExpr {
+    /// No such expression (or a column the reader never samples: hidden,
+    /// `VIRTUAL`, a name it cannot quote).
+    #[default]
+    None,
+    /// An expression whose functions are all on the closed list.
+    Listed,
+    /// An expression naming a function off the list: the column is not
+    /// sampled (`coverage.computed_columns_not_sampled`).
+    Refused,
+    /// The table's schema text is not valid UTF-8: the expression's
+    /// function names could make `rusqlite`'s authorizer conversion panic,
+    /// so the column is not sampled.
+    NotUtf8,
+}
+
+impl ColumnExpr {
+    /// Whether the column is left out of samples.
+    #[must_use]
+    pub const fn excluded(self) -> bool {
+        matches!(self, Self::Refused | Self::NotUtf8)
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Listed => 1,
+            Self::Refused => 2,
+            Self::NotUtf8 => 3,
+        }
+    }
+
+    const fn from_tag(t: u8) -> Result<Self, Violation> {
+        match t {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Listed),
+            2 => Ok(Self::Refused),
+            3 => Ok(Self::NotUtf8),
+            _ => Err(Violation::Unknown),
+        }
+    }
 }
 
 impl std::fmt::Debug for ColumnRow {
@@ -578,6 +643,7 @@ impl std::fmt::Debug for ColumnRow {
         f.debug_struct("ColumnRow")
             .field("pk", &self.pk)
             .field("hidden", &self.hidden)
+            .field("expr", &self.expr)
             .finish_non_exhaustive()
     }
 }
@@ -1022,6 +1088,7 @@ impl Response {
                     w.raw(&c.name)?;
                     w.i64(c.pk);
                     w.i64(c.hidden);
+                    w.u8(c.expr.tag());
                 }
                 w
             }
@@ -1149,13 +1216,19 @@ impl Response {
                 Self::Stats(rows)
             }
             0x84 => {
-                let n = r.count(MAX_TABLE_COLUMNS, 20)?;
+                let n = r.count(MAX_TABLE_COLUMNS, 21)?;
                 let mut cols = Vec::with_capacity(n);
                 for _ in 0..n {
                     let name = r.bytes(MAX_NAME)?;
                     let pk = r.i64()?;
                     let hidden = r.i64()?;
-                    cols.push(ColumnRow { name, pk, hidden });
+                    let expr = ColumnExpr::from_tag(r.u8()?)?;
+                    cols.push(ColumnRow {
+                        name,
+                        pk,
+                        hidden,
+                        expr,
+                    });
                 }
                 Self::Columns(cols)
             }
@@ -1555,6 +1628,7 @@ mod tests {
                 name: z(b"c"),
                 pk: 1,
                 hidden: 3,
+                expr: ColumnExpr::Refused,
             }]),
             Response::Bounds(Some((i64::MIN, i64::MAX))),
             Response::Bounds(None),

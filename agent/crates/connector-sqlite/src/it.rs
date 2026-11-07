@@ -1088,3 +1088,348 @@ fn a_column_name_that_is_not_utf8_never_reaches_the_authorizer() {
     ));
     assert_eq!(got.rows, 2);
 }
+
+/// ADR-0059 refinement of 2026-11-07 (SQLite 3.54): reading a column with
+/// a `DEFAULT` or a `STORED` generated expression sends that expression's
+/// function names to the authorizer at prepare time. A file whose columns
+/// use functions of the closed list (`SCHEMA_EXPR_FUNCTIONS`), in any
+/// case, is sampled as before; the values are the stored ones.
+#[test]
+fn listed_schema_expression_functions_are_sampled() {
+    let d = Dir::new("schema-expr-listed");
+    let p = d.path("e.db");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT,
+             email_lower TEXT GENERATED ALWAYS AS (Lower(email)) STORED,
+             created TEXT DEFAULT CURRENT_TIMESTAMP,
+             year TEXT DEFAULT (strftime('%Y', 'now')),
+             kind INTEGER GENERATED ALWAYS AS (iif(instr(email, '@') > 0, abs(-1), 0)) STORED,
+             label TEXT GENERATED ALWAYS AS (coalesce(nullif(trim(email), ''), 'none')) STORED,
+             upper_v TEXT GENERATED ALWAYS AS (upper(email)) VIRTUAL);
+         INSERT INTO t (email) VALUES ('Fake.One@Example.com'), (' Fake.Two@Example.org ');
+         ANALYZE;",
+    )
+    .unwrap();
+    drop(c);
+    let mut s = session(&p);
+    // The catalog, column and statistics statements are unchanged.
+    assert_eq!(
+        catalog(&mut s).iter().filter(|(_, n, _)| n == "t").count(),
+        1
+    );
+    let Response::Stats(stats) = s.handle(&Request::Stats) else {
+        panic!("stats")
+    };
+    assert!(
+        stats
+            .iter()
+            .any(|r| r.name.as_slice() == b"t" && r.rows == 2),
+        "{stats:?}"
+    );
+    let cols = columns(&mut s, "t");
+    assert!(cols.contains(&("email_lower".to_owned(), 3)));
+    assert!(cols.contains(&("upper_v".to_owned(), 2)));
+    // Bounds read no column: unchanged.
+    let r = s.handle(&Request::Bounds(z(b"t"), RowidAlias::Rowid));
+    assert_eq!(r, Response::Bounds(Some((1, 2))));
+    let cols = ["email", "email_lower", "created", "year", "kind", "label"];
+    let got = sampled(sample(
+        &mut s,
+        "t",
+        Some(RowidAlias::Rowid),
+        &cols,
+        SampleRange::From(1),
+        10,
+    ));
+    assert_eq!(got.rows, 2);
+    assert_eq!(
+        texts(&got, 1),
+        [
+            Some("fake.one@example.com".to_owned()),
+            Some(" fake.two@example.org ".to_owned())
+        ]
+    );
+    // `DEFAULT CURRENT_TIMESTAMP`: the value written at insert time
+    // (YYYY-MM-DD HH:MM:SS).
+    for v in texts(&got, 2) {
+        let v = v.unwrap();
+        assert_eq!(v.len(), 19, "{v}");
+        assert_eq!(&v[4..5], "-");
+    }
+    assert!(
+        texts(&got, 3)
+            .iter()
+            .all(|v| v.as_ref().is_some_and(|y| y.len() == 4))
+    );
+    assert_eq!(texts(&got, 4), [Some("1".to_owned()), Some("1".to_owned())]);
+    assert_eq!(
+        texts(&got, 5),
+        [
+            Some("Fake.One@Example.com".to_owned()),
+            Some("Fake.Two@Example.org".to_owned())
+        ]
+    );
+    // The plain read too.
+    let plain = sampled(sample(
+        &mut s,
+        "t",
+        None,
+        &cols,
+        SampleRange::Plain { reverse: false },
+        10,
+    ));
+    assert_eq!(plain.rows, 2);
+}
+
+fn column_exprs(s: &mut Session, t: &str) -> Vec<(String, crate::ipc::ColumnExpr)> {
+    match s.handle(&Request::Columns(z(t.as_bytes()))) {
+        Response::Columns(c) => c
+            .into_iter()
+            .map(|c| (String::from_utf8_lossy(&c.name).into_owned(), c.expr))
+            .collect(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A function off the list in a column's `DEFAULT` or `STORED` expression
+/// (security review of #425, maintainer decision of 2026-11-07, "exclude
+/// the column only"): `Columns` marks that column `Refused`, found by
+/// preparing (never running) a statement that reads it; a sample that
+/// reads it anyway is refused (`schema_function_refused`, counted
+/// `unsupported`); every other column, the rowid bounds, the catalog and
+/// the pragmas are unchanged. Random functions, extension loading (allowed
+/// in a `DEFAULT`, which SQLite does not resolve when it reads the schema),
+/// SQLite's own state, an unknown name, an innocuous built-in off the list
+/// (`quote`) and `LIKE` (the function `like`). A schema text that is not
+/// UTF-8 marks the expression columns `NotUtf8` and refuses samples that
+/// read them (`name_not_utf8`), with no authorizer panic.
+#[test]
+fn unlisted_schema_expression_functions_exclude_their_column() {
+    use crate::ipc::ColumnExpr as E;
+    use std::sync::atomic::Ordering;
+    let panics = authorizer_utf8_panics();
+    let d = Dir::new("schema-expr-unlisted");
+    let valid = "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)";
+    let cases: [(&str, &[u8], E, Code); 9] = [
+        (
+            "randomblob.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (lower(hex(randomblob(16)))))",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "random.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (abs(random())))",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "load_extension.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (load_extension('x')))",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "sqlite_version.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (sqlite_version()))",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "unknown.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (no_such_function(1)))",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "quote_stored.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT GENERATED ALWAYS AS (quote(a)) STORED)",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "like_stored.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b INTEGER GENERATED ALWAYS AS (a LIKE '%@example.com') STORED)",
+            E::Refused,
+            Code::SchemaFunctionRefused,
+        ),
+        (
+            "non_utf8_default.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (f\xff(1)))",
+            E::NotUtf8,
+            Code::NameNotUtf8,
+        ),
+        // Security review M1 of #425: SQLite does not report an unknown
+        // function of a generated expression while it parses the schema,
+        // so this file loads; table_xinfo gives no text for it.
+        (
+            "non_utf8_stored.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT GENERATED ALWAYS AS (g\xe4(a)) STORED)",
+            E::NotUtf8,
+            Code::NameNotUtf8,
+        ),
+    ];
+    for (file, schema, verdict, code) in cases {
+        let p = d.path(file);
+        non_utf8_schema(&p, valid, schema);
+        let before = panics.load(Ordering::SeqCst);
+        let mut s = session(&p);
+        assert_eq!(catalog(&mut s), vec![(false, "t".to_owned(), 2)], "{file}");
+        assert_eq!(
+            column_exprs(&mut s, "t"),
+            vec![
+                ("i".to_owned(), E::None),
+                ("a".to_owned(), E::None),
+                ("b".to_owned(), verdict)
+            ],
+            "{file}"
+        );
+        assert!(matches!(s.handle(&Request::Pragmas), Response::Pragmas(_)));
+        let r = s.handle(&Request::Bounds(z(b"t"), RowidAlias::Rowid));
+        assert_eq!(r, Response::Bounds(Some((1, 2))), "{file}");
+        for (alias, range) in [
+            (Some(RowidAlias::Rowid), SampleRange::From(1)),
+            (None, SampleRange::Plain { reverse: false }),
+        ] {
+            // A sample that reads the column anyway is refused.
+            let r = sample(&mut s, "t", alias, &["a", "b"], range, 5);
+            assert!(
+                matches!(&r, Response::Failed(f) if f.code == code),
+                "{file}: {r:?}"
+            );
+            // The other columns: sampled.
+            let r = sample(&mut s, "t", alias, &["a"], range, 5);
+            assert_eq!(sampled(r).rows, 2, "{file}");
+        }
+        assert_eq!(
+            panics.load(Ordering::SeqCst),
+            before,
+            "{file}: authorizer panic"
+        );
+    }
+}
+
+/// The maintainer's "exclude the column only" on the reader's side: a UUID
+/// default (`lower(hex(randomblob(16)))`) and a `STORED` `LIKE` are
+/// `Refused`, the listed `STORED lower()` and `DEFAULT CURRENT_TIMESTAMP`
+/// are `Listed`, plain columns have no verdict, and the columns left are
+/// sampled together.
+#[test]
+fn a_uuid_default_and_a_like_are_excluded_the_rest_sampled() {
+    use crate::ipc::ColumnExpr as E;
+    let d = Dir::new("schema-expr-exclude");
+    let p = d.path("a.db");
+    crate::testing::seed_exprs(&p);
+    let mut s = session(&p);
+    assert_eq!(
+        column_exprs(&mut s, "accounts"),
+        vec![
+            ("id".to_owned(), E::None),
+            ("email".to_owned(), E::None),
+            ("email_low".to_owned(), E::Listed),
+            ("created".to_owned(), E::Listed),
+            ("uuid".to_owned(), E::Refused),
+            ("is_corp".to_owned(), E::Refused),
+        ]
+    );
+    let got = sampled(sample(
+        &mut s,
+        "accounts",
+        Some(RowidAlias::Rowid),
+        &["email", "email_low", "created"],
+        SampleRange::From(1),
+        100,
+    ));
+    assert_eq!(got.rows, 20);
+    assert_eq!(texts(&got, 1)[0].as_deref(), Some("account0@example.com"));
+}
+
+/// Security review M1 of #425: a crafted `sqlite_stat1` whose `stat`
+/// column has a `DEFAULT` naming a function that is not UTF-8 is refused
+/// before the statistics statement (`name_not_utf8`), with no authorizer
+/// panic; one with a listed function in a `DEFAULT`, or with a generated
+/// column, does not have the shape SQLite writes and is not used
+/// (`stats_unusable`) rather than refused by the authorizer and silently
+/// lost; the plain one is used.
+#[test]
+fn a_crafted_sqlite_stat1_is_not_used() {
+    use std::sync::atomic::Ordering;
+    let panics = authorizer_utf8_panics();
+    let d = Dir::new("stat1-crafted");
+    let cases: [(&str, &[u8], Option<Code>); 5] = [
+        ("plain.db", b"CREATE TABLE sqlite_stat1(tbl,idx,stat)", None),
+        (
+            "non_utf8.db",
+            b"CREATE TABLE sqlite_stat1(tbl,idx,stat DEFAULT (g\xe4(1)))",
+            Some(Code::NameNotUtf8),
+        ),
+        (
+            "lower.db",
+            b"CREATE TABLE sqlite_stat1(tbl,idx,stat DEFAULT (lower('x')))",
+            Some(Code::StatsUnusable),
+        ),
+        (
+            "stored.db",
+            b"CREATE TABLE sqlite_stat1(tbl,idx,stat GENERATED ALWAYS AS (tbl) STORED)",
+            Some(Code::StatsUnusable),
+        ),
+        (
+            "extra.db",
+            b"CREATE TABLE sqlite_stat1(tbl,idx,stat,x)",
+            Some(Code::StatsUnusable),
+        ),
+    ];
+    for (file, schema, code) in cases {
+        let p = d.path(file);
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT);
+             INSERT INTO t (a) VALUES ('x@example.com'), ('y@example.com');
+             ANALYZE;",
+        )
+        .unwrap();
+        c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+            .unwrap();
+        c.execute_batch("PRAGMA writable_schema = ON").unwrap();
+        let n = c
+            .execute(
+                "UPDATE sqlite_schema SET sql = CAST(?1 AS TEXT) WHERE name = 'sqlite_stat1'",
+                [schema.to_vec()],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        c.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+        drop(c);
+        let before = panics.load(Ordering::SeqCst);
+        let mut s = session(&p);
+        let r = s.handle(&Request::Stats);
+        match code {
+            None => assert!(
+                matches!(&r, Response::Stats(rows) if rows.iter().any(|x| x.name.as_slice() == b"t" && x.rows == 2)),
+                "{file}: {r:?}"
+            ),
+            Some(code) => assert!(
+                matches!(&r, Response::Failed(f) if f.code == code),
+                "{file}: {r:?}"
+            ),
+        }
+        // The table itself is read as before.
+        let got = sampled(sample(
+            &mut s,
+            "t",
+            Some(RowidAlias::Rowid),
+            &["a"],
+            SampleRange::From(1),
+            5,
+        ));
+        assert_eq!(got.rows, 2, "{file}");
+        assert_eq!(
+            panics.load(Ordering::SeqCst),
+            before,
+            "{file}: authorizer panic"
+        );
+    }
+}

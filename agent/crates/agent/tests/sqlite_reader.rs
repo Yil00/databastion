@@ -32,7 +32,7 @@ use databastion_connector_sqlite::ipc::{
     Request, Response, RowidAlias, SampleRange, SampleRequest,
 };
 use databastion_connector_sqlite::process::{Death, ReaderProcess};
-use databastion_connector_sqlite::testing::{Writer, build_from_sql, seed};
+use databastion_connector_sqlite::testing::{Writer, build_from_sql, seed, seed_exprs};
 use databastion_core::config::TargetConfig;
 use databastion_core::config::sqlite::{RollbackMode, SqliteSettings};
 use databastion_core::notes::NoteCode;
@@ -541,6 +541,46 @@ async fn a_wal_file_is_read_while_another_process_writes_and_nothing_changes() {
             .any(|n| n.code() == NoteCode::CoverageWalFilesNotReadable),
         "{h:?}"
     );
+}
+
+/// ADR-0059 refinement of 2026-11-07, "exclude the column only"
+/// (maintainer decision on the security review of #425): through the
+/// sandboxed reader, a UUID default (`randomblob`) and a `STORED` `LIKE`
+/// are left out and counted in `coverage.computed_columns_not_sampled`;
+/// the table is sampled (its plain column and its listed `STORED lower()`
+/// column found), never refused.
+#[tokio::test(flavor = "current_thread")]
+async fn unlisted_expression_columns_are_left_out_alone() {
+    let Some(env) = Env::new("exprs") else {
+        return;
+    };
+    seed_exprs(&env.rw.join("accounts.db"));
+    env.mount();
+    let c = SqliteConnector::new();
+    let t = env.target("accounts.db", RollbackMode::Read);
+    let h = c.check(&t).await;
+    assert!(h.reachable, "{h:?}");
+    let (found, cov) = scan(&c, &t).await;
+    let has = |f: &str| {
+        found
+            .iter()
+            .any(|x| x.0 == "accounts" && x.1 == f && x.2 == "pii.email")
+    };
+    assert!(has("email"), "{found:?}");
+    assert!(has("email_low"), "{found:?}");
+    assert!(
+        !found.iter().any(|x| x.1 == "uuid" || x.1 == "is_corp"),
+        "{found:?}"
+    );
+    assert_eq!(cov.sampled, 1, "{cov:?}");
+    assert_eq!(cov.unsupported, 0, "{cov:?}");
+    assert_eq!(cov.error, 0, "{cov:?}");
+    let h = c.check(&t).await;
+    let note = h
+        .notes
+        .iter()
+        .find(|n| n.code() == NoteCode::CoverageComputedColumnsNotSampled);
+    assert_eq!(note.and_then(|n| n.count()), Some(2), "{h:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]
