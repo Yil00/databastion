@@ -52,6 +52,9 @@ members = ["."]
 
 [profile.release]
 debug = 1
+# As the agent's release profile; cargo-fuzz `-a` and smoke.sh also pass
+# `-Coverflow-checks`, this keeps a plain `cargo fuzz run` the same.
+overflow-checks = true
 
 [[bin]]
 name = "mongodb_bson"
