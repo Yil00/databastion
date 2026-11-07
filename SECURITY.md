@@ -3,7 +3,8 @@
 ## Supported versions
 | Version | Supported |
 |---------|-----------|
-| 0.9.x | Yes: security fixes are released as `0.9.Z` patch versions |
+| 0.10.x (coming: 0.10.0 is being prepared, not released yet) | Yes once 0.10.0 is released: security fixes are released as `0.10.Z` patch versions |
+| 0.9.x | Yes until 0.10.0 is released: security fixes are released as `0.9.Z` patch versions; then no, upgrade to the latest `0.10.x` release |
 | 0.1.x, 0.2.x, 0.3.x, 0.4.x, 0.5.x, 0.6.x, 0.7.x, 0.8.x | No: upgrade to the latest `0.9.x` release |
 | Pre-releases (`X.Y.Z-alpha.N`, `-beta.N`, `-rc.N`) | No: upgrade to the latest `0.9.x` release |
 | Unreleased commits of `main` / `dev` | No |
@@ -22,7 +23,7 @@ Please include: the affected version or commit, the component (agent, connector,
 
 ## Scope
 In scope, in this repository:
-- **Agent** (`agent/`): the `databastion-agent` binary, its connectors (PostgreSQL, MySQL / MariaDB, MongoDB, OpenLDAP, Apereo CAS, Microsoft SQL Server, Redis / Valkey), the classifiers and masking, the local state files, and the image built from `agent/Dockerfile`.
+- **Agent** (`agent/`): the `databastion-agent` binary, its connectors (PostgreSQL, MySQL / MariaDB, MongoDB, OpenLDAP, Apereo CAS, Microsoft SQL Server, Redis / Valkey, and SQLite and Firebird on `dev` for 0.10.0, including the SQLite reader process), the classifiers and masking, the local state files, and the image built from `agent/Dockerfile`.
 - **Console** (`console/`): the web and worker processes, the user API and UI, local and OpenID Connect login, the agent API (`/api/agent/v1`), the internal database migrations and roles, alerting, and the image built from `console/Dockerfile`.
 - **Protocol** (`shared/protocol/`): the agent ↔ console contract (`openapi.yaml`, schemas, registries) and how each side enforces it.
 - The [deployment example](deploy/docker-compose.example.yml) and the release workflows, where they make a deployment or a published artifact insecure.
