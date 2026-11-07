@@ -2193,6 +2193,7 @@ mod tests {
             std::env::var("FIREBIRD_IT_TCP_LOG"),
             std::env::var("FIREBIRD_PORT"),
         ) else {
+            eprintln!("skipped: FIREBIRD_IT_TCP_LOG is not set (a phase of dev/firebird/it.sh)");
             return;
         };
         let port: u16 = port.parse().unwrap();
@@ -2374,6 +2375,9 @@ mod tests {
             std::env::var("FIREBIRD_IT_RUN_CHANGE_LOG"),
             std::env::var("FIREBIRD_IT_RUN_OLD_PID"),
         ) else {
+            eprintln!(
+                "skipped: FIREBIRD_IT_RUN_CHANGE_LOG is not set (a phase of dev/firebird/it.sh)"
+            );
             return;
         };
         let old: u32 = old.trim().parse().unwrap();

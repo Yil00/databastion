@@ -327,6 +327,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "firebird_trace_stream"
+path = "fuzz_targets/firebird_trace_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "firebird_trace_conf"
 path = "fuzz_targets/firebird_trace_conf.rs"
 test = false

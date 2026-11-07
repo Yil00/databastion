@@ -109,7 +109,8 @@ pub(crate) enum Event {
     Warning,
 }
 
-const EVENTS: &[(&str, Event)] = &[
+/// The event names of the closed header grammar.
+pub(crate) const EVENTS: &[(&str, Event)] = &[
     ("ATTACH_DATABASE", Event::AttachDatabase),
     ("DETACH_DATABASE", Event::DetachDatabase),
     ("CREATE_DATABASE", Event::CreateDatabase),
@@ -184,6 +185,43 @@ impl Event {
             E::SweepStart | E::SweepProgress | E::SweepFinish | E::SweepFailed => Family::Sweep,
             E::Error | E::Warning => Family::Error,
         }
+    }
+
+    /// Whether the server writes the event with a `FAILED ` or
+    /// `UNAUTHORIZED ` prefix (review N2 of P10-F): the event names the
+    /// trace plugin of the pinned 4.0.7 and 5.0.4 images writes with one
+    /// (its strings, and `TracePluginImpl.cpp` of 4.0 and 5.0 for the
+    /// statement events it builds), each with both. Another event with a
+    /// prefix is not a header line.
+    pub(crate) fn has_outcome_forms(self) -> bool {
+        use Event as E;
+        matches!(
+            self,
+            E::AttachDatabase
+                | E::CreateDatabase
+                | E::StartTransaction
+                | E::CommitTransaction
+                | E::RollbackTransaction
+                | E::CommitRetaining
+                | E::RollbackRetaining
+                | E::PrepareStatement
+                | E::ExecuteStatementStart
+                | E::ExecuteStatementFinish
+                | E::ExecuteStatementRestart
+                | E::ExecuteProcedureStart
+                | E::ExecuteProcedureFinish
+                | E::ExecuteFunctionStart
+                | E::ExecuteFunctionFinish
+                | E::ExecuteTriggerStart
+                | E::ExecuteTriggerFinish
+                | E::CompileBlr
+                | E::ExecuteBlr
+                | E::ExecuteDyn
+                | E::AttachService
+                | E::StartService
+                | E::QueryService
+                | E::DetachService
+        )
     }
 
     /// A finish event whose trailer the server always writes (H1 fix 2).
@@ -365,6 +403,7 @@ fn event(s: &str) -> Option<(Event, Outcome, Option<ErrorAt>)> {
     EVENTS
         .iter()
         .find(|(n, _)| *n == name)
+        .filter(|(_, e)| outcome == Outcome::Ok || e.has_outcome_forms())
         .map(|(_, e)| (*e, outcome, None))
 }
 

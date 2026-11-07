@@ -31,7 +31,7 @@ const SERVER: u32 = 84;
 const AGENT: u32 = 10_001;
 
 fn dir() -> Option<PathBuf> {
-    std::env::var_os("FIREBIRD_IT_HOSTID_DIR").map(PathBuf::from)
+    super::phase_var("FIREBIRD_IT_HOSTID_DIR").map(PathBuf::from)
 }
 
 /// An ACL xattr (version 2, entries sorted by tag then id).
@@ -57,6 +57,7 @@ fn set_acl(p: &Path, name: &str, entries: &[(u16, u16, u32)]) {
 fn prepare() {
     let Some(d) = dir() else { return };
     if std::env::var("FIREBIRD_IT_HOSTID_PREPARE").as_deref() != Ok("1") {
+        eprintln!("skipped: FIREBIRD_IT_HOSTID_PREPARE is not 1 (the root phase)");
         return;
     }
     assert_eq!(
@@ -132,6 +133,7 @@ fn declared(d: &Path, passwd: &str) -> FirebirdHostIdentity {
 fn checks() {
     let Some(d) = dir() else { return };
     if std::env::var("FIREBIRD_IT_HOSTID_PREPARE").as_deref() == Ok("1") {
+        eprintln!("skipped: FIREBIRD_IT_HOSTID_PREPARE is 1 (the agent phase runs this test)");
         return;
     }
     assert_eq!(

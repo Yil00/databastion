@@ -90,6 +90,9 @@ jobs:
           # ADR-0060 decision 6: the system audit trace log and configuration parsers, and the
           # Firebird mode of the statement analysis.
           - { target: firebird_trace_log, seconds: 600 }
+          # Review L1 of P10-F: the stream's multi-record state machine over assembled records,
+          # seeded with the recorded trace logs.
+          - { target: firebird_trace_stream, seconds: 600 }
           - { target: firebird_trace_conf, seconds: 300 }
           - { target: firebird_statement, seconds: 300 }
           # ADR-0060 refinement of 2026-10-31 (R52 item 4): the identity files of the readers

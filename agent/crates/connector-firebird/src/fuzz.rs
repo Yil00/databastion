@@ -393,6 +393,163 @@ pub fn trace_log(data: &[u8]) {
     }
 }
 
+/// The multi-record stream state machine (ADR-0060 R1, R5, R7, R25, R29;
+/// review L1 of P10-F): the input's first byte selects the settings (bit 0
+/// the 5.0 name-line grammar, bit 1 proof 11, bit 2 SuperServer, bit 3 a
+/// run confirmed before the first record), the rest is lines assembled
+/// into records, each pushed into one [`crate::stream::Machine`] with a
+/// fixed catalog and a fixed ledger (one own attachment of the declared
+/// database and a few credits of the closed set). A line that is exactly
+/// one byte `0x01` advances the reading clock by 11 s and runs `expire`,
+/// `0x02` by 61 s, `0x03` confirms another run. After every step: no
+/// record panicked (`counts.panics == 0`, the isolation counter) and the
+/// state is within every cap of the stream.
+pub fn trace_stream(data: &[u8]) {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime};
+
+    use crate::conn::{FetchAccount, FetchEnd};
+    use crate::stream::{DeclaredNames, Emitted, Machine, Run, Settings};
+    use crate::trace_events::{Catalog, RelClass};
+    use crate::trace_log::{Assembled, Assembler, ParseOptions, Series};
+
+    const APP: &str = "/var/lib/firebird/data/app.fdb";
+    const CRM: &str = "/var/lib/firebird/data/crm.fdb";
+    /// The recorded fixtures' printed time (2026-10-30T15:22:38, UTC).
+    const FIXTURE_TIME: u64 = 1_793_373_758;
+
+    struct Fixed;
+    impl Catalog for Fixed {
+        fn class(&self, r: &str) -> RelClass {
+            if r.starts_with("RDB$") {
+                RelClass::System
+            } else if r.starts_with("MON$") || r.starts_with("SEC$") {
+                RelClass::Virtual
+            } else if r.starts_with('V') {
+                RelClass::View
+            } else if r.starts_with('G') {
+                RelClass::Gtt
+            } else if r.starts_with('X') {
+                RelClass::External
+            } else if r.starts_with('U') {
+                RelClass::Unknown
+            } else {
+                RelClass::Table
+            }
+        }
+        fn always_view(&self, r: &str) -> bool {
+            r.ends_with("_ALWAYS")
+        }
+    }
+
+    let Some((flags, rest)) = data.split_first() else {
+        return;
+    };
+    let declared = |label: &str, path: &str| DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+        read_at: None,
+    };
+    let settings = Settings {
+        databases: vec![declared("app", APP), declared("crm", CRM)],
+        aliases: Some(crate::trace_conf::AliasMap::default()),
+        proof11: flags & 2 != 0,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(4096),
+            series: if flags & 1 != 0 {
+                Series::V5
+            } else {
+                Series::V4
+            },
+        },
+        superserver: flags & 4 != 0,
+    };
+    let opened = SystemTime::UNIX_EPOCH + Duration::from_secs(FIXTURE_TIME);
+    let ledger = Arc::new(crate::own::Ledger::default());
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    let account = |counted| FetchAccount {
+        counted,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    for text in [
+        sql::VERSION,
+        sql::SESSION,
+        sql::OWN_ATTACHMENT,
+        sql::READ_BACK_PROBE,
+        sql::DATABASE_FILE,
+    ] {
+        ledger.credit_at(APP, 3, text, account(1), SystemTime::now());
+    }
+    let mut m = Machine::new(settings, ledger);
+    if flags & 8 != 0 {
+        m.confirm_run(Run {
+            pid: 24,
+            start: Some(4242),
+        });
+    }
+    let cat = Fixed;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let start = Instant::now();
+    let mut now = start;
+    let mut out: Vec<Emitted> = Vec::new();
+    let expire = |m: &mut Machine, now: Instant, cats: &[&dyn Catalog]| {
+        let mut out: Vec<Emitted> = Vec::new();
+        m.expire(now, cats, &mut out);
+        check(m);
+    };
+    let mut asm = Assembler::new();
+    let mut pos = 0u64;
+    let mut other_pid = 25u32;
+    fn check(m: &Machine) {
+        assert_eq!(m.counts.panics, 0, "a record panicked");
+        let cap = m.caps_violated();
+        assert!(cap.is_none(), "the stream state is past a cap: {cap:?}");
+    }
+    // The output is the uplink's: bounded by the caller, not kept here.
+    let mut push = |m: &mut Machine, rec: Option<Assembled>, now: Instant, pos: &mut u64| {
+        if let Some(Assembled::Record(raw)) = rec {
+            m.push(&raw, *pos, now, &cats, &mut out);
+            out.clear();
+            *pos += raw.len() as u64 + 1;
+            check(m);
+        }
+    };
+    for line in rest.split(|b| *b == b'\n') {
+        match line {
+            [1] | [2] => {
+                let rec = asm.flush();
+                push(&mut m, rec, now, &mut pos);
+                now += Duration::from_secs(if line == [1] { 11 } else { 61 });
+                expire(&mut m, now, &cats);
+            }
+            [3] => {
+                m.confirm_run(Run {
+                    pid: other_pid,
+                    start: Some(u64::from(other_pid)),
+                });
+                other_pid = other_pid.wrapping_add(1);
+                check(&m);
+            }
+            _ => {
+                now += Duration::from_millis(1);
+                let rec = asm.push_line(line);
+                push(&mut m, rec, now, &mut pos);
+            }
+        }
+    }
+    let rec = asm.flush();
+    push(&mut m, rec, now, &mut pos);
+    expire(&mut m, now + Duration::from_secs(700), &cats);
+}
+
 /// The configuration files (decision 6, R2): the first byte picks the
 /// parser (`firebird.conf`, `databases.conf`, the trace configuration,
 /// then evaluated against one declared database).
@@ -521,6 +678,7 @@ mod tests {
             proc_net_tcp,
             catalog,
             trace_log,
+            trace_stream,
             trace_conf,
             host_identity,
         ] {
@@ -541,5 +699,32 @@ mod tests {
         let mut input = vec![2, 5];
         input.extend_from_slice(w.as_slice());
         messages(&input);
+    }
+
+    /// Review L1: the recorded logs (the seed corpus of `trace_stream`)
+    /// run through the stream under every setting, whole and with clock
+    /// steps between their records, within every cap and with no panic.
+    #[test]
+    fn trace_stream_runs_the_recorded_logs() {
+        for log in [
+            &include_bytes!("../testdata/trace-4.0.7-triggers-sweep.log")[..],
+            &include_bytes!("../testdata/trace-5.0.4-isql-gbak.log")[..],
+            &include_bytes!("../testdata/trace-5.0.4-triggers-sweep.log")[..],
+        ] {
+            for flags in 0u8..16 {
+                let mut input = vec![flags];
+                input.extend_from_slice(log);
+                trace_stream(&input);
+                let mut stepped = vec![flags];
+                for (i, line) in log.split(|b| *b == b'\n').enumerate() {
+                    stepped.extend_from_slice(line);
+                    stepped.push(b'\n');
+                    if i % 97 == 96 {
+                        stepped.extend_from_slice(&[1 + (i % 3) as u8, b'\n']);
+                    }
+                }
+                trace_stream(&stepped);
+            }
+        }
     }
 }

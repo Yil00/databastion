@@ -2,7 +2,10 @@
 //! (`dev/firebird/it.sh` starts a throwaway one from the pinned images,
 //! seeds it and runs these tests; the full dev service is P10-B lot 2).
 //!
-//! Skipped unless `DATABASTION_IT_FIREBIRD=1`. Variables:
+//! Skipped unless `DATABASTION_IT_FIREBIRD=1`, each skip said on stderr;
+//! with `DATABASTION_IT_FIREBIRD_REQUIRE=1` (set by `dev/firebird/it.sh`,
+//! review N4 of P10-F) a missing server, or a missing variable the
+//! harness sets for every run, fails the test instead. Variables:
 //! - `FIREBIRD_PORT` (default 3050) and `FIREBIRD_IT_PEER_UID` (the uid
 //!   owning the server's sockets, default 84; 0 needs the root opt-in,
 //!   which the tests then set);
@@ -44,8 +47,51 @@ use databastion_core::{AuditLevel, Connector, FailureCode, NoteCode, TargetHealt
 
 use crate::FirebirdConnector;
 
+/// The variable that makes a skip a failure (review N4 of P10-F).
+const REQUIRE: &str = "DATABASTION_IT_FIREBIRD_REQUIRE";
+
+fn required() -> bool {
+    std::env::var(REQUIRE).as_deref() == Ok("1")
+}
+
+/// A server is there (`DATABASTION_IT_FIREBIRD=1`); otherwise the test is
+/// skipped, said on stderr, or fails under [`REQUIRE`].
 fn enabled() -> bool {
-    std::env::var("DATABASTION_IT_FIREBIRD").as_deref() == Ok("1")
+    if std::env::var("DATABASTION_IT_FIREBIRD").as_deref() == Ok("1") {
+        return true;
+    }
+    assert!(
+        !required(),
+        "{REQUIRE}=1 but DATABASTION_IT_FIREBIRD is not 1: the Firebird integration tests would not run"
+    );
+    eprintln!(
+        "skipped: DATABASTION_IT_FIREBIRD is not 1 (dev/firebird/it.sh runs the Firebird integration tests)"
+    );
+    false
+}
+
+/// A variable `dev/firebird/it.sh` sets for every run of the tests (the
+/// variant servers, the forwarder, the seeded files): absent, the part of
+/// the test that needs it is skipped, said on stderr, or fails under
+/// [`REQUIRE`].
+fn server_var(name: &str) -> Option<String> {
+    let v = std::env::var(name).ok().filter(|v| !v.is_empty());
+    if v.is_none() {
+        assert!(!required(), "{REQUIRE}=1 but {name} is not set");
+        eprintln!("skipped: {name} is not set");
+    }
+    v
+}
+
+/// A variable of one phase of `dev/firebird/it.sh` (the matrix, the
+/// restore, the restart, the logs of a step): absent, the test is skipped,
+/// said on stderr (another phase runs it).
+pub(crate) fn phase_var(name: &str) -> Option<String> {
+    let v = std::env::var(name).ok();
+    if v.is_none() {
+        eprintln!("skipped: {name} is not set (a phase of dev/firebird/it.sh runs this test)");
+    }
+    v
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -242,7 +288,7 @@ async fn an_account_without_grants_is_clean_and_sysdba_is_refused() {
         h.notes
     );
     assert_eq!(count(&h, NoteCode::CoverageRelationsWithoutSelect), Some(2));
-    if std::env::var("FIREBIRD_IT_SYSDBA_PASSWORD_FILE").is_err() {
+    if server_var("FIREBIRD_IT_SYSDBA_PASSWORD_FILE").is_none() {
         return;
     }
     let sysdba = target(
@@ -270,7 +316,7 @@ async fn failures_are_closed_codes_at_their_stage() {
     }
     let c = FirebirdConnector::new();
     // A wrong password: the server refuses the proof.
-    if std::env::var("FIREBIRD_IT_WRONG_PASSWORD_FILE").is_ok() {
+    if server_var("FIREBIRD_IT_WRONG_PASSWORD_FILE").is_some() {
         let h = c
             .check(&target(
                 "DATABASTION_AGENT",
@@ -305,7 +351,7 @@ async fn failures_are_closed_codes_at_their_stage() {
     assert!(h.detail.unwrap().contains("firebird.peer_uid"));
     // A forwarder in the path, refused without `tunnel: true`, accepted
     // with it (and the tunnel note).
-    if let Ok(fwd) = std::env::var("FIREBIRD_IT_FORWARDER_PORT") {
+    if let Some(fwd) = server_var("FIREBIRD_IT_FORWARDER_PORT") {
         let fwd_uid = var("FIREBIRD_IT_FORWARDER_UID", "0");
         let h = c
             .check(&target(
@@ -418,7 +464,7 @@ async fn wire_encryption_variants_and_firebird_3() {
             "0",
         )
     };
-    if let Ok(p) = std::env::var("FIREBIRD_IT_CHACHA_PORT") {
+    if let Some(p) = server_var("FIREBIRD_IT_CHACHA_PORT") {
         let h = c.check(&on(&p)).await;
         assert!(h.reachable, "{:?}", h.detail);
         let detail = h.detail.unwrap();
@@ -427,7 +473,7 @@ async fn wire_encryption_variants_and_firebird_3() {
             "{detail}"
         );
     }
-    if let Ok(p) = std::env::var("FIREBIRD_IT_ARC4_PORT") {
+    if let Some(p) = server_var("FIREBIRD_IT_ARC4_PORT") {
         let h = c.check(&on(&p)).await;
         assert_eq!(
             h.failure,
@@ -442,7 +488,7 @@ async fn wire_encryption_variants_and_firebird_3() {
             h.detail
         );
     }
-    if let Ok(p) = std::env::var("FIREBIRD_IT_NOCRYPT_PORT") {
+    if let Some(p) = server_var("FIREBIRD_IT_NOCRYPT_PORT") {
         let h = c.check(&on(&p)).await;
         assert!(!h.reachable, "{:?}", h.detail);
         assert_eq!(
@@ -453,7 +499,7 @@ async fn wire_encryption_variants_and_firebird_3() {
         );
         eprintln!("[it] no wire encryption: {:?}", h.detail);
     }
-    if let Ok(p) = std::env::var("FIREBIRD_IT_FB3_PORT") {
+    if let Some(p) = server_var("FIREBIRD_IT_FB3_PORT") {
         let h = c.check(&on(&p)).await;
         assert_eq!(h.failure, Some(FailureCode::Unsupported), "{:?}", h.detail);
         assert_eq!(labels(&h, NoteCode::CheckStageFailed), ["stage_connect"]);
@@ -561,7 +607,7 @@ async fn mappings_to_sysdba_or_rdb_admin_are_refused() {
     if !enabled() {
         return;
     }
-    let Ok(p) = std::env::var("FIREBIRD_IT_MAPPING_PORT") else {
+    let Some(p) = server_var("FIREBIRD_IT_MAPPING_PORT") else {
         return;
     };
     let c = FirebirdConnector::new();
@@ -706,9 +752,7 @@ async fn op_cancel_ends_a_pending_fetch() {
 // ---------------------------------------------------------------------
 
 fn crm_attach() -> Option<String> {
-    std::env::var("FIREBIRD_IT_CRM_ATTACH")
-        .ok()
-        .filter(|a| !a.is_empty())
+    server_var("FIREBIRD_IT_CRM_ATTACH")
 }
 
 fn crm(account: &str, extra: &str) -> TargetConfig {
@@ -1202,7 +1246,7 @@ async fn the_linger_on_the_server() {
 /// attachment id is below phase 1's). Between the phases only a hash of the state and the id are kept
 /// (`FIREBIRD_IT_RESTORE_FILE`, in the run's 0700 directory).
 async fn restore_state_phase(phase: u8) {
-    let Ok(file) = std::env::var("FIREBIRD_IT_RESTORE_FILE") else {
+    let Some(file) = phase_var("FIREBIRD_IT_RESTORE_FILE") else {
         return;
     };
     if !enabled() {
@@ -1285,7 +1329,7 @@ async fn restore_state_phase_2() {
 /// (`it_audit::the_agent_records_match_the_own_statement_table`).
 #[tokio::test]
 async fn own_reads_for_the_matrix() {
-    let Ok(out) = std::env::var("FIREBIRD_IT_MATRIX_OUT") else {
+    let Some(out) = phase_var("FIREBIRD_IT_MATRIX_OUT") else {
         return;
     };
     if !enabled() {

@@ -180,7 +180,19 @@ pub(crate) struct Ledger {
     dirty: std::sync::atomic::AtomicBool,
     /// A write is scheduled.
     scheduled: std::sync::atomic::AtomicBool,
+    /// When the ledger was last written: scheduled writes keep
+    /// [`WRITE_EVERY`] apart (a paced Discovery scan credits every table).
+    last_write: Mutex<Option<std::time::Instant>>,
+    /// Test support: when each write happened.
+    #[cfg(test)]
+    writes: Mutex<Vec<std::time::Instant>>,
 }
+
+/// The least time between two scheduled writes of a ledger (as the
+/// checkpoint's): a scan crediting many tables rewrites a persisted ledger
+/// of up to [`MAX_PERSISTED`] bytes at most once per second, and the last
+/// change is always written (the trailing write waits out the spacing).
+pub(crate) const WRITE_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 struct State {
@@ -276,8 +288,10 @@ impl Ledger {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A session's attachment, after its `CURRENT_CONNECTION` read.
-    pub(crate) fn register(&self, attach: &str, id: u64, port: u16, pid: u32) {
+    /// A session's attachment, after its `CURRENT_CONNECTION` read;
+    /// `opened` when the server answered its `op_attach` (review N1 of
+    /// P10-F).
+    pub(crate) fn register(&self, attach: &str, id: u64, port: u16, pid: u32, opened: SystemTime) {
         let mut s = self.state();
         if s.attachments.len() >= MAX_ATTACHMENTS {
             s.attachments.remove(0);
@@ -287,7 +301,7 @@ impl Ledger {
             id,
             port,
             pid,
-            opened: SystemTime::now(),
+            opened,
             closed: None,
         });
     }
@@ -319,8 +333,8 @@ impl Ledger {
     }
 
     /// Test support: a credit issued at `at` (the record times of the
-    /// stream tests are fixed).
-    #[cfg(test)]
+    /// stream tests are fixed; the fuzz target `trace_stream`).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn credit_at(
         &self,
         attach: &str,
@@ -335,8 +349,9 @@ impl Ledger {
         }
     }
 
-    /// Test support: an attachment opened at `opened`.
-    #[cfg(test)]
+    /// Test support: an attachment opened at `opened` (and the fuzz
+    /// target `trace_stream`).
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn register_at(
         &self,
         attach: &str,
@@ -345,10 +360,7 @@ impl Ledger {
         pid: u32,
         opened: SystemTime,
     ) {
-        self.register(attach, id, port, pid);
-        if let Some(a) = self.state().attachments.last_mut() {
-            a.opened = opened;
-        }
+        self.register(attach, id, port, pid, opened);
     }
 
     /// Test support (the engine-matrix own-statement test, R20): the
@@ -509,9 +521,13 @@ impl Ledger {
     /// Marks the ledger changed and schedules its write on a blocking
     /// thread, never from async code or a `Drop` (review L2), one write
     /// for the changes made meanwhile; without a runtime (tests), at the
-    /// next checkpoint. At a session's end ([`Self::close`]) and at its
+    /// next checkpoint. At a session's end ([`Self::close`]), at its
     /// registration (`Session::register_own`, L1 of the review of #418:
-    /// a kill later in the session then still finds the attachment).
+    /// a kill later in the session then still finds the attachment) and
+    /// at each credit (the late-kill window of the review of #418). A write
+    /// within [`WRITE_EVERY`] of the previous one waits out the rest of it
+    /// (the changes made meanwhile join it), so the last change is always
+    /// written.
     pub(crate) fn schedule_persist(self: &Arc<Self>) {
         self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(rt) = tokio::runtime::Handle::try_current()
@@ -519,13 +535,31 @@ impl Ledger {
                 .scheduled
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
+            let wait = self.until_next_write();
             let me = Arc::clone(self);
-            drop(rt.spawn_blocking(move || {
+            let write = move || {
                 me.scheduled
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 me.persist_if_dirty();
-            }));
+            };
+            if wait.is_zero() {
+                drop(rt.spawn_blocking(write));
+            } else {
+                let handle = rt.clone();
+                drop(rt.spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    drop(handle.spawn_blocking(write));
+                }));
+            }
         }
+    }
+
+    /// What is left of [`WRITE_EVERY`] since the last write.
+    fn until_next_write(&self) -> Duration {
+        self.last_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map_or(Duration::ZERO, |t| WRITE_EVERY.saturating_sub(t.elapsed()))
     }
 
     /// Writes the ledger when it changed since it was last written.
@@ -980,6 +1014,16 @@ impl Ledger {
         let Some((store, key)) = p.as_ref() else {
             return;
         };
+        let now = std::time::Instant::now();
+        *self
+            .last_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+        #[cfg(test)]
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(now);
         let body = self.encode(key);
         match crate::ckpt::seal(key, MAGIC, &body) {
             Some(bytes) => {
@@ -1083,6 +1127,65 @@ pub(crate) fn within(a: &FetchAccount, n: u64, failed: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// The late-kill window of the review of #418: every credit schedules
+    /// the ledger's write, at most one write per [`WRITE_EVERY`], and the
+    /// last credit is always written (the trailing write).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credits_are_written_spaced_with_a_trailing_write() {
+        crate::fsread::allow_own_files_for_tests();
+        let dir = std::env::temp_dir().join(format!("fb-credit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = Arc::new(
+            databastion_classifiers::masking::HmacKey::new(&[7; 32])
+                .unwrap()
+                .local_tag_key("databastion.audit.cursor")
+                .unwrap(),
+        );
+        let l = Arc::new(Ledger::default());
+        let store = CursorStore::counters(&dir, "t", "fblg").unwrap();
+        l.attach_store(store, key);
+        l.register("app", 7, 40000, 24, SystemTime::now());
+        let text = crate::sql::VERSION;
+        let one = acc(FetchEnd::End, 1, 64, 64, 64);
+        // A paced scan: a credit every 10 ms for 2.2 s.
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        while start.elapsed() < Duration::from_millis(2200) {
+            l.credit("app", 7, text, Some("T"), one);
+            l.schedule_persist();
+            n += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let last = std::time::Instant::now();
+        // The trailing write comes within the spacing.
+        let deadline = last + WRITE_EVERY + Duration::from_secs(2);
+        while l.dirty.load(std::sync::atomic::Ordering::SeqCst)
+            || l.scheduled.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(std::time::Instant::now() < deadline, "no trailing write");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let writes = l.writes.lock().unwrap().clone();
+        assert!(n > 100, "{n} credits");
+        // About one write per second (at 0, 1, 2 and the trailing one at 3),
+        // never two within the spacing.
+        assert!((3..=4).contains(&writes.len()), "{writes:?}");
+        for w in writes.windows(2) {
+            assert!(
+                w[1] - w[0] >= WRITE_EVERY - Duration::from_millis(5),
+                "{writes:?}"
+            );
+        }
+        assert!(
+            *writes.last().unwrap() >= last,
+            "the last credit was written"
+        );
+        let saved = CursorStore::counters(&dir, "t", "fblg").unwrap().load();
+        assert!(matches!(saved, Ok(Some(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn acc(end: FetchEnd, counted: u64, requested: u64, last: u32, largest: u32) -> FetchAccount {
         FetchAccount {
             counted,
@@ -1122,7 +1225,7 @@ mod tests {
     #[test]
     fn credits_are_consumed_once() {
         let l = Ledger::default();
-        l.register("app", 7, 40000, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
         assert!(l.is_own_attach("app", 7, 40000, None));
         assert!(!l.is_own_attach("app", 7, 40001, None));
         let text = crate::sql::OWN_ATTACHMENT;
@@ -1152,7 +1255,7 @@ mod tests {
     #[test]
     fn a_re_read_record_finds_its_credit_again() {
         let l = Ledger::default();
-        l.register("app", 7, 40000, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
         let text = crate::sql::OWN_ATTACHMENT;
         l.credit("app", 7, text, None, acc(FetchEnd::End, 1, 64, 64, 64));
         assert_eq!(l.consume("app", 7, text, AT, bounded(1)), Verdict::Own);
@@ -1201,8 +1304,8 @@ mod tests {
         let store = || CursorStore::counters(&dir, "t", "fblg").unwrap();
         let l = Ledger::default();
         l.attach_store(store(), Arc::clone(&key));
-        l.register("app", 7, 40000, 24);
-        l.register("gone", 8, 40001, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
+        l.register("gone", 8, 40001, 24, SystemTime::now());
         let text = crate::sql::OWN_ATTACHMENT;
         let one = acc(FetchEnd::End, 1, 64, 64, 64);
         for _ in 0..3 {
@@ -1270,7 +1373,7 @@ mod tests {
     #[test]
     fn a_sampling_credit_names_its_table() {
         let l = Ledger::default();
-        l.register("app", 7, 40000, 24);
+        l.register("app", 7, 40000, 24, SystemTime::now());
         let t = "SELECT FIRST 3 X FROM \"T\"";
         l.credit("app", 7, t, Some("T"), acc(FetchEnd::End, 3, 3, 3, 3));
         assert_eq!(

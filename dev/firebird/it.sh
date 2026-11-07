@@ -482,13 +482,15 @@ fi
   printf 'CREATE TABLE T (ID INTEGER);\nCOMMIT;\n'
 } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA >/dev/null
 
-# The tests run in the network namespace, as the calling user.
+# The tests run in the network namespace, as the calling user. DATABASTION_IT_FIREBIRD_REQUIRE=1
+# (review N4 of P10-F): a test that finds no server, or no variable this script always sets, fails
+# instead of skipping.
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
 run_tests() { # filter, then extra NAME=value settings
   local filter="$1"
   shift
   timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid "$(id -g)" -- \
-  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 "$@" \
+  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 DATABASTION_IT_FIREBIRD_REQUIRE=1 "$@" \
   FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 FIREBIRD_IT_MAJOR="$MAJOR" \
   FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
   FIREBIRD_IT_CRM_ATTACH=/var/lib/firebird/data/crm.fdb \
@@ -819,7 +821,7 @@ sed 's/^\tmax_log_size = 0$/\tmax_log_size = 1/' "$WORK/fbtrace.conf" > "$WORK/f
 grep -F 'max_log_size = 1' "$WORK/fbtrace-rot.conf" >/dev/null || { echo "[it] rotation: no max_log_size" >&2; exit 1; }
 chmod 0644 "$WORK/fbtrace-rot.conf"
 # ADR-0060 R54: that configuration is Limited (max_log_size not 0); checked, not measured.
-timeout 120 env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+timeout 120 env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 DATABASTION_IT_FIREBIRD_REQUIRE=1 \
   FIREBIRD_IT_ROTATION_TRACE_CONF="$WORK/fbtrace-rot.conf" \
   FIREBIRD_IT_DATABASES_CONF="$WORK/databases.conf" \
   "$EXE" it::audit::the_rotation_measurement_configuration_is_limited --exact --nocapture >&2
@@ -851,7 +853,7 @@ rotation_case() { # label umask(image|NNN) default-acl(yes|no)
     'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = firebird ] && \
      awk "/^Umask/ {print \$2}" "$p/status"; done; true' | head -n 1)" >&2
   $SUDO setpriv --reuid 10001 --regid 10001 --clear-groups -- \
-    env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+    env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 DATABASTION_IT_FIREBIRD_REQUIRE=1 \
     FIREBIRD_IT_ROTATION_LOG="$C/audit/audit.log" FIREBIRD_IT_ROTATION_READY="$C/agent/ready" \
     timeout 300 "$ROT/it" it::rotation::the_stream_across_a_server_rotation --exact --nocapture \
     > "$out" 2>&1 &
