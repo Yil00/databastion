@@ -1,4 +1,4 @@
-"""Writes two seed inputs of the sqlite_file fuzz target (ADR-0059), fake values only:
+"""Writes three seed inputs of the sqlite_file fuzz target (ADR-0059), fake values only:
 
 - OUT: a small SQLite file in rollback mode, as the target's first length-prefixed part;
 - OUT-wal: a WAL file set (the main file, its -wal and the start of its -shm, saved while a
@@ -7,6 +7,9 @@
   whole region; the cut hash table finds no frame, so pages come from the main file). The
   target runs it on the heap WAL index and on the reliable -shm path (its helper holds the
   DMS lock).
+- OUT-names: a small file whose schema text names its INTEGER PRIMARY KEY column with a byte
+  that is not valid UTF-8 (fuzz nightly run 42322811219: rusqlite's authorizer conversion
+  panicked on that name when a statement named the rowid).
 
     python3 -I sqlite_seed.py OUT
 """
@@ -38,6 +41,8 @@ def main(out: str) -> None:
         f.write(part(data))
     with open(out + "-wal", "wb") as f:
         f.write(wal_set())
+    with open(out + "-names", "wb") as f:
+        f.write(part(non_utf8_names()))
 
 
 # The -shm bytes kept: the two copies of the WAL index header and the checkpoint info (136
@@ -69,6 +74,28 @@ def wal_set() -> bytes:
         c.close()
     files[2] = files[2][:SHM_KEPT]
     return b"".join(part(f) for f in files)
+
+
+def non_utf8_names() -> bytes:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "names.db")
+        c = sqlite3.connect(path, isolation_level=None)
+        c.executescript(
+            """
+            PRAGMA page_size = 512;
+            PRAGMA journal_mode = DELETE;
+            CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);
+            INSERT INTO t (email) VALUES ('fake@example.com');
+            PRAGMA writable_schema = ON;
+            """
+        )
+        c.execute(
+            "UPDATE sqlite_schema SET sql = CAST(? AS TEXT) WHERE name = 't'",
+            (b"CREATE TABLE t (i\xff INTEGER PRIMARY KEY, email TEXT)",),
+        )
+        c.execute("PRAGMA writable_schema = OFF")
+        c.close()
+        return open(path, "rb").read()
 
 
 if __name__ == "__main__":

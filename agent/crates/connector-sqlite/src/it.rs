@@ -926,3 +926,165 @@ fn a_cut_response_stays_within_its_budget() {
         (10, Some(last + 10), false)
     );
 }
+
+/// Counts the panics of `rusqlite`'s authorizer conversion (its message
+/// names the authorizer and invalid UTF-8) in this test process; the hook
+/// is installed once, and calls the previous one.
+pub(crate) fn authorizer_utf8_panics() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = info
+                .payload()
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| info.payload().downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            if msg.contains("non-utf8") {
+                COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            previous(info);
+        }));
+    });
+    &COUNT
+}
+
+/// A rollback-mode file whose table `t` is created by `valid` and filled,
+/// then whose schema text is replaced by `schema` (bytes, with a name that
+/// is not valid UTF-8 in this UTF-8 file): a hostile file.
+pub(crate) fn non_utf8_schema(path: &Path, valid: &str, schema: &[u8]) {
+    let c = Connection::open(path).unwrap();
+    c.execute_batch(&format!(
+        "PRAGMA journal_mode = DELETE; {valid}; \
+         INSERT INTO t (a, b) VALUES ('x@example.com', 'y@example.org'), \
+         ('z@example.com', 'w@example.org');"
+    ))
+    .unwrap();
+    c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+        .unwrap();
+    c.execute_batch("PRAGMA writable_schema = ON").unwrap();
+    let n = c
+        .execute(
+            "UPDATE sqlite_schema SET sql = CAST(?1 AS TEXT) WHERE name = 't'",
+            [schema.to_vec()],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    c.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+}
+
+/// Fuzz nightly run 42322811219 (`sqlite_file`): a column name that is not
+/// UTF-8. A statement naming the rowid of a table whose `INTEGER PRIMARY
+/// KEY` column has such a name made SQLite hand that name to the
+/// authorizer, and `rusqlite`'s conversion panicked (caught by `rusqlite`
+/// and read as a denial, reported `auth`; an abort under libFuzzer). Now
+/// the rowid statements of a table with such a name are refused before
+/// they are prepared (`name_not_utf8`), the table is read by the plain
+/// read, and the authorizer never sees the name.
+#[test]
+fn a_column_name_that_is_not_utf8_never_reaches_the_authorizer() {
+    use std::sync::atomic::Ordering;
+    let panics = authorizer_utf8_panics();
+    let d = Dir::new("non-utf8-names");
+    let cases: [(&str, &str, &[u8]); 4] = [
+        // The rowid alias itself (the fuzz crash).
+        (
+            "ipk.db",
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            b"CREATE TABLE t (i\xff INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        ),
+        // Another column (never named by a statement: refused all the
+        // same, the rule does not depend on which column is the alias).
+        (
+            "col.db",
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT, c\xc3 TEXT)",
+        ),
+        // A cut sequence in a quoted name, without an alias column.
+        (
+            "quoted.db",
+            "CREATE TABLE t (\"k\" TEXT, a TEXT, b TEXT)",
+            b"CREATE TABLE t (\"k\xe2\x82\" TEXT, a TEXT, b TEXT)",
+        ),
+        // A STORED generated column (hidden 3) with such a name.
+        (
+            "gen.db",
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT, \
+             g TEXT GENERATED ALWAYS AS (a) STORED)",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT, \
+             g\x80 TEXT GENERATED ALWAYS AS (a) STORED)",
+        ),
+    ];
+    for (file, valid, schema) in cases {
+        let p = d.path(file);
+        non_utf8_schema(&p, valid, schema);
+        let before = panics.load(Ordering::SeqCst);
+        let mut s = session(&p);
+        let cat = catalog(&mut s);
+        assert_eq!(cat, vec![(false, "t".to_owned(), 2)], "{file}");
+        // The columns are listed, the bad name as it is (the agent never
+        // quotes it).
+        let Response::Columns(cols) = s.handle(&Request::Columns(z(b"t"))) else {
+            panic!("{file}: columns");
+        };
+        assert!(
+            cols.iter().any(|c| std::str::from_utf8(&c.name).is_err()),
+            "{file}"
+        );
+        // The rowid statements are refused before they are prepared.
+        let r = s.handle(&Request::Bounds(z(b"t"), RowidAlias::Rowid));
+        assert!(
+            matches!(r, Response::Failed(f) if f.code == Code::NameNotUtf8 && f.engine_code.is_none()),
+            "{file}: {r:?}"
+        );
+        for range in [SampleRange::From(1), SampleRange::Below(5)] {
+            let r = sample(&mut s, "t", Some(RowidAlias::Rowid), &["a"], range, 5);
+            assert!(
+                matches!(r, Response::Failed(f) if f.code == Code::NameNotUtf8),
+                "{file}: {r:?}"
+            );
+        }
+        // The plain read names only valid columns: the table is read.
+        for reverse in [false, true] {
+            let got = sampled(sample(
+                &mut s,
+                "t",
+                None,
+                &["a", "b"],
+                SampleRange::Plain { reverse },
+                5,
+            ));
+            assert_eq!(got.rows, 2, "{file}");
+            assert_eq!(texts(&got, 1).len(), 2, "{file}");
+        }
+        // The other statements still run.
+        assert!(matches!(s.handle(&Request::Pragmas), Response::Pragmas(_)));
+        assert_eq!(
+            panics.load(Ordering::SeqCst),
+            before,
+            "{file}: authorizer panic"
+        );
+    }
+    // A valid file's rowid statements are unchanged.
+    let p = d.path("valid.db");
+    non_utf8_schema(
+        &p,
+        "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        "CREATE TABLE t (\u{e9}t\u{e9} INTEGER PRIMARY KEY, a TEXT, b TEXT)".as_bytes(),
+    );
+    let mut s = session(&p);
+    let r = s.handle(&Request::Bounds(z(b"t"), RowidAlias::Rowid));
+    assert_eq!(r, Response::Bounds(Some((1, 2))));
+    let got = sampled(sample(
+        &mut s,
+        "t",
+        Some(RowidAlias::Rowid),
+        &["a"],
+        SampleRange::From(1),
+        5,
+    ));
+    assert_eq!(got.rows, 2);
+}

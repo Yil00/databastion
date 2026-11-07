@@ -555,14 +555,57 @@ impl Db {
         out
     }
 
+    /// Before a statement that reads the rowid of `table`: every column
+    /// name of the table (`table_xinfo`, hidden columns included) must be
+    /// valid UTF-8, or [`Code::NameNotUtf8`].
+    ///
+    /// When a statement names the rowid of a table that has an `INTEGER
+    /// PRIMARY KEY` column, SQLite hands that column's name, as stored in
+    /// the file's schema, to the authorizer (`sqlite3AuthRead`), and
+    /// `rusqlite`'s authorizer hook converts it with a panic on invalid
+    /// UTF-8 (0.40.2 and 0.41.1; no bytes variant). That panic is caught by
+    /// `rusqlite` and read by SQLite as `SQLITE_DENY` (so the statement is
+    /// refused, never allowed), but it would abort a process whose panic
+    /// hook aborts (a fuzz target) and report a hostile file as an
+    /// authorizer bug. The columns the reader's statements name are always
+    /// valid UTF-8 ([`sql::quote`]), and SQLite matches them only to a
+    /// stored name equal but for ASCII case, so the rowid alias is the only
+    /// name from the file the authorizer can receive; every column is
+    /// checked, not only the primary key's, so the rule does not depend on
+    /// which column SQLite takes as the alias.
+    fn rowid_names_are_utf8(&self, table: &[u8], name: &str) -> Result<(), Failure> {
+        let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
+        self.arm(Template::Columns(name.to_owned()));
+        let out = (|| {
+            let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
+            let mut rows = stmt.query([]).map_err(map_error)?;
+            let mut n = 0usize;
+            while let Some(row) = rows.next().map_err(map_error)? {
+                n += 1;
+                if n > MAX_TABLE_COLUMNS {
+                    return Err(Failure::new(Code::TooBig));
+                }
+                match row.get_ref(1).map_err(map_error)? {
+                    ValueRef::Text(t) if std::str::from_utf8(t).is_ok() => {}
+                    _ => return Err(Failure::new(Code::NameNotUtf8)),
+                }
+            }
+            Ok(())
+        })();
+        self.disarm();
+        out
+    }
+
     /// `min` / `max` of the rowid; [`Code::NoRowid`] for a `WITHOUT ROWID`
-    /// table.
+    /// table, [`Code::NameNotUtf8`] for a table with a column name that is
+    /// not UTF-8 (`rowid_names_are_utf8`).
     ///
     /// # Errors
     /// The mapped failure.
     pub fn bounds(&self, table: &[u8], alias: RowidAlias) -> Result<Option<(i64, i64)>, Failure> {
         let text = sql::bounds(table, alias).ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(table).map_err(|_| Failure::new(Code::Internal))?;
+        self.rowid_names_are_utf8(table, name)?;
         self.arm(Template::Read(name.to_owned()));
         let out = self
             .conn
@@ -577,7 +620,8 @@ impl Db {
         out
     }
 
-    /// One sampling statement of decision 5's closed list.
+    /// One sampling statement of decision 5's closed list; one by the
+    /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is.
     ///
     /// # Errors
     /// The mapped failure.
@@ -585,6 +629,9 @@ impl Db {
         let text = sql::sample(&req.table, req.alias, &req.columns, req.range)
             .ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(&req.table).map_err(|_| Failure::new(Code::Internal))?;
+        if req.alias.is_some() {
+            self.rowid_names_are_utf8(&req.table, name)?;
+        }
         let reverse = matches!(req.range, SampleRange::Plain { reverse: true });
         self.conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, reverse)
