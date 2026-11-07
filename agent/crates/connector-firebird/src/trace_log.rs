@@ -319,8 +319,12 @@ pub(crate) fn header(line: &[u8]) -> Option<Header> {
     }
     let (t, rest) = line.split_at(24);
     let sep = |i: usize, c: u8| t.get(i) == Some(&c);
-    if !(sep(4, b'-') && sep(7, b'-') && sep(10, b'T') && sep(13, b':') && sep(16, b':'))
-        || !sep(19, b'.')
+    if !(sep(4, b'-')
+        && sep(7, b'-')
+        && sep(10, b'T')
+        && sep(13, b':')
+        && sep(16, b':')
+        && sep(19, b'.'))
     {
         return None;
     }

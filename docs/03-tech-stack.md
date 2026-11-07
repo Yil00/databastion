@@ -22,7 +22,7 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 ## Agent (Data Plane)
 | Component | Technology | Comment |
 |-----------|-------------|-------------|
-| Language | **Rust** (stable, edition 2024, MSRV 1.88, built in CI) | Lightweight, safe, static binary |
+| Language | **Rust** (stable, edition 2024, MSRV 1.89, built in CI) | Lightweight, safe, static binary |
 | Async runtime | tokio | |
 | CLI / logs | clap, `tracing` + `tracing-subscriber` (JSON) | |
 | Protocol types | typify 0.8, run by the `databastion-protocol-codegen` developer tool (`cargo run -p databastion-protocol-codegen`) | Output committed in `crates/protocol/src/generated.rs` (crate `databastion-protocol`); the codegen tool is not shipped in the agent |
