@@ -947,10 +947,10 @@ cargo run -p databastion-protocol-codegen      # after changing shared/protocol/
 cargo run -- enroll --config agent.example.yaml --token-file /path/to/token
 cargo run -- run --config /etc/databastion/agent.yaml
 fuzz/smoke.sh 10                               # parser fuzz targets, 10 s each (stable; fuzz/README.md)
-cargo +1.88.0 check --workspace --all-targets --all-features --locked   # MSRV (rust-version)
+cargo +1.89.0 check --workspace --all-targets --all-features --locked   # MSRV (rust-version)
 ```
 
-The workspace `rust-version` (1.88) is a tested minimum: the "Agent MSRV" CI job type-checks every
+The workspace `rust-version` (1.89) is a tested minimum: the "Agent MSRV" CI job type-checks every
 target on exactly that toolchain, and `release.yml` pins it. The other jobs, the Docker image and
 the released `.deb` build with a newer stable (the `Dockerfile` builder). Raise `rust-version`, the
 job's `toolchain` and the `release.yml` pin together.

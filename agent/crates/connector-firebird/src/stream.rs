@@ -1292,7 +1292,7 @@ impl Machine {
         };
         !self.provisional
             && h.pid != r.pid
-            && !self.pending_run.is_some_and(|p| p.pid == h.pid)
+            && self.pending_run.is_none_or(|p| p.pid != h.pid)
             && !self.failed_pids.contains(&h.pid)
             && self.failed_pids.len() < MAX_FAILED_PIDS
             && self.cooldown_until.is_none_or(|u| now >= u)
@@ -1489,7 +1489,7 @@ impl Machine {
     /// end, and a learned eviction raises the learned floor.
     fn evict_one(&mut self) -> bool {
         while let Some((seq, key)) = self.evictable.pop_front() {
-            if !self.bindings.get(&key).is_some_and(|b| b.seq == seq) {
+            if self.bindings.get(&key).is_none_or(|b| b.seq != seq) {
                 continue;
             }
             let Some(b) = self.remove_binding(key) else {

@@ -670,7 +670,7 @@ impl Checkpointer {
                 .last
                 .as_ref()
                 .is_some_and(|l| l.file == p.file && l.pos == p.pos && l.step == p.step);
-            if !(unchanged && !self.dirty) {
+            if !unchanged || self.dirty {
                 self.write(p, m, facts, now);
             }
         }

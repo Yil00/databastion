@@ -1134,7 +1134,7 @@ impl Session {
         }
         self.dec.discard = false;
         // The rest of the acknowledging message, if any.
-        if !self.poisoned && !(self.reasm.eom && self.pos >= self.buf.len()) {
+        if !(self.poisoned || (self.reasm.eom && self.pos >= self.buf.len())) {
             // Any error here leaves the stream out of step: poisoned
             // (review L2).
             loop {

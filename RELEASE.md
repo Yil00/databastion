@@ -99,7 +99,7 @@ All the checks, in order: [deploy/README.md](deploy/README.md#verify-the-artifac
    - `T` has one parent `P`, a merge commit;
    - between `P` and `T`, only files the release hooks change are modified (`CHANGELOG.md`, `package.json`, `package-lock.json`, `console/package.json`, `agent/Cargo.toml`, `agent/Cargo.lock`, `agent/fuzz/Cargo.lock`, `helm/databastion/Chart.yaml`), `CHANGELOG.md` and `package.json` among them;
    - exactly one `release.yml` run on the push of `P` to `main` exists, its `release-it` job concluded `success` and was approved in the `release-it` environment, and `T`'s committer time falls within that job's start and end (2 minutes of slack). `prepare` waits up to 20 minutes, the job's own timeout, for the job to finish (release-it pushes the tag before it creates the draft), and fails if it has not;
-   - in the `release-tree` job, whose token can only read the contents: `T`'s tree is exactly what the two `after:bump` hooks produce when run on `P` (with Node 24 and Rust 1.88.0, as in `release.yml`).
+   - in the `release-tree` job, whose token can only read the contents: `T`'s tree is exactly what the two `after:bump` hooks produce when run on `P` (with Node 24 and Rust 1.89.0, as in `release.yml`).
 
    It then builds and signs the images, the `.deb` files and `SHA256SUMS`, attaches them to the draft, and runs the installation test with them. A pre-release tag skips these checks and waits for one approval instead ([Pre-release](#pre-release)).
 

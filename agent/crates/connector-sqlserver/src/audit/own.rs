@@ -947,8 +947,8 @@ pub(crate) fn restore(target_id: &str, persisted: Persisted) {
             && c.until_us.saturating_sub(c.from_us) <= max_window_us
             && saved_us.is_none_or(|saved| c.from_us <= saved)
     };
-    let polls: Vec<Credit> = polls.into_iter().filter(|c| plausible(c)).collect();
-    let sampling: Vec<Credit> = sampling.into_iter().filter(|c| plausible(c)).collect();
+    let polls: Vec<Credit> = polls.into_iter().filter(&plausible).collect();
+    let sampling: Vec<Credit> = sampling.into_iter().filter(plausible).collect();
     let mut reg = lock();
     let t = reg.targets.entry(target_id.to_owned()).or_default();
     for c in polls {
