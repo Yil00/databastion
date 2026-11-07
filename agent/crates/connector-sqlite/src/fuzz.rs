@@ -477,6 +477,31 @@ mod tests {
         file(&part(&std::fs::read(&p).unwrap()), Some(&mut h));
     }
 
+    /// Fuzz nightly run 42322811219: a column name that is not UTF-8 (the
+    /// table's `INTEGER PRIMARY KEY`) made `rusqlite`'s authorizer
+    /// conversion panic, which libFuzzer's panic hook turns into an abort.
+    /// The pipeline now reads the table by the plain read, and nothing
+    /// panics.
+    #[test]
+    fn a_column_name_that_is_not_utf8_does_not_panic() {
+        use std::sync::atomic::Ordering;
+        let _g = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let panics = crate::it::authorizer_utf8_panics();
+        let before = panics.load(Ordering::SeqCst);
+        let d = crate::it::Dir::new("fuzz-non-utf8");
+        let p = d.path("n.db");
+        crate::it::non_utf8_schema(
+            &p,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            b"CREATE TABLE t (i\xe4 INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        );
+        let input = part(&std::fs::read(&p).unwrap());
+        assert_eq!(file_counted(&input, None), (2, None));
+        assert_eq!(panics.load(Ordering::SeqCst), before);
+    }
+
     /// The second pass takes the reliable -shm path: with the helper
     /// holding the DMS lock, SQLite trusts the fuzzed WAL index, which here
     /// is a writer's -shm saved before its last commit, so that commit's

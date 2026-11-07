@@ -315,6 +315,9 @@ pub struct Db {
     deadline: Arc<AtomicU64>,
     epoch: Instant,
     max_statement: Duration,
+    /// How many times the deadline was set (tests: one per request).
+    #[cfg(test)]
+    deadlines_set: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for Db {
@@ -357,6 +360,8 @@ pub fn open(
         deadline: Arc::new(AtomicU64::new(0)),
         epoch: Instant::now(),
         max_statement: Duration::from_millis(u64::from(max_statement_ms)),
+        #[cfg(test)]
+        deadlines_set: std::sync::atomic::AtomicU32::new(0),
     };
     db.setup()?;
     Ok(db)
@@ -427,10 +432,26 @@ impl Db {
     /// Arms the statement deadline and sets the template of the next
     /// statement.
     fn arm(&self, template: Template) {
+        self.arm_deadline();
+        self.set_template(template);
+    }
+
+    /// Arms the statement deadline: once per request, so that the
+    /// statements of one request share it (decision 3: one statement
+    /// deadline bounds one unit's lock time; the agent kills the reader at
+    /// that deadline plus 2 s).
+    fn arm_deadline(&self) {
+        #[cfg(test)]
+        self.deadlines_set.fetch_add(1, Ordering::Relaxed);
         self.deadline.store(
             ms(self.epoch.elapsed() + self.max_statement),
             Ordering::Relaxed,
         );
+    }
+
+    /// Sets the template of the next statement, under the deadline already
+    /// armed.
+    fn set_template(&self, template: Template) {
         if let Ok(mut t) = self.template.lock() {
             *t = template;
         }
@@ -558,15 +579,69 @@ impl Db {
         out
     }
 
+    /// Before a statement that reads the rowid of `table`: every column
+    /// name of the table (`table_xinfo`, hidden columns included) must be
+    /// valid UTF-8, or [`Code::NameNotUtf8`].
+    ///
+    /// When a statement names the rowid of a table that has an `INTEGER
+    /// PRIMARY KEY` column, SQLite hands that column's name, as stored in
+    /// the file's schema, to the authorizer (`sqlite3AuthRead`), and
+    /// `rusqlite`'s authorizer hook converts it with a panic on invalid
+    /// UTF-8 (0.40.2 and 0.41.1; no bytes variant). That panic is caught by
+    /// `rusqlite` and read by SQLite as `SQLITE_DENY` (so the statement is
+    /// refused, never allowed), but it would abort a process whose panic
+    /// hook aborts (a fuzz target) and report a hostile file as an
+    /// authorizer bug. The columns the reader's statements name are always
+    /// valid UTF-8 ([`sql::quote`]), and SQLite matches them only to a
+    /// stored name equal but for ASCII case, so the rowid alias is the only
+    /// name from the file the authorizer can receive; every column is
+    /// checked, not only the primary key's, so the rule does not depend on
+    /// which column SQLite takes as the alias.
+    ///
+    /// It runs under the deadline its caller armed for the whole request
+    /// (`arm_deadline`), never one of its own.
+    ///
+    /// Residual race (fail closed): the application can rename a column to
+    /// such a name between this check and the prepare of the rowid
+    /// statement. The panic is then caught as above and the statement is
+    /// denied (`SQLITE_AUTH`); `after_rowid_statement` checks the names
+    /// once more and reports [`Code::NameNotUtf8`] rather than
+    /// [`Code::Auth`] when it finds such a name.
+    fn rowid_names_are_utf8(&self, table: &[u8], name: &str) -> Result<(), Failure> {
+        let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
+        self.set_template(Template::Columns(name.to_owned()));
+        let out = (|| {
+            let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
+            let mut rows = stmt.query([]).map_err(map_error)?;
+            let mut n = 0usize;
+            while let Some(row) = rows.next().map_err(map_error)? {
+                n += 1;
+                if n > MAX_TABLE_COLUMNS {
+                    return Err(Failure::new(Code::TooBig));
+                }
+                match row.get_ref(1).map_err(map_error)? {
+                    ValueRef::Text(t) if std::str::from_utf8(t).is_ok() => {}
+                    _ => return Err(Failure::new(Code::NameNotUtf8)),
+                }
+            }
+            Ok(())
+        })();
+        self.disarm();
+        out
+    }
+
     /// `min` / `max` of the rowid; [`Code::NoRowid`] for a `WITHOUT ROWID`
-    /// table.
+    /// table, [`Code::NameNotUtf8`] for a table with a column name that is
+    /// not UTF-8 (`rowid_names_are_utf8`).
     ///
     /// # Errors
     /// The mapped failure.
     pub fn bounds(&self, table: &[u8], alias: RowidAlias) -> Result<Option<(i64, i64)>, Failure> {
         let text = sql::bounds(table, alias).ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(table).map_err(|_| Failure::new(Code::Internal))?;
-        self.arm(Template::Read(name.to_owned()));
+        self.arm_deadline();
+        self.rowid_names_are_utf8(table, name)?;
+        self.set_template(Template::Read(name.to_owned()));
         let out = self
             .conn
             .query_row(&text, [], |r| {
@@ -577,10 +652,30 @@ impl Db {
             })
             .map_err(map_error);
         self.disarm();
-        out
+        self.after_rowid_statement(out, table, name)
     }
 
-    /// One sampling statement of decision 5's closed list.
+    /// After a rowid statement whose names passed `rowid_names_are_utf8`:
+    /// a denial (`Code::Auth`) is checked once more, under the same
+    /// deadline, and reported as [`Code::NameNotUtf8`] when a column name
+    /// is no longer valid UTF-8 (the application renamed it in between).
+    fn after_rowid_statement<T>(
+        &self,
+        out: Result<T, Failure>,
+        table: &[u8],
+        name: &str,
+    ) -> Result<T, Failure> {
+        match out {
+            Err(f) if f.code == Code::Auth => match self.rowid_names_are_utf8(table, name) {
+                Err(g) if g.code == Code::NameNotUtf8 => Err(g),
+                _ => Err(f),
+            },
+            other => other,
+        }
+    }
+
+    /// One sampling statement of decision 5's closed list; one by the
+    /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is.
     ///
     /// # Errors
     /// The mapped failure.
@@ -588,11 +683,15 @@ impl Db {
         let text = sql::sample(&req.table, req.alias, &req.columns, req.range)
             .ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(&req.table).map_err(|_| Failure::new(Code::Internal))?;
+        self.arm_deadline();
+        if req.alias.is_some() {
+            self.rowid_names_are_utf8(&req.table, name)?;
+        }
         let reverse = matches!(req.range, SampleRange::Plain { reverse: true });
         self.conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, reverse)
             .map_err(map_error)?;
-        self.arm(Template::Read(name.to_owned()));
+        self.set_template(Template::Read(name.to_owned()));
         let out = (|| {
             let mut stmt = self.conn.prepare(&text).map_err(map_error)?;
             let limit = i64::from(req.limit);
@@ -654,6 +753,9 @@ impl Db {
         let _ = self
             .conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, false);
+        if req.alias.is_some() {
+            return self.after_rowid_statement(out, &req.table, name);
+        }
         out
     }
 
@@ -817,6 +919,65 @@ fn first_integer(stat: &[u8]) -> Option<u64> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Review L1 of #423: the names check and the rowid statement of one
+    /// request share one deadline (armed once), in bounds and in a rowid
+    /// sample; review L2: a denial after a passed check is reported as
+    /// `name_not_utf8` when the names are now bad, and stays `auth`
+    /// otherwise.
+    #[test]
+    fn a_rowid_request_arms_one_deadline_and_rechecks_a_denial() {
+        let d = crate::it::Dir::new("db-rowid-deadline");
+        let good = d.path("good.db");
+        crate::it::non_utf8_schema(
+            &good,
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        );
+        let db = open(&good, 60_000, || Ok(())).unwrap();
+        let sets = || db.deadlines_set.load(Ordering::Relaxed);
+        let before = sets();
+        let deadline = |db: &Db| db.deadline.load(Ordering::Relaxed);
+        assert_eq!(db.bounds(b"t", RowidAlias::Rowid), Ok(Some((1, 2))));
+        assert_eq!(sets(), before + 1);
+        let armed = deadline(&db);
+        let req = SampleRequest {
+            table: Zeroizing::new(b"t".to_vec()),
+            alias: Some(RowidAlias::Rowid),
+            columns: vec![Zeroizing::new(b"a".to_vec())],
+            range: SampleRange::From(1),
+            limit: 5,
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(db.sample(&req).unwrap().rows, 2);
+        assert_eq!(sets(), before + 2);
+        assert!(deadline(&db) > armed);
+        // A denial with valid names stays `auth`; other results pass.
+        let auth = || Err::<(), _>(Failure::new(Code::Auth));
+        assert_eq!(
+            db.after_rowid_statement(auth(), b"t", "t")
+                .unwrap_err()
+                .code,
+            Code::Auth
+        );
+        assert_eq!(db.after_rowid_statement(Ok(3), b"t", "t"), Ok(3));
+        assert_eq!(sets(), before + 2);
+        let bad = d.path("bad.db");
+        crate::it::non_utf8_schema(
+            &bad,
+            "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+            b"CREATE TABLE t (i\xff INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+        );
+        let db = open(&bad, 60_000, || Ok(())).unwrap();
+        assert_eq!(
+            db.after_rowid_statement(auth(), b"t", "t")
+                .unwrap_err()
+                .code,
+            Code::NameNotUtf8
+        );
+        // The re-check arms no deadline of its own.
+        assert_eq!(db.deadlines_set.load(Ordering::Relaxed), 0);
+    }
 
     fn memory() -> Connection {
         Connection::open_in_memory().unwrap()
