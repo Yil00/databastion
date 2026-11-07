@@ -104,10 +104,15 @@ features = [
     # enabled (no load_extension, loadable_extension, vtab, functions, trace,
     # backup, blob, serialize, session, sqlcipher, buildtime_bindgen,
     # with-asan outside the fuzz workspace, or the integrations).
-    { crate = "rusqlite", allow = ["bundled", "modern_sqlite", "hooks", "limits"] },
-    # `default` is `min_sqlite_version_3_34_1` (cargo-deny 0.20 lists it as a
-    # feature of its own); the bundled build ignores pkg-config and vcpkg.
-    { crate = "libsqlite3-sys", allow = ["bundled", "bundled_bindings", "cc", "default", "min_sqlite_version_3_34_1", "pkg-config", "vcpkg"] },
+    # `wal`: since rusqlite 0.41, `hooks` implies it; it only compiles
+    # `Connection::wal_checkpoint_v2` and the `wal` module, which the reader
+    # never calls (architecture test `sqlite_connector_statements_are_closed`
+    # bans `wal_checkpoint` and `wal_hook` in the crate's code).
+    { crate = "rusqlite", allow = ["bundled", "modern_sqlite", "hooks", "limits", "wal"] },
+    # `default` is `min_sqlite_version_3_45_3` since libsqlite3-sys 0.39
+    # (`min_sqlite_version_3_34_1` before; cargo-deny 0.20 lists `default` as
+    # a feature of its own); the bundled build ignores pkg-config and vcpkg.
+    { crate = "libsqlite3-sys", allow = ["bundled", "bundled_bindings", "cc", "default", "min_sqlite_version_3_45_3", "pkg-config", "vcpkg"] },
 ]
 
 [sources]

@@ -115,13 +115,13 @@ pub enum SelfCheckFailure {
 /// # Errors
 /// [`Code::SelfCheckFailed`].
 pub fn self_check() -> Result<(), Failure> {
-    let conn = Connection::open_in_memory_with_flags(
+    let mut conn = Connection::open_in_memory_with_flags(
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     )
     .map_err(|_| Failure::new(Code::SelfCheckFailed))?;
-    self_check_on(&conn, &expected()).map_err(|_| Failure::new(Code::SelfCheckFailed))
+    self_check_on(&mut conn, &expected()).map_err(|_| Failure::new(Code::SelfCheckFailed))
 }
 
 /// The self-check against `expected` on `conn` (the negative-control test
@@ -129,7 +129,7 @@ pub fn self_check() -> Result<(), Failure> {
 ///
 /// # Errors
 /// The first check that failed.
-pub fn self_check_on(conn: &Connection, expected: &Expected) -> Result<(), SelfCheckFailure> {
+pub fn self_check_on(conn: &mut Connection, expected: &Expected) -> Result<(), SelfCheckFailure> {
     // Read before anything sets them: the compile-time defaults.
     let defensive = conn
         .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
@@ -277,7 +277,10 @@ pub fn map_error(e: rusqlite::Error) -> Failure {
     }
 }
 
-fn install_authorizer(conn: &Connection, template: &Arc<Mutex<Template>>) -> Result<(), Failure> {
+fn install_authorizer(
+    conn: &mut Connection,
+    template: &Arc<Mutex<Template>>,
+) -> Result<(), Failure> {
     let state = Arc::clone(template);
     conn.authorizer(Some(move |ctx: AuthContext<'_>| {
         let current = state.lock().map(|t| t.clone()).unwrap_or(Template::None);
@@ -348,7 +351,7 @@ pub fn open(
             crate::ipc::Rule::DescriptorBinding,
         ));
     }
-    let db = Db {
+    let mut db = Db {
         conn,
         template: Arc::new(Mutex::new(Template::None)),
         deadline: Arc::new(AtomicU64::new(0)),
@@ -365,8 +368,8 @@ fn ms(d: Duration) -> u64 {
 
 impl Db {
     /// Decision 5's connection setup, in its order.
-    fn setup(&self) -> Result<(), Failure> {
-        let c = &self.conn;
+    fn setup(&mut self) -> Result<(), Failure> {
+        let c = &mut self.conn;
         for (limit, value) in [
             (Limit::SQLITE_LIMIT_ATTACHED, 0),
             (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 8),
@@ -823,7 +826,7 @@ pub(crate) mod tests {
     fn the_self_check_passes_on_this_build() {
         self_check().unwrap();
         let e = expected();
-        assert_eq!(e.version, "3.53.2");
+        assert_eq!(e.version, "3.54.1");
         assert!(!e.source_id.is_empty());
     }
 
@@ -835,39 +838,39 @@ pub(crate) mod tests {
         let mut wrong = expected();
         wrong.version = "3.40.1".to_owned();
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::Version)
         );
         let mut wrong = expected();
         wrong.source_id.push('x');
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::Version)
         );
         let mut wrong = expected();
         wrong.required.push("ENABLE_SOMETHING_ABSENT".to_owned());
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::MissingOption)
         );
         let mut wrong = expected();
         wrong.forbidden.push("THREADSAFE".to_owned());
         assert_eq!(
-            self_check_on(&memory(), &wrong),
+            self_check_on(&mut memory(), &wrong),
             Err(SelfCheckFailure::ForbiddenOption)
         );
-        let changed = memory();
+        let mut changed = memory();
         changed.execute_batch("PRAGMA trusted_schema = 1").unwrap();
         assert_eq!(
-            self_check_on(&changed, &expected()),
+            self_check_on(&mut changed, &expected()),
             Err(SelfCheckFailure::TrustedSchema)
         );
-        let changed = memory();
+        let mut changed = memory();
         changed
             .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
             .unwrap();
         assert_eq!(
-            self_check_on(&changed, &expected()),
+            self_check_on(&mut changed, &expected()),
             Err(SelfCheckFailure::Defensive)
         );
     }

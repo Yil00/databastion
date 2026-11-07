@@ -879,7 +879,8 @@ fn sqlite_features_are_the_reviewed_ones() {
     };
     assert_eq!(
         features("rusqlite"),
-        ["bundled", "hooks", "limits", "modern_sqlite"],
+        // `wal`: implied by `hooks` since rusqlite 0.41 (agent/deny.toml).
+        ["bundled", "hooks", "limits", "modern_sqlite", "wal"],
         "rusqlite features"
     );
     let sys = features("libsqlite3-sys");
@@ -1062,6 +1063,10 @@ fn sqlite_connector_statements_are_closed() {
                 "load_extension",
                 "Connection::handle",
                 ".handle()",
+                // rusqlite 0.41's `wal` feature (implied by `hooks`).
+                "wal_checkpoint",
+                "wal_hook",
+                "rusqlite::wal",
             ] {
                 assert!(!l.contains(banned), "{shown} names {banned}");
             }
