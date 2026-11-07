@@ -1112,12 +1112,15 @@ impl Ledger {
 /// that fetched nothing. Any other server error is not the agent's own.
 pub(crate) fn within(a: &FetchAccount, n: u64, failed: bool) -> bool {
     let q = a.requested;
-    let m = u64::from(a.largest);
+    // A restored account's `requested` is any u64 (the persisted ledger):
+    // an upper bound past `u64::MAX` takes nothing (not the agent's own,
+    // so reported).
+    let below = |n: u64| q.checked_add(u64::from(a.largest)).is_some_and(|b| n <= b);
     match a.end {
         FetchEnd::End => !failed && n == a.counted,
-        FetchEnd::Early => !failed && q <= n && n <= q + m,
-        FetchEnd::Lost => !failed && q.saturating_sub(u64::from(a.last)) <= n && n <= q + m,
-        FetchEnd::Failed | FetchEnd::Cancelled => failed && n <= q + m,
+        FetchEnd::Early => !failed && q <= n && below(n),
+        FetchEnd::Lost => !failed && q.saturating_sub(u64::from(a.last)) <= n && below(n),
+        FetchEnd::Failed | FetchEnd::Cancelled => failed && below(n),
         FetchEnd::NotRun => !failed && n == 0,
         FetchEnd::Error => false,
     }
@@ -1195,6 +1198,23 @@ mod tests {
             end,
             ..FetchAccount::default()
         }
+    }
+
+    /// A restored account's `requested` near `u64::MAX`: no overflow, and
+    /// an upper bound past it takes nothing (reported, not own).
+    #[test]
+    fn bounds_of_a_forged_account_do_not_overflow() {
+        for end in [FetchEnd::Early, FetchEnd::Lost] {
+            assert!(!within(&acc(end, 0, u64::MAX, 1, 64), u64::MAX, false));
+        }
+        for end in [FetchEnd::Failed, FetchEnd::Cancelled] {
+            assert!(!within(&acc(end, 0, u64::MAX, 1, u32::MAX), 0, true));
+        }
+        assert!(within(
+            &acc(FetchEnd::Early, 0, u64::MAX - 64, 1, 64),
+            u64::MAX,
+            false
+        ));
     }
 
     /// R35: full reads N = C; early closes Q <= N <= Q + M (M = 64);
