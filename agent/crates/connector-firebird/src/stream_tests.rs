@@ -3672,3 +3672,47 @@ fn unreserved_clause_words_as_columns_are_not_read_silently() {
         }
     }
 }
+
+/// The `firebird_checkpoint` fuzz crash (CI job 128413708621): a restored
+/// confirmed offset of `i64::MIN` overflowed `grid_offset`. Any `i64` is
+/// taken, and only an offset within the zones' range is on the grid.
+#[test]
+fn grid_offset_takes_any_i64() {
+    for o in [
+        i64::MIN,
+        i64::MIN + 1,
+        i64::MIN + 450,
+        i64::MAX,
+        i64::MAX - 1,
+        i64::MAX - 450,
+        -15 * 3600 - 1,
+        15 * 3600 + 1,
+        -15 * 3600,
+        15 * 3600,
+    ] {
+        assert_eq!(grid_offset(o), None, "{o}");
+        assert!(!plausible_offset(o), "{o}");
+    }
+    // The range's ends (a zone from +14 h to -12 h) and their drift.
+    assert_eq!(grid_offset(-14 * 3600 - 5), Some(-14 * 3600));
+    assert_eq!(grid_offset(12 * 3600 + 5), Some(12 * 3600));
+    assert_eq!(grid_offset(-14 * 3600 - 900), None);
+    assert_eq!(grid_offset(12 * 3600 + 900), None);
+}
+
+/// The crash input itself (base64 `9wAAAA…`), through the fuzz entry point:
+/// a restored body with a confirmed offset of `i64::MIN` is refused.
+#[cfg(feature = "fuzzing")]
+#[test]
+fn checkpoint_with_an_extreme_offset_does_not_panic() {
+    let mut data = vec![0u8; 120];
+    data[0] = 247;
+    data[16] = 2;
+    data[68] = 1;
+    data[69] = 0x80;
+    crate::fuzz::checkpoint(&data);
+    // `i64::MAX` in the same slot.
+    data[69] = 0x7f;
+    data[70..77].fill(0xff);
+    crate::fuzz::checkpoint(&data);
+}

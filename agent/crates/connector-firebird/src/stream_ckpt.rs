@@ -62,6 +62,9 @@ const MAX_AGE: Duration = Duration::from_secs(3600);
 const MAX_FAILED_PIDS: usize = 64;
 /// Open transactions per binding (as the live state keeps them).
 const MAX_OPEN_TRAS: usize = MAX_GROUPS_PER_BINDING * 4;
+/// The highest restored next binding sequence number (never reached: one
+/// per binding inserted).
+const MAX_NEXT_SEQ: u64 = u64::MAX >> 1;
 /// Every binding of every identity at its cap.
 const MAX_ALL_BINDINGS: usize = MAX_BINDINGS_DECLARED * 64 + MAX_BINDINGS_UNDECLARED * 16;
 
@@ -955,6 +958,11 @@ impl Restored {
     fn fill(&mut self, st: Decoded) -> Result<(), ()> {
         self.failed_pids = st.failed_pids;
         if unique_set(self.failed_pids.iter().copied())?.len() != self.failed_pids.len() {
+            return Err(());
+        }
+        // One sequence number per binding ever inserted: a restored value
+        // past `MAX_NEXT_SEQ` is forged (and would overflow).
+        if st.next_seq > MAX_NEXT_SEQ {
             return Err(());
         }
         self.next_seq = st.next_seq;
