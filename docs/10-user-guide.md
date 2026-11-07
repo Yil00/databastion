@@ -477,13 +477,13 @@ Every ancestor directory needs search (`x`) permission for the agent, and the fi
 | `coverage.file_path_refused` | Declare the real path (no symbolic link), give the file one hard link, keep side files owned by the application on the same file system, and do not declare the same file twice or a file under a refused location |
 | `coverage.network_filesystem_refused` | Move the file to a local file system; NFS, SMB, FUSE and the like are refused |
 | `coverage.reader_sandbox_unavailable` | Enable Landlock in the kernel; in a container, use Docker 25 or later or a seccomp profile that allows the `landlock_*` calls |
-| `coverage.unrecognized_file_format` | The file is not a SQLite 3 database the agent reads: encrypted (SQLCipher and the like are not supported), another file type, a corrupt schema or syntax newer than the bundled SQLite 3.53.2. Check that the path is the right file |
+| `coverage.unrecognized_file_format` | The file is not a SQLite 3 database the agent reads: encrypted (SQLCipher and the like are not supported), another file type, a corrupt schema or syntax newer than the bundled SQLite 3.54.1. Check that the path is the right file |
 | `coverage.wal_files_not_readable` | The application does not hold the WAL file open, or its `-wal` is above 128 MiB: the file is read while the application runs; checkpoint the WAL if it keeps growing |
 | `coverage.hot_journal_pending` | An interrupted write is waiting for the application to recover it at its next open; nothing to do on the agent's side |
 | `coverage.rollback_mode_not_read` | Expected with `rollback_mode: skip`; set `read` if the impact on the application's commits is acceptable |
 | `coverage.reader_process_failed` | The reader process died during the scan (count): the file may be crafted or its `-shm` truncated. Check the agent's log for the target; the agent and its other targets are not affected |
 | `security.file_world_readable` | Remove the "other" read bit from the database file |
-| `coverage.views_not_sampled`, `coverage.virtual_tables_not_sampled`, `coverage.computed_columns_not_sampled` | Information: these objects are never read (their base or shadow tables are) |
+| `coverage.views_not_sampled`, `coverage.virtual_tables_not_sampled`, `coverage.computed_columns_not_sampled` | Information: these objects are never read (their base or shadow tables are). On SQLite, `coverage.computed_columns_not_sampled` also counts columns whose `DEFAULT` or `STORED` expression uses a function outside the reader's list (a UUID default with `randomblob`, for example), and every such column of a table whose `CREATE TABLE` text is not valid UTF-8 (a Latin-1 literal); the table's other columns are read ([docs/08](08-engine-capabilities.md#what-is-not-read)) |
 | `check.timed_out` | A writer held its lock past the reader's busy timeout, or a statement hit `max_statement_ms`; it is retried at the next check |
 
 While a scan runs, the agent page shows the target's state from the last check before the scan: the scan's reader checks the file before every unit, but the console sees a change only after the scan.
