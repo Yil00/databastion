@@ -552,12 +552,15 @@ A new table needs a new grant (`coverage.relations_without_select` lists the tab
 - **After a kill** (SIGKILL, the OOM killer) during a check or a scan, the check's reads can be reported under the agent's account, or a statement of about the last second before the kill can be ambiguous.
 - **Never exclude the agent's account** from "every read" policies: the exclusion would also hide reads made with a stolen copy of its credential.
 
-**Level: Partial at best, never Full.** The target reaches Partial when all of these hold, and stays Limited otherwise (None before a record of a declared database is read):
+**Level: Partial at best, never Full.** The target reaches Partial when all of these hold, and stays Limited otherwise (None whenever no record of a declared database was parsed in the last 24 h):
 - the agent reads the trace log locally, and every enabled section that writes it has `max_log_size = 0` (see "Rotation" below);
 - the agent runs on the server's host, or, in a container, the host's identity files are declared and mounted read-only (below);
 - the readers check passes: only root, the server's account and the agent can read the log, its directory and its rotated files (below);
 - every trace setting below is present, the services section included, and the server was restarted after the configuration changed;
-- no gap and no ambiguous record in the last 24 h.
+- the server is not in Classic mode (Limited at best otherwise);
+- a recent read-back probe: the agent's own constant probe statement found in the log;
+- no gap and no ambiguous record in the last 24 h;
+- and the other proofs of [docs/08, Firebird Audit](08-engine-capabilities.md#firebird-audit).
 
 **Failed logins are not audited**: a wrong password writes no record of the target database, so every Firebird target with Audit shows `audit.failed_logins_not_audited`. The note does not lower the level. Watch failed logins on the host, outside DataBastion.
 
@@ -767,8 +770,8 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment). Upgrade commands for the Compose console and the `.deb` agent: [deploy/README.md](../deploy/README.md#agent-package-reference) ("Upgrade").
 
 From 0.9.x to **0.10.0** (console and agent; new engines SQLite and Firebird; one console migration, `0048`; the agent refuses PostgreSQL before 14 and MariaDB before 10.11; no grant added on any existing engine; the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)). Upgrade in this order:
-1. **Check the server versions.** A 0.10.0 agent refuses PostgreSQL 12 and 13 and MariaDB 10.6 at connection time: such a target shows as unreachable with the failure code `unsupported`, and nothing is sampled or audited. Upgrade those servers first, or keep the agent that monitors them on 0.9.x until then.
-2. **Back up the console database.** At its first start the 0.10.0 worker upgrades the pg-boss schema from 45 to 46, as the runtime role, as for earlier pg-boss upgrades.
+1. **Check the server versions.** A 0.10.0 agent refuses PostgreSQL 12 and 13 and MariaDB 10.6 at connection time: such a target shows as unreachable with the failure code `unsupported`, and nothing is sampled or audited. Upgrade those servers first, or keep the agent that monitors them on 0.9.x until then (0.9.x receives no security fixes once 0.10.0 is released).
+2. **Back up the console database.** At its first start the 0.10.0 worker upgrades the pg-boss schema from 45 to 46, as the runtime role, as for earlier pg-boss upgrades. After the first start, four `CREATE INDEX CONCURRENTLY` builds run in the background on `pgboss.job`; expect extra I/O on a large job table.
 3. **Every console replica and every worker.** `migrate` applies migration `0048` on start: one column with a constant default and a `CHECK` on `policy_exceptions`, which holds administrator-written rows only. With **several replicas**:
    - set `DATABASTION_AGENT_TOKENS_HOLD=0.9` on every web process of the new build before you roll it out;
    - check `databastion_console_agent_tokens_hold{release="0.9"} 1` on each replica's `/metrics`;
@@ -778,7 +781,7 @@ From 0.9.x to **0.10.0** (console and agent; new engines SQLite and Firebird; on
 4. **The agents**, once every replica and worker runs 0.10.0 and the hold is removed. Existing targets need no change: 0.9 `agent.yaml` files stay valid.
 5. **New SQLite targets** ([SQLite targets](#sqlite-targets)):
    - the reader needs **Landlock**: on a bare host, a kernel with Landlock enabled; in a container, Docker 25 or later, or a seccomp profile that allows the `landlock_*` calls. Otherwise the target reports `coverage.reader_sandbox_unavailable` and is not read;
-   - the agent's **systemd unit** now allows `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` and `seccomp` (`SystemCallFilter=`). A drop-in that resets `SystemCallFilter=` disables the reader, and one that restricts the filter must keep these four calls.
+   - the agent's **systemd unit** now allows `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` and `seccomp` (`SystemCallFilter=`). A drop-in that replaces the filter (`SystemCallFilter=` followed by its own list) must list these four calls, or the reader is disabled (fail closed: `coverage.reader_sandbox_unavailable`). Never leave `SystemCallFilter=` empty: that removes the whole filter, including the unit's `bind` / `listen` deny.
 6. **New Firebird targets** ([Firebird targets](#firebird-targets), [Firebird Audit](#firebird-audit)):
    - reached over **loopback only**; no other container may share the agent's and the server's network namespace unless every container there drops `NET_RAW` and `NET_ADMIN`;
    - keep `state_dir` on a persistent volume. Without the parser state kept there, an agent restart can withhold Partial for up to 24 h and report the agent's own recent reads under the agent's account; a kill during a check or a scan can do the same for that check, or make a statement of about the last second before the kill ambiguous. A restored pending routine read, and the re-read reads of a database whose check results changed while the agent was stopped, are reported as `*`. No read is hidden;
@@ -790,7 +793,7 @@ From 0.9.x to **0.10.0** (console and agent; new engines SQLite and Firebird; on
 
 **Building the agent from source** needs Rust 1.89 or later (1.88 before). The released `.deb` and images are not affected.
 
-Also after the upgrade: Audit settings on MySQL, MariaDB and MongoDB targets warn about a hand-typed sensitive object with a schema (`schema_warning`), which the agent never matches on those engines; and every log-file Audit source keeps the records read before a rotation whose new file cannot be opened, which earlier agents lost.
+Also after the upgrade: Audit settings on MySQL, MariaDB and MongoDB targets warn about a hand-typed sensitive object with a schema (`schema_warning`), which the agent never matches on those engines; and every log-file Audit source keeps the records read just before a log rotation whose new file cannot be opened, or before a read error, which earlier agents lost.
 
 From 0.8.x to **0.9.0** (console and agent; seven console migrations, `0041` to `0047`; new optional protocol fields negotiated per capability token; no grant added on any engine; the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)). Upgrade in this order:
 1. **Webhook receivers.** The `incident.opened` access payload gains `access.objects_overflowed`, so update the receivers that reject unknown keys before the console ([section 11](#11-policies-incidents-and-notifications)). `agent.target_mismatch`'s `details_count` can now reach 64.
