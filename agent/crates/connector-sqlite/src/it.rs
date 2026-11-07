@@ -1088,3 +1088,187 @@ fn a_column_name_that_is_not_utf8_never_reaches_the_authorizer() {
     ));
     assert_eq!(got.rows, 2);
 }
+
+/// ADR-0059 refinement of 2026-11-07 (SQLite 3.54): reading a column with
+/// a `DEFAULT` or a `STORED` generated expression sends that expression's
+/// function names to the authorizer at prepare time. A file whose columns
+/// use functions of the closed list (`SCHEMA_EXPR_FUNCTIONS`), in any
+/// case, is sampled as before; the values are the stored ones.
+#[test]
+fn listed_schema_expression_functions_are_sampled() {
+    let d = Dir::new("schema-expr-listed");
+    let p = d.path("e.db");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT,
+             email_lower TEXT GENERATED ALWAYS AS (Lower(email)) STORED,
+             created TEXT DEFAULT CURRENT_TIMESTAMP,
+             year TEXT DEFAULT (strftime('%Y', 'now')),
+             kind INTEGER GENERATED ALWAYS AS (iif(instr(email, '@') > 0, abs(-1), 0)) STORED,
+             label TEXT GENERATED ALWAYS AS (coalesce(nullif(trim(email), ''), 'none')) STORED,
+             upper_v TEXT GENERATED ALWAYS AS (upper(email)) VIRTUAL);
+         INSERT INTO t (email) VALUES ('Fake.One@Example.com'), (' Fake.Two@Example.org ');
+         ANALYZE;",
+    )
+    .unwrap();
+    drop(c);
+    let mut s = session(&p);
+    // The catalog, column and statistics statements are unchanged.
+    assert_eq!(
+        catalog(&mut s).iter().filter(|(_, n, _)| n == "t").count(),
+        1
+    );
+    let Response::Stats(stats) = s.handle(&Request::Stats) else {
+        panic!("stats")
+    };
+    assert!(
+        stats
+            .iter()
+            .any(|r| r.name.as_slice() == b"t" && r.rows == 2),
+        "{stats:?}"
+    );
+    let cols = columns(&mut s, "t");
+    assert!(cols.contains(&("email_lower".to_owned(), 3)));
+    assert!(cols.contains(&("upper_v".to_owned(), 2)));
+    // Bounds read no column: unchanged.
+    let r = s.handle(&Request::Bounds(z(b"t"), RowidAlias::Rowid));
+    assert_eq!(r, Response::Bounds(Some((1, 2))));
+    let cols = ["email", "email_lower", "created", "year", "kind", "label"];
+    let got = sampled(sample(
+        &mut s,
+        "t",
+        Some(RowidAlias::Rowid),
+        &cols,
+        SampleRange::From(1),
+        10,
+    ));
+    assert_eq!(got.rows, 2);
+    assert_eq!(
+        texts(&got, 1),
+        [
+            Some("fake.one@example.com".to_owned()),
+            Some(" fake.two@example.org ".to_owned())
+        ]
+    );
+    // `DEFAULT CURRENT_TIMESTAMP`: the value written at insert time
+    // (YYYY-MM-DD HH:MM:SS).
+    for v in texts(&got, 2) {
+        let v = v.unwrap();
+        assert_eq!(v.len(), 19, "{v}");
+        assert_eq!(&v[4..5], "-");
+    }
+    assert!(
+        texts(&got, 3)
+            .iter()
+            .all(|v| v.as_ref().is_some_and(|y| y.len() == 4))
+    );
+    assert_eq!(texts(&got, 4), [Some("1".to_owned()), Some("1".to_owned())]);
+    assert_eq!(
+        texts(&got, 5),
+        [
+            Some("Fake.One@Example.com".to_owned()),
+            Some("Fake.Two@Example.org".to_owned())
+        ]
+    );
+    // The plain read too.
+    let plain = sampled(sample(
+        &mut s,
+        "t",
+        None,
+        &cols,
+        SampleRange::Plain { reverse: false },
+        10,
+    ));
+    assert_eq!(plain.rows, 2);
+}
+
+/// A function off the list in a column's `DEFAULT` or `STORED` expression
+/// still makes every statement that reads that column refused (`auth`):
+/// random functions, extension loading (allowed in a `DEFAULT`, which
+/// SQLite does not resolve when it reads the schema), SQLite's own state,
+/// and an innocuous built-in that is not listed. Statements that do not
+/// read the column (the rowid bounds, a sample of other columns) and the
+/// catalog, column and statistics statements are unchanged. A function
+/// name that is not UTF-8 never reaches the authorizer (`name_not_utf8`).
+#[test]
+fn unlisted_schema_expression_functions_refuse_the_statement() {
+    use std::sync::atomic::Ordering;
+    let panics = authorizer_utf8_panics();
+    let d = Dir::new("schema-expr-unlisted");
+    let valid = "CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT)";
+    let cases: [(&str, &[u8], Code); 7] = [
+        (
+            "randomblob.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (lower(hex(randomblob(16)))))",
+            Code::Auth,
+        ),
+        (
+            "random.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (abs(random())))",
+            Code::Auth,
+        ),
+        (
+            "load_extension.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (load_extension('x')))",
+            Code::Auth,
+        ),
+        (
+            "sqlite_version.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (sqlite_version()))",
+            Code::Auth,
+        ),
+        (
+            "unknown.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (no_such_function(1)))",
+            Code::Auth,
+        ),
+        (
+            "quote_stored.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT GENERATED ALWAYS AS (quote(a)) STORED)",
+            Code::Auth,
+        ),
+        (
+            "non_utf8.db",
+            b"CREATE TABLE t (i INTEGER PRIMARY KEY, a TEXT, b TEXT DEFAULT (f\xff(1)))",
+            Code::NameNotUtf8,
+        ),
+    ];
+    for (file, schema, code) in cases {
+        let p = d.path(file);
+        non_utf8_schema(&p, valid, schema);
+        let before = panics.load(Ordering::SeqCst);
+        let mut s = session(&p);
+        assert_eq!(catalog(&mut s), vec![(false, "t".to_owned(), 2)], "{file}");
+        assert_eq!(columns(&mut s, "t").len(), 3, "{file}");
+        assert!(matches!(s.handle(&Request::Pragmas), Response::Pragmas(_)));
+        let r = s.handle(&Request::Bounds(z(b"t"), RowidAlias::Rowid));
+        assert_eq!(r, Response::Bounds(Some((1, 2))), "{file}");
+        for (alias, range) in [
+            (Some(RowidAlias::Rowid), SampleRange::From(1)),
+            (None, SampleRange::Plain { reverse: false }),
+        ] {
+            let r = sample(&mut s, "t", alias, &["a", "b"], range, 5);
+            assert!(
+                matches!(&r, Response::Failed(f) if f.code == code),
+                "{file}: {r:?}"
+            );
+            // Another column only: its read authorizes no expression.
+            let r = sample(&mut s, "t", alias, &["a"], range, 5);
+            if code == Code::NameNotUtf8 {
+                // The DEFAULT texts are checked for the whole table.
+                assert!(
+                    matches!(&r, Response::Failed(f) if f.code == code),
+                    "{file}: {r:?}"
+                );
+            } else {
+                assert_eq!(sampled(r).rows, 2, "{file}");
+            }
+        }
+        assert_eq!(
+            panics.load(Ordering::SeqCst),
+            before,
+            "{file}: authorizer panic"
+        );
+    }
+}

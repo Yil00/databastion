@@ -229,6 +229,11 @@ fn sqlite_code(extended: i32, message: Option<&str>) -> Code {
             Some(m) if m.starts_with("no such table") => Code::NoSuchTable,
             Some(m) if m.starts_with("no such column") => Code::NoRowid,
             Some(m) if m.starts_with("malformed database schema") => Code::UnrecognizedFormat,
+            // A function of a column's DEFAULT or STORED expression denied
+            // by the authorizer (`sqlite3FuncAuth`, SQLite 3.54+: plain
+            // SQLITE_ERROR, not SQLITE_AUTH; ADR-0059 refinement of
+            // 2026-11-07).
+            Some(m) if m.starts_with("not authorized to use function") => Code::Auth,
             _ => Code::Internal,
         },
         _ => Code::Internal,
@@ -306,6 +311,24 @@ fn install_authorizer(
         }
     }))
     .map_err(map_error)
+}
+
+/// The schema texts `Db::schema_texts_are_utf8` checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Utf8Texts {
+    /// Every column name (a statement naming the rowid).
+    names: bool,
+    /// Every `DEFAULT` expression text (a sampling statement).
+    defaults: bool,
+}
+
+impl Utf8Texts {
+    /// The rowid-bounds statement: names only (it reads no column, so no
+    /// column expression is authorized).
+    const ROWID: Self = Self {
+        names: true,
+        defaults: false,
+    };
 }
 
 /// An open, set-up connection to one declared file.
@@ -579,35 +602,57 @@ impl Db {
         out
     }
 
-    /// Before a statement that reads the rowid of `table`: every column
-    /// name of the table (`table_xinfo`, hidden columns included) must be
-    /// valid UTF-8, or [`Code::NameNotUtf8`].
+    /// Before a statement that reads `table`: the schema texts of the table
+    /// that SQLite can hand to the authorizer must be valid UTF-8, or
+    /// [`Code::NameNotUtf8`]. From `table_xinfo` (hidden columns included):
+    /// every column name when `texts.names` (a statement naming the rowid),
+    /// every `DEFAULT` expression text when `texts.defaults` (a sampling
+    /// statement).
     ///
-    /// When a statement names the rowid of a table that has an `INTEGER
-    /// PRIMARY KEY` column, SQLite hands that column's name, as stored in
-    /// the file's schema, to the authorizer (`sqlite3AuthRead`), and
-    /// `rusqlite`'s authorizer hook converts it with a panic on invalid
-    /// UTF-8 (0.40.2 and 0.41.1; no bytes variant). That panic is caught by
-    /// `rusqlite` and read by SQLite as `SQLITE_DENY` (so the statement is
-    /// refused, never allowed), but it would abort a process whose panic
-    /// hook aborts (a fuzz target) and report a hostile file as an
-    /// authorizer bug. The columns the reader's statements name are always
-    /// valid UTF-8 ([`sql::quote`]), and SQLite matches them only to a
-    /// stored name equal but for ASCII case, so the rowid alias is the only
-    /// name from the file the authorizer can receive; every column is
-    /// checked, not only the primary key's, so the rule does not depend on
-    /// which column SQLite takes as the alias.
+    /// `rusqlite`'s authorizer hook converts each string argument with a
+    /// panic on invalid UTF-8 (0.40.2 and 0.41.1; no bytes variant). That
+    /// panic is caught by `rusqlite` and read by SQLite as `SQLITE_DENY` (so
+    /// the statement is refused, never allowed), but it would abort a
+    /// process whose panic hook aborts (a fuzz target) and report a hostile
+    /// file as an authorizer bug. Two texts of the file reach the
+    /// authorizer:
+    ///
+    /// - When a statement names the rowid of a table that has an `INTEGER
+    ///   PRIMARY KEY` column, SQLite hands that column's name, as stored in
+    ///   the file's schema, to the authorizer (`sqlite3AuthRead`). The
+    ///   columns the reader's statements name are always valid UTF-8
+    ///   ([`sql::quote`]), and SQLite matches them only to a stored name
+    ///   equal but for ASCII case, so the rowid alias is the only name from
+    ///   the file the authorizer can receive there; every column is checked,
+    ///   not only the primary key's, so the rule does not depend on which
+    ///   column SQLite takes as the alias.
+    /// - Since SQLite 3.54, reading a column with a `DEFAULT` or a `STORED`
+    ///   generated expression hands every function name of that expression,
+    ///   as written in the schema, to the authorizer (`sqlite3ColumnExprAuth`,
+    ///   ADR-0059 refinement of 2026-11-07). A `DEFAULT` expression is not
+    ///   resolved when the schema is read, so it can name any function,
+    ///   including one whose name is not UTF-8; `table_xinfo` gives its
+    ///   text as written (`dflt_value`), and a function name is a part of
+    ///   that text. A generated expression is resolved when the schema is
+    ///   read: each function it names is a registered function (an ASCII
+    ///   name), or the schema does not load, so it needs no check (and
+    ///   `table_xinfo` does not give its text).
     ///
     /// It runs under the deadline its caller armed for the whole request
     /// (`arm_deadline`), never one of its own.
     ///
-    /// Residual race (fail closed): the application can rename a column to
-    /// such a name between this check and the prepare of the rowid
-    /// statement. The panic is then caught as above and the statement is
-    /// denied (`SQLITE_AUTH`); `after_rowid_statement` checks the names
-    /// once more and reports [`Code::NameNotUtf8`] rather than
-    /// [`Code::Auth`] when it finds such a name.
-    fn rowid_names_are_utf8(&self, table: &[u8], name: &str) -> Result<(), Failure> {
+    /// Residual race (fail closed): the application can change the schema
+    /// to such a text between this check and the prepare of the statement.
+    /// The panic is then caught as above and the statement is denied
+    /// (`SQLITE_AUTH`); `after_read_statement` checks the texts once more
+    /// and reports [`Code::NameNotUtf8`] rather than [`Code::Auth`] when it
+    /// finds such a text.
+    fn schema_texts_are_utf8(
+        &self,
+        table: &[u8],
+        name: &str,
+        texts: Utf8Texts,
+    ) -> Result<(), Failure> {
         let text = sql::columns(table).ok_or_else(|| Failure::new(Code::Internal))?;
         self.set_template(Template::Columns(name.to_owned()));
         let out = (|| {
@@ -619,9 +664,20 @@ impl Db {
                 if n > MAX_TABLE_COLUMNS {
                     return Err(Failure::new(Code::TooBig));
                 }
-                match row.get_ref(1).map_err(map_error)? {
-                    ValueRef::Text(t) if std::str::from_utf8(t).is_ok() => {}
-                    _ => return Err(Failure::new(Code::NameNotUtf8)),
+                if texts.names {
+                    match row.get_ref(1).map_err(map_error)? {
+                        ValueRef::Text(t) if std::str::from_utf8(t).is_ok() => {}
+                        _ => return Err(Failure::new(Code::NameNotUtf8)),
+                    }
+                }
+                if texts.defaults {
+                    match row.get_ref(4).map_err(map_error)? {
+                        ValueRef::Text(t) if std::str::from_utf8(t).is_err() => {
+                            return Err(Failure::new(Code::NameNotUtf8));
+                        }
+                        ValueRef::Blob(_) => return Err(Failure::new(Code::NameNotUtf8)),
+                        _ => {}
+                    }
                 }
             }
             Ok(())
@@ -632,7 +688,7 @@ impl Db {
 
     /// `min` / `max` of the rowid; [`Code::NoRowid`] for a `WITHOUT ROWID`
     /// table, [`Code::NameNotUtf8`] for a table with a column name that is
-    /// not UTF-8 (`rowid_names_are_utf8`).
+    /// not UTF-8 (`schema_texts_are_utf8`).
     ///
     /// # Errors
     /// The mapped failure.
@@ -640,8 +696,8 @@ impl Db {
         let text = sql::bounds(table, alias).ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(table).map_err(|_| Failure::new(Code::Internal))?;
         self.arm_deadline();
-        self.rowid_names_are_utf8(table, name)?;
-        self.set_template(Template::Read(name.to_owned()));
+        self.schema_texts_are_utf8(table, name, Utf8Texts::ROWID)?;
+        self.set_template(Template::Bounds(name.to_owned()));
         let out = self
             .conn
             .query_row(&text, [], |r| {
@@ -652,30 +708,35 @@ impl Db {
             })
             .map_err(map_error);
         self.disarm();
-        self.after_rowid_statement(out, table, name)
+        self.after_read_statement(out, table, name, Utf8Texts::ROWID)
     }
 
-    /// After a rowid statement whose names passed `rowid_names_are_utf8`:
-    /// a denial (`Code::Auth`) is checked once more, under the same
-    /// deadline, and reported as [`Code::NameNotUtf8`] when a column name
-    /// is no longer valid UTF-8 (the application renamed it in between).
-    fn after_rowid_statement<T>(
+    /// After a statement whose texts passed `schema_texts_are_utf8`: a
+    /// denial (`Code::Auth`) is checked once more, under the same deadline,
+    /// and reported as [`Code::NameNotUtf8`] when a checked text is no
+    /// longer valid UTF-8 (the application changed the schema in between).
+    fn after_read_statement<T>(
         &self,
         out: Result<T, Failure>,
         table: &[u8],
         name: &str,
+        texts: Utf8Texts,
     ) -> Result<T, Failure> {
         match out {
-            Err(f) if f.code == Code::Auth => match self.rowid_names_are_utf8(table, name) {
-                Err(g) if g.code == Code::NameNotUtf8 => Err(g),
-                _ => Err(f),
-            },
+            Err(f) if f.code == Code::Auth => {
+                match self.schema_texts_are_utf8(table, name, texts) {
+                    Err(g) if g.code == Code::NameNotUtf8 => Err(g),
+                    _ => Err(f),
+                }
+            }
             other => other,
         }
     }
 
     /// One sampling statement of decision 5's closed list; one by the
-    /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is.
+    /// rowid is refused with [`Code::NameNotUtf8`] as [`Db::bounds`] is,
+    /// and every one when a column's `DEFAULT` text is not valid UTF-8
+    /// (`schema_texts_are_utf8`).
     ///
     /// # Errors
     /// The mapped failure.
@@ -684,9 +745,11 @@ impl Db {
             .ok_or_else(|| Failure::new(Code::Internal))?;
         let name = std::str::from_utf8(&req.table).map_err(|_| Failure::new(Code::Internal))?;
         self.arm_deadline();
-        if req.alias.is_some() {
-            self.rowid_names_are_utf8(&req.table, name)?;
-        }
+        let texts = Utf8Texts {
+            names: req.alias.is_some(),
+            defaults: true,
+        };
+        self.schema_texts_are_utf8(&req.table, name, texts)?;
         let reverse = matches!(req.range, SampleRange::Plain { reverse: true });
         self.conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, reverse)
@@ -753,10 +816,7 @@ impl Db {
         let _ = self
             .conn
             .set_db_config(DbConfig::SQLITE_DBCONFIG_REVERSE_SCANORDER, false);
-        if req.alias.is_some() {
-            return self.after_rowid_statement(out, &req.table, name);
-        }
-        out
+        self.after_read_statement(out, &req.table, name, texts)
     }
 
     /// The check pragmas.
@@ -920,6 +980,27 @@ fn first_integer(stat: &[u8]) -> Option<u64> {
 pub(crate) mod tests {
     use super::*;
 
+    /// ADR-0059 refinement of 2026-11-07: SQLite 3.54 reports a function of
+    /// a column's `DEFAULT` or `STORED` expression denied by the authorizer
+    /// as `SQLITE_ERROR` with this message; it is mapped to `auth` (and so
+    /// rechecked by `after_read_statement`), other errors are not.
+    #[test]
+    fn a_denied_schema_expression_function_is_auth() {
+        assert_eq!(
+            sqlite_code(
+                rc::ERROR,
+                Some("not authorized to use function: randomblob(16)")
+            ),
+            Code::Auth
+        );
+        assert_eq!(sqlite_code(rc::AUTH, Some("not authorized")), Code::Auth);
+        assert_eq!(
+            sqlite_code(rc::ERROR, Some("near \"x\": syntax error")),
+            Code::Internal
+        );
+        assert_eq!(sqlite_code(rc::ERROR, None), Code::Internal);
+    }
+
     /// Review L1 of #423: the names check and the rowid statement of one
     /// request share one deadline (armed once), in bounds and in a rowid
     /// sample; review L2: a denial after a passed check is reported as
@@ -955,12 +1036,15 @@ pub(crate) mod tests {
         // A denial with valid names stays `auth`; other results pass.
         let auth = || Err::<(), _>(Failure::new(Code::Auth));
         assert_eq!(
-            db.after_rowid_statement(auth(), b"t", "t")
+            db.after_read_statement(auth(), b"t", "t", Utf8Texts::ROWID)
                 .unwrap_err()
                 .code,
             Code::Auth
         );
-        assert_eq!(db.after_rowid_statement(Ok(3), b"t", "t"), Ok(3));
+        assert_eq!(
+            db.after_read_statement(Ok(3), b"t", "t", Utf8Texts::ROWID),
+            Ok(3)
+        );
         assert_eq!(sets(), before + 2);
         let bad = d.path("bad.db");
         crate::it::non_utf8_schema(
@@ -970,7 +1054,7 @@ pub(crate) mod tests {
         );
         let db = open(&bad, 60_000, || Ok(())).unwrap();
         assert_eq!(
-            db.after_rowid_statement(auth(), b"t", "t")
+            db.after_read_statement(auth(), b"t", "t", Utf8Texts::ROWID)
                 .unwrap_err()
                 .code,
             Code::NameNotUtf8

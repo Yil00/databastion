@@ -1,4 +1,4 @@
-"""Writes four seed inputs of the sqlite_file fuzz target (ADR-0059), fake values only:
+"""Writes five seed inputs of the sqlite_file fuzz target (ADR-0059), fake values only:
 
 - OUT: a small SQLite file in rollback mode, as the target's first length-prefixed part;
 - OUT-wal: a WAL file set (the main file, its -wal and the start of its -shm, saved while a
@@ -17,6 +17,9 @@
 - OUT-names: a small file whose schema text names its INTEGER PRIMARY KEY column with a byte
   that is not valid UTF-8 (fuzz nightly run 42322811219: rusqlite's authorizer conversion
   panicked on that name when a statement named the rowid).
+- OUT-exprs: a small file whose columns have DEFAULT and STORED generated expressions, listed
+  (lower, CURRENT_TIMESTAMP) and not (randomblob), which SQLite 3.54 sends to the authorizer
+  when a sampling statement reads them (ADR-0059 refinement of 2026-11-07).
 
     python3 -I sqlite_seed.py OUT
 """
@@ -52,6 +55,8 @@ def main(out: str) -> None:
         f.write(wal_page_size_zero())
     with open(out + "-names", "wb") as f:
         f.write(part(non_utf8_names()))
+    with open(out + "-exprs", "wb") as f:
+        f.write(part(schema_exprs()))
 
 
 # The -shm bytes kept: the two copies of the WAL index header and the checkpoint info (136
@@ -130,6 +135,25 @@ def non_utf8_names() -> bytes:
         c.close()
         return open(path, "rb").read()
 
+
+
+def schema_exprs() -> bytes:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "exprs.db")
+        c = sqlite3.connect(path, isolation_level=None)
+        c.executescript(
+            """
+            PRAGMA page_size = 512;
+            PRAGMA journal_mode = DELETE;
+            CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT,
+                low TEXT GENERATED ALWAYS AS (lower(email)) STORED,
+                created TEXT DEFAULT CURRENT_TIMESTAMP,
+                token TEXT DEFAULT (hex(randomblob(4))));
+            INSERT INTO t (email) VALUES ('Fake@Example.com');
+            """
+        )
+        c.close()
+        return open(path, "rb").read()
 
 if __name__ == "__main__":
     main(sys.argv[1])

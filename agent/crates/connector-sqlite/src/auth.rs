@@ -10,9 +10,25 @@
 //!   `sqlite_schema` (or `sqlite_master`) for the catalog only,
 //!   `sqlite_stat1` for the statistics only.
 //! - `SQLITE_FUNCTION` only for `typeof`, `octet_length`, `substr`, `min`,
-//!   `max` (and, on the self-check's in-memory connection only,
-//!   `sqlite_version` and `sqlite_source_id`), compared
+//!   `max` under the sampling template, `min` and `max` under the
+//!   rowid-bounds template, and, on the self-check's in-memory connection
+//!   only, `sqlite_version` and `sqlite_source_id`; compared
 //!   ASCII-case-insensitively.
+//! - Under the sampling template only, also the closed list
+//!   [`SCHEMA_EXPR_FUNCTIONS`] (ADR-0059 refinement of 2026-11-07): since
+//!   SQLite 3.54, reading a column that has a `DEFAULT` or a `STORED`
+//!   generated expression sends every function name of that expression to
+//!   the authorizer while the statement is prepared
+//!   (`sqlite3ColumnExprAuth`, called from `sqlite3ColumnDefault`). SQLite
+//!   only authorizes those names there: the expression is turned into a
+//!   value by `sqlite3ValueFromExpr` without a function context, so no
+//!   function is run (a `STORED` value is read from the record, a
+//!   `DEFAULT` one is used only for rows written before an `ALTER TABLE ...
+//!   ADD COLUMN`, which allows only constant defaults). The callback cannot
+//!   tell such a call from a call in the statement text (both are
+//!   `SQLITE_FUNCTION` with no table, database or trigger / view name), but
+//!   the statement texts are fixed and call only the five functions above,
+//!   so any other name can only come from the file's schema.
 //! - `SQLITE_PRAGMA` only for `table_xinfo` with an argument (the current
 //!   table) and `journal_mode`, `schema_version`, `page_size`, `encoding`,
 //!   `trusted_schema`, `compile_options` without one, compared
@@ -33,7 +49,11 @@ pub enum Template {
     Stats,
     /// `table_xinfo` of this table.
     Columns(String),
-    /// Rowid bounds or sampling of this table.
+    /// Rowid bounds of this table (`min` / `max` of the rowid only: the
+    /// rowid is read with `OP_Rowid`, so no column expression is
+    /// authorized).
+    Bounds(String),
+    /// Sampling of this table.
     Read(String),
     /// One check pragma, by name.
     Pragma(&'static str),
@@ -66,8 +86,62 @@ pub enum Action<'a> {
     Other,
 }
 
-/// Functions the reader's statements call.
+/// Functions the sampling statements call.
 const FUNCTIONS: [&str; 5] = ["typeof", "octet_length", "substr", "min", "max"];
+/// Functions the rowid-bounds statement calls.
+const BOUNDS_FUNCTIONS: [&str; 2] = ["min", "max"];
+/// Built-in functions a column's `DEFAULT` or `STORED` generated expression
+/// may name, authorized (never run) under the sampling template only
+/// (ADR-0059 refinement of 2026-11-07). Each is registered by SQLite 3.54.1
+/// without `SQLITE_FUNC_UNSAFE` or `SQLITE_DIRECTONLY` (innocuous: usable in
+/// the schema under `TRUSTED_SCHEMA=0`), reads no file, environment or
+/// memory beyond its arguments, and is not random. `->` and `->>` are the
+/// names SQLite gives the JSON operators; `CURRENT_DATE`, `CURRENT_TIME`
+/// and `CURRENT_TIMESTAMP` reach the authorizer as functions of those
+/// names. `random`, `randomblob`, `load_extension`, `sqlite_*`,
+/// `changes`-style connection functions and any name outside this list
+/// stay refused: the statement fails with `auth` and the table is not
+/// sampled.
+pub const SCHEMA_EXPR_FUNCTIONS: [&str; 33] = [
+    // Date and time.
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "date",
+    "time",
+    "datetime",
+    "julianday",
+    "unixepoch",
+    "strftime",
+    // Text.
+    "lower",
+    "upper",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "substring",
+    "replace",
+    "instr",
+    "length",
+    "printf",
+    "format",
+    "hex",
+    "concat",
+    "concat_ws",
+    // NULL handling and conditions.
+    "coalesce",
+    "ifnull",
+    "nullif",
+    "iif",
+    "if",
+    // Numbers.
+    "abs",
+    "round",
+    // JSON.
+    "json_extract",
+    "->",
+    "->>",
+];
 /// Functions of the self-check statement only.
 const SELF_FUNCTIONS: [&str; 2] = ["sqlite_version", "sqlite_source_id"];
 /// Pragmas read without an argument, with the template allowing each.
@@ -98,13 +172,17 @@ pub fn allowed(template: &Template, action: Action<'_>, database: Option<&str>) 
         Action::Read { table } => match template {
             Template::Catalog => eq(table, "sqlite_schema") || eq(table, "sqlite_master"),
             Template::Stats => eq(table, "sqlite_stat1"),
-            Template::Read(t) => {
+            Template::Read(t) | Template::Bounds(t) => {
                 eq(table, t) && !eq(table, "sqlite_schema") && !eq(table, "sqlite_master")
             }
             _ => false,
         },
         Action::Function { name } => match template {
-            Template::Read(_) => FUNCTIONS.iter().any(|f| eq(name, f)),
+            Template::Read(_) => {
+                FUNCTIONS.iter().any(|f| eq(name, f))
+                    || SCHEMA_EXPR_FUNCTIONS.iter().any(|f| eq(name, f))
+            }
+            Template::Bounds(_) => BOUNDS_FUNCTIONS.iter().any(|f| eq(name, f)),
             Template::SelfCheck => SELF_FUNCTIONS.iter().any(|f| eq(name, f)),
             _ => false,
         },
@@ -267,6 +345,101 @@ mod tests {
         assert!(!allowed(&Template::None, Action::Select, None));
     }
 
+    /// ADR-0059 refinement of 2026-11-07: the schema-expression list is
+    /// allowed under the sampling template only, in any ASCII case; names
+    /// off the list (random, extension loading, SQLite's own state) stay
+    /// refused there.
+    #[test]
+    fn schema_expression_functions_under_the_sampling_template_only() {
+        let read = Template::Read("t".into());
+        for f in SCHEMA_EXPR_FUNCTIONS {
+            assert!(allowed(&read, Action::Function { name: f }, None), "{f}");
+            let upper = f.to_ascii_uppercase();
+            assert!(
+                allowed(&read, Action::Function { name: &upper }, None),
+                "{upper}"
+            );
+        }
+        for f in [
+            "random",
+            "randomblob",
+            "load_extension",
+            "sqlite_version",
+            "sqlite_source_id",
+            "sqlite_compileoption_get",
+            "sqlite_offset",
+            "readfile",
+            "writefile",
+            "fts3_tokenizer",
+            "changes",
+            "last_insert_rowid",
+            "zeroblob",
+            "quote",
+            "unknown",
+            "lower ",
+            "",
+        ] {
+            assert!(!allowed(&read, Action::Function { name: f }, None), "{f}");
+        }
+        // None of the listed names is a base function, a self-check
+        // function or a name with characters SQLite's tokenizer would not
+        // give a function (besides the JSON operators).
+        for f in SCHEMA_EXPR_FUNCTIONS {
+            assert!(
+                !FUNCTIONS.contains(&f) && !SELF_FUNCTIONS.contains(&f),
+                "{f}"
+            );
+            assert!(
+                f == "->" || f == "->>" || f.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{f}"
+            );
+        }
+    }
+
+    /// The other templates are unchanged by the refinement: catalog,
+    /// columns, statistics, check pragmas and the self-check allow no
+    /// schema-expression function, and the rowid bounds only `min` and
+    /// `max`.
+    #[test]
+    fn the_other_templates_are_unchanged() {
+        let others = [
+            Template::None,
+            Template::SelfCheck,
+            Template::Catalog,
+            Template::Stats,
+            Template::Columns("t".into()),
+            Template::Bounds("t".into()),
+            Template::Pragma("journal_mode"),
+        ];
+        for t in &others {
+            for f in SCHEMA_EXPR_FUNCTIONS {
+                assert!(!allowed(t, Action::Function { name: f }, None), "{t:?} {f}");
+            }
+        }
+        for t in &others[..5] {
+            for f in FUNCTIONS {
+                assert!(!allowed(t, Action::Function { name: f }, None), "{t:?} {f}");
+            }
+        }
+        let bounds = Template::Bounds("t".into());
+        assert!(allowed(&bounds, Action::Function { name: "MIN" }, None));
+        assert!(allowed(&bounds, Action::Function { name: "max" }, None));
+        for f in ["typeof", "octet_length", "substr", "sqlite_version"] {
+            assert!(!allowed(&bounds, Action::Function { name: f }, None), "{f}");
+        }
+        assert!(allowed(&bounds, Action::Select, None));
+        assert!(allowed(&bounds, Action::Read { table: "t" }, Some("main")));
+        assert!(!allowed(&bounds, Action::Read { table: "u" }, Some("main")));
+        assert!(!allowed(
+            &Template::Bounds("sqlite_schema".into()),
+            Action::Read {
+                table: "sqlite_schema"
+            },
+            Some("main")
+        ));
+        assert!(!allowed(&bounds, Action::Other, Some("main")));
+    }
+
     fn template() -> impl Strategy<Value = Template> {
         prop_oneof![
             Just(Template::None),
@@ -274,6 +447,7 @@ mod tests {
             Just(Template::Catalog),
             Just(Template::Stats),
             "[a-zA-Z_]{1,8}".prop_map(Template::Columns),
+            "[a-zA-Z_]{1,8}".prop_map(Template::Bounds),
             "[a-zA-Z_]{1,8}".prop_map(Template::Read),
             prop::sample::select(PRAGMAS.to_vec()).prop_map(Template::Pragma),
         ]
@@ -297,6 +471,8 @@ mod tests {
             kind in 0u8..5,
             name in prop_oneof![
                 mixed_case("typeof"), mixed_case("substr"), mixed_case("load_extension"),
+                mixed_case("lower"), mixed_case("current_timestamp"), mixed_case("randomblob"),
+                Just("->>".to_owned()),
                 mixed_case("sqlite_master"), mixed_case("sqlite_stat1"), mixed_case("table_xinfo"),
                 mixed_case("journal_mode"), mixed_case("writable_schema"), "[a-zA-Z_]{1,8}",
             ],
@@ -318,14 +494,18 @@ mod tests {
                 let lower = name.to_ascii_lowercase();
                 match action {
                     Action::Function { .. } => prop_assert!(
-                        FUNCTIONS.contains(&lower.as_str())
+                        (matches!(t, Template::Read(_))
+                            && (FUNCTIONS.contains(&lower.as_str())
+                                || SCHEMA_EXPR_FUNCTIONS.contains(&lower.as_str())))
+                            || (matches!(t, Template::Bounds(_))
+                                && BOUNDS_FUNCTIONS.contains(&lower.as_str()))
                             || (t == Template::SelfCheck && SELF_FUNCTIONS.contains(&lower.as_str()))
                     ),
                     Action::Pragma { arg, .. } => {
                         prop_assert!(lower == "table_xinfo" || PRAGMAS.contains(&lower.as_str()));
                         prop_assert_eq!(lower == "table_xinfo", arg.is_some());
                     }
-                    Action::Read { .. } => prop_assert!(matches!(t, Template::Read(_) | Template::Catalog | Template::Stats)),
+                    Action::Read { .. } => prop_assert!(matches!(t, Template::Read(_) | Template::Bounds(_) | Template::Catalog | Template::Stats)),
                     _ => {}
                 }
             }
