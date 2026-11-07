@@ -105,3 +105,11 @@ print_stderr = "warn"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# An integer overflow panics instead of wrapping silently (maintainer
+# decision of 2026-11-07, after the fuzz finding of #429). The panic is
+# contained where it lands (`databastion_core::panics`: `guard` around every
+# connector call, `isolate` around each Audit record, the SQLite reader in
+# its own process); intended wrapping is written `wrapping_*`. The panic
+# strategy stays `unwind` (the default): `catch_unwind` needs it. `bench`
+# inherits this; the fuzz workspace (fuzz/Cargo.toml) has its own profile.
+overflow-checks = true

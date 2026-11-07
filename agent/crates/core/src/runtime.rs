@@ -2072,8 +2072,14 @@ impl Runtime {
                         Vec::new()
                     }
                 };
-                let left_out = u64::try_from(batch.len()).unwrap_or(u64::MAX)
-                    - u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>()).unwrap_or(0);
+                // Saturating: the core runtime is not panic-isolated, so a
+                // miscount here must not stop the agent (overflow checks).
+                let left_out = u64::try_from(batch.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(
+                        u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>())
+                            .unwrap_or(0),
+                    );
                 if self
                     .lock_spool()
                     .replace(&key, &rest, left_out)
