@@ -388,7 +388,8 @@ const MAX_STATE_BYTES: usize = 16 << 20;
 
 impl Part {
     fn add(&mut self, m: Member) {
-        self.count += 1;
+        // A restored part's count is any u64 (a checkpoint): saturated.
+        self.count = self.count.saturating_add(1);
         let keep = |v: &mut Vec<String>, o: String, overflow: &mut bool, bytes: &mut usize| {
             if v.contains(&o) {
                 return;
@@ -1099,7 +1100,7 @@ impl Machine {
             file: self.file,
             off: g.first,
             group: true,
-            members: g.full.count + g.bare.count,
+            members: g.full.count.saturating_add(g.bare.count),
             last: g.last,
         }
     }
@@ -1542,7 +1543,8 @@ impl Machine {
 
     fn insert_binding(&mut self, key: Key, mut b: Binding) {
         b.seq = self.next_seq;
-        self.next_seq += 1;
+        // Bounded at import (`MAX_NEXT_SEQ`); saturated all the same.
+        self.next_seq = self.next_seq.saturating_add(1);
         if !b.anchored || matches!(key.0, DbId::Undeclared(_)) {
             self.evictable.push_back((b.seq, key));
         }
@@ -2217,7 +2219,7 @@ impl Machine {
     /// confirms a change of more than an hour, item 3).
     fn confirm_offset(&mut self, key: Key, by_probe: bool, measured: Option<i64>) {
         if let Some((o, k, needs_probe)) = self.offset_pending
-            && measured.is_some_and(|m| (m - o).abs() <= 5)
+            && measured.is_some_and(|m| m.abs_diff(o) <= 5)
             && (by_probe || (k == key && !needs_probe))
         {
             self.offset_from = Some((k, key, self.offset));
@@ -2229,7 +2231,7 @@ impl Machine {
     /// A record's time: the printed time with `offset`, bounded by the
     /// observation (not later than now plus 5 s, R42 item 5).
     fn record_time(&self, t: LogTime, offset: Option<i64>) -> SystemTime {
-        let naive = naive_seconds(t) + offset.unwrap_or(0);
+        let naive = naive_seconds(t).saturating_add(offset.unwrap_or(0));
         let printed = u64::try_from(naive)
             .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s))
             .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -2328,7 +2330,7 @@ impl Machine {
     /// server's local time).
     fn time(&self, t: LogTime) -> SystemTime {
         let naive = naive_seconds(t);
-        let secs = naive + self.offset.unwrap_or(0);
+        let secs = naive.saturating_add(self.offset.unwrap_or(0));
         let base = SystemTime::UNIX_EPOCH;
         let frac = Duration::from_micros(u64::from(t.frac) * 100);
         match u64::try_from(secs) {
@@ -3415,7 +3417,8 @@ impl Machine {
                     .opened(&label, id)
                     .and_then(|o| o.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .and_then(|d| i64::try_from(d.as_secs()).ok())
-                    .and_then(|agent| grid_offset(agent - naive_seconds(rec.header.time)));
+                    .and_then(|agent| agent.checked_sub(naive_seconds(rec.header.time)))
+                    .and_then(grid_offset);
                 // R42 item 5: the attachment's lifetime holds the record's
                 // time (this attach's offset, else the confirmed one).
                 let t = self.record_time(rec.header.time, measured.or(self.offset));
@@ -4426,7 +4429,8 @@ impl Machine {
             .opened(&label, key.1)
             .and_then(|o| o.duration_since(SystemTime::UNIX_EPOCH).ok())
             .and_then(|d| i64::try_from(d.as_secs()).ok())
-            .and_then(|agent| grid_offset(agent - naive_seconds(time)));
+            .and_then(|agent| agent.checked_sub(naive_seconds(time)))
+            .and_then(grid_offset);
         let t = self.record_time(time, measured.or(self.offset));
         if self.ledger.is_own_attach(&label, key.1, port, Some(t)) {
             self.watermark.entry(i).or_insert(key.1);
@@ -4445,7 +4449,9 @@ impl Machine {
         if let Some(o) = measured
             && !self.offset_pending.is_some_and(|p| p.2)
         {
-            let needs_probe = self.offset.is_some_and(|cur| (o - cur).abs() > OFFSET_STEP);
+            let needs_probe = self
+                .offset
+                .is_some_and(|cur| o.abs_diff(cur) > OFFSET_STEP.unsigned_abs());
             if needs_probe {
                 // R42 item 3: the probe re-confirms it.
                 self.check_requested = true;
@@ -4528,7 +4534,8 @@ impl Machine {
         let probe = text == crate::sql::READ_BACK_PROBE;
         if probe {
             let n = self.probe_records.entry(key).or_insert(0);
-            *n += 1;
+            // A restored count is any u32 (a checkpoint): saturated.
+            *n = n.saturating_add(1);
             if *n > 1 {
                 if let Some(b) = self.bindings.get_mut(&key) {
                     b.poisoned = true;
@@ -4576,7 +4583,7 @@ impl Machine {
                     .consumed_time((self.file, pos))
                     .and_then(|c| c.duration_since(SystemTime::UNIX_EPOCH).ok())
                     .and_then(|d| i64::try_from(d.as_secs()).ok())
-                    .map(|c| c - measured_base);
+                    .and_then(|c| c.checked_sub(measured_base));
                 self.confirm_offset(key, probe, measured);
                 // R22 items 5 and 6, R35: the credit's error follow-up, for
                 // the next record of this binding.
@@ -4620,8 +4627,15 @@ impl Machine {
 /// server's zone from −12 h to +14 h (so an offset from −14 h to +12 h),
 /// rounded to the grid; `None` otherwise (a forged attach time or a
 /// skewed clock is not taken).
+/// Any `i64` is taken: an offset outside ±15 h is refused before any
+/// arithmetic, so a hostile value (a restored checkpoint, a forged ledger
+/// time) cannot overflow.
 pub(crate) fn grid_offset(offset: i64) -> Option<i64> {
     const QUARTER: i64 = 15 * 60;
+    const BOUND: i64 = 15 * 3600;
+    if !(-BOUND..=BOUND).contains(&offset) {
+        return None;
+    }
     let r = offset.rem_euclid(QUARTER);
     let (dist, nearest) = if r <= QUARTER / 2 {
         (r, offset - r)

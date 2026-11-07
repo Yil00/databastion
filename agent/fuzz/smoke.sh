@@ -52,6 +52,11 @@ seed() {
       if command -v python3 >/dev/null 2>&1; then
         python3 -I "$HERE/sqlite_seed.py" "$2/seed" || true
       fi ;;
+    # The regression input of fuzz smoke job 128413708621: a restored stream body whose confirmed
+    # clock offset is i64::MIN (the grid_offset overflow).
+    firebird_checkpoint)
+      printf '%s' '9wAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+        | base64 -d >"$2/grid-offset-min" ;;
     # Whole records of the recorded Firebird trace logs, under -max_len (ADR-0060, review L1).
     firebird_trace_stream)
       if command -v python3 >/dev/null 2>&1; then

@@ -71,7 +71,9 @@ YAML input rarely gets past the `--- !<class>` header the pre-scanner requires. 
 `crates/connector-cas/fixtures/cas-8.0.2-oauth-oidc-audit.jsonl` (fake user, every token and ticket
 replaced): all of them as one input, and each request with its response, so the correlation state
 sees request and response pairs from the start. It seeds `firebird_trace_stream` with whole records
-of the recorded Firebird trace logs (`firebird_trace_seed.py`, the pinned dev images' fake data). The other targets start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
+of the recorded Firebird trace logs (`firebird_trace_seed.py`, the pinned dev images' fake data), and
+`firebird_checkpoint` with the regression input of fuzz smoke job 128413708621 (a restored stream
+body whose confirmed clock offset is `i64::MIN`). The other targets start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
 
 Longer campaigns with AddressSanitizer need a nightly toolchain and cargo-fuzz:
 
