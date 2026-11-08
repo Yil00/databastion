@@ -169,7 +169,7 @@ jobs:
   secrets:
     name: Secret scanning (gitleaks)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     env:
       GITLEAKS_VERSION: 8.30.1
     steps:
@@ -180,8 +180,11 @@ jobs:
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -sSfLO "$base/$archive"
-          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " ${archive}\$" | sha256sum -c -
+          # GitHub release downloads answer 504 at times: retry, the checksum check still guards the archive.
+          retry=(--retry 6 --retry-delay 10 --retry-all-errors --retry-max-time 180)
+          curl -sSfL "${retry[@]}" -o "$archive" "$base/$archive"
+          curl -sSfL "${retry[@]}" -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${archive}\$" checksums.txt | sha256sum -c -
           tar -xzf "$archive" gitleaks
       - name: Scan history
         run: ./gitleaks git --redact --verbose --exit-code 1 .
