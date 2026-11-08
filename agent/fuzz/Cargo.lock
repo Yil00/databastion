@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-classifiers"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "getrandom 0.4.3",
  "hmac",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-cas"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-firebird"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "chacha20",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-mongodb"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-openldap"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-redis"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-sqlite"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-sqlserver"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-protocol"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "regress",
