@@ -20,7 +20,7 @@ members = [
 # `version` is rewritten by scripts/bump-version.mjs: keep it the first
 # `version` key of this section.
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # The real minimum (`rusqlite` 0.41, which bundles SQLite 3.54.1, needs 1.89; let-chains in the
 # classifiers and `regress` 0.12 need 1.88), checked by the "Agent MSRV" CI job; release.yml pins

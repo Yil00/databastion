@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.10.0](https://github.com/Yil00/databastion/compare/0.9.0...0.10.0) (2026-11-08)
+
 The minor release after 0.9.0, which completes phase 10: the console and the agent. Two engines are added: SQLite database files get Discovery, read by a sandboxed reader process ([ADR-0059](docs/adr/0059-sqlite-connector.md)), and Firebird 4.0 and 5.0 get Discovery and an Audit read from the server's system audit trace log, Partial at best ([ADR-0060](docs/adr/0060-firebird-connector.md)). The agent now refuses end-of-life PostgreSQL and MariaDB servers, the core log tailer no longer loses the records read just before a log rotation whose new file cannot be opened, or before a read error, on any log-file Audit source, and building the agent needs Rust 1.89. A 0.10 console accepts 0.10 and 0.9 agents ([RELEASE.md](RELEASE.md#compatibility)).
 
 ### ⭐ Highlights
