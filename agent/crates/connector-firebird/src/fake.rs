@@ -309,6 +309,9 @@ pub(crate) struct Seen {
     pub(crate) prepared: Vec<String>,
     /// The CNCT codes of the user identification.
     pub(crate) cnct: Vec<u8>,
+    /// The length of the SRP public value `A` (hex) sent in the
+    /// `CNCT_specific_data` parts.
+    pub(crate) public_len: usize,
     /// The timeout of each `op_execute`.
     pub(crate) timeouts: Vec<u32>,
 }
@@ -361,6 +364,7 @@ fn parse_client(r: &mut Reader<'_>, seen: &mut Seen) -> Result<Msg, XdrError> {
             }
             seen.versions = versions;
             seen.cnct = cnct;
+            seen.public_len = public.len();
             Msg::Connect { public }
         }
         op::CONT_AUTH => {
@@ -714,7 +718,15 @@ mod tests {
         let seen = server.await.unwrap();
         // op_connect offered protocol 16 only, with no OS user or host.
         assert_eq!(seen.versions, [0x8010]);
-        assert_eq!(seen.cnct, [9, 8, 10, 7, 7, 11]);
+        // `A` is random: its minimal bytes are 128 (256 hex digits, two
+        // parts of at most 254) unless its first byte is zero (about 1
+        // in 256: 254 hex digits or fewer, one part).
+        let parts = seen.public_len.div_ceil(254);
+        assert!((1..=2).contains(&parts), "{}", seen.public_len);
+        let mut cnct = vec![9, 8, 10];
+        cnct.extend(std::iter::repeat_n(7, parts));
+        cnct.push(11);
+        assert_eq!(seen.cnct, cnct);
         assert_eq!(seen.crypt_plugin.as_deref(), Some("ChaCha64"));
         assert_eq!(
             seen.ops,
