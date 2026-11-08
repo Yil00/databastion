@@ -318,6 +318,7 @@ describe("exceptionCovers", () => {
     classifier: null,
     location: null,
     expiresAt: null,
+    crossTarget: false,
   };
   it("matches every set scope, per policy or global, until expiry", () => {
     expect(exceptionCovers(base, "p1", FACTS, NOW)).toBe(true);
@@ -432,6 +433,7 @@ describe("exceptionCovers: names altered by normalization (ADR-0056 decision 3 i
     classifier: null,
     location,
     expiresAt: null,
+    crossTarget: false,
   });
   const altered = (parts: FindingFacts["altered"], over: Partial<FindingFacts> = {}): FindingFacts => ({ ...FACTS, ...over, altered: parts });
 

@@ -115,6 +115,24 @@ pub struct RawCasSettings {
     pub client_addr: ClientAddrMode,
 }
 
+impl RawCasSettings {
+    /// Every local path the block declares (the registry directory, the
+    /// audit log): refused locations for `sqlite` targets (ADR-0059
+    /// decision 2).
+    #[must_use]
+    pub fn referenced_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Some(r) = &self.service_registry {
+            out.extend(r.json_dir.clone());
+            out.extend(r.yaml_dir.clone());
+        }
+        if let Some(a) = &self.audit_log {
+            out.push(a.path.clone());
+        }
+        out
+    }
+}
+
 /// A declared path and what it resolved to when the configuration was
 /// loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]

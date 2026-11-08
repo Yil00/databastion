@@ -46,7 +46,7 @@ exact certificate identity is known for each version: check it exactly, not with
 bundles use the Sigstore bundle format), then:
 
 ```bash
-VERSION=0.8.0
+VERSION=0.9.0
 ID=(--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION"
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
     --certificate-github-workflow-trigger push)
@@ -74,7 +74,7 @@ docker buildx imagetools inspect "$agent_ref" --format '{{json .Provenance}}'
 
 A tag can be moved in a registry; a digest cannot. **Pinning the digest is required**: `.env` takes
 the console line of the verified `image-digests.txt`
-(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.8.0@sha256:<digest>`), and Compose
+(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.9.0@sha256:<digest>`), and Compose
 then pulls exactly that image.
 
 ## Install
@@ -91,7 +91,7 @@ On the console host, in an empty directory (as a user allowed to run `docker`), 
 `SHA256SUMS` verified [above](#verify-the-artifacts):
 
 ```bash
-VERSION=0.8.0
+VERSION=0.9.0
 curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-deploy-$VERSION.tar.gz"
 sha256sum --check --ignore-missing SHA256SUMS            # must print "databastion-deploy-...: OK"
 tar -xzf "databastion-deploy-$VERSION.tar.gz" --strip-components=2 "databastion-deploy-$VERSION/deploy"
@@ -159,7 +159,7 @@ for one agent.
 On the database host. Verify the download first ([above](#verify-the-artifacts)).
 
 ```bash
-VERSION=0.8.0
+VERSION=0.9.0
 ARCH="$(dpkg --print-architecture)"      # amd64 or arm64
 curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-agent_${VERSION}_${ARCH}.deb"
 sha256sum --check --ignore-missing SHA256SUMS          # the list verified with cosign
@@ -280,12 +280,15 @@ that replica accepts (capability tokens, [ADR-0022](../docs/adr/0022-protocol-ca
 decision 8); an agent that learned a new token from an upgraded replica sends the field to every
 replica, an older replica answers `400`, and the agent resends those items without the field, so
 they lose it (for example the overflowed-objects flag of an event, the name case of a target, the
-"altered by normalization" marker of a finding). To avoid that, hold the new tokens back with
+"altered by normalization" marker of a finding). An engine token is worse: a 0.9 replica answers
+`400` to every heartbeat that reports a SQLite or Firebird target and to every SQLite or Firebird
+findings or events batch, once an agent learned `engine.sqlite` or `engine.firebird` from an
+upgraded replica. To avoid that, hold the new tokens back with
 `DATABASTION_AGENT_TOKENS_HOLD` ([console/README.md](../console/README.md#configuration)) until no
 older replica remains:
 
 1. Set `DATABASTION_AGENT_TOKENS_HOLD` to the release line the replicas run now (`0.8` for 0.8.0,
-   0.8.1 or 0.8.2, the only value today) in the environment of every web process of the new build
+   0.8.1 or 0.8.2; `0.9` for 0.9.x) in the environment of every web process of the new build
    (in `compose.yaml`, the `environment` of the `console` service; the worker answers no agent and
    only checks the value). An older build ignores the variable; a value the new build does not
    know stops it at startup. **Check every replica**: each web process reports its hold on its
@@ -302,13 +305,18 @@ older replica remains:
    accept and store every field of the new release, but list only the tokens of the held release
    (each logs a warning at startup naming the tokens it holds back), so the agents keep sending
    what the older replicas accept.
-3. Once **every** replica runs the new build, remove the variable and restart the replicas, one
-   by one if you like: every replica now accepts the new fields, so a replica that already lists
+3. Once **every** replica runs the new build, **and every worker too** (an older worker evaluates
+   new items with the older rules: a 0.9 worker applies location exceptions to SQLite findings
+   without their target scope), remove the variable and restart the replicas, one by one if you
+   like. At its first start a worker of the new build also evaluates every SQLite finding again
+   once (audit entry `findings.reevaluate_target_scoped`), in case an older worker evaluated some: every replica now accepts the new fields, so a replica that already lists
    them and one that does not yet can answer side by side. **Do not leave the hold set**: until
    it is removed, no agent sends the held fields, so the detection rules of the new release that
    depend on them do not apply (for 0.9: overflowed event objects reaching object- and
    sensitivity-scoped policies, ADR-0053; exceptions following the server's name case, ADR-0055;
-   exceptions not covering names altered by normalization, ADR-0056). Check that every replica's
+   exceptions not covering names altered by normalization, ADR-0056; after 0.9: SQLite targets,
+   ADR-0059, and Firebird targets, ADR-0060, which the agents report only once `engine.sqlite` or
+   `engine.firebird` is listed and whose findings and events wait in their spool until then). Check that every replica's
    `databastion_console_agent_tokens_hold` is back to `0`; alerting on it staying `1` is a good idea.
 4. Upgrade the agents. They send the new fields once a heartbeat answer lists their tokens.
 

@@ -21,6 +21,33 @@ async function asAdmin<T>(fn: (c: Client) => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Drops a test database, letting the backends still connected to it exit first.
+ *
+ * `pg`'s `Pool.end()` (pg-pool 3.14) resolves as soon as every client has been removed from the
+ * pool, that is once each has *sent* its Terminate message, not once its socket is closed. Its
+ * backend may still be running for a few milliseconds. `DROP DATABASE … WITH (FORCE)` at that
+ * moment signals it, and the client, still `_ending` and still carrying the pool's idle `error`
+ * listener, receives a FATAL 57P01 `ErrorResponse` that the pool re-emits as an `error` event:
+ * an unhandled error for a pool without an `error` listener (CI Console job 120858331040).
+ *
+ * So the plain `DROP DATABASE` comes first: the server itself waits up to 5 s for the other
+ * backends of the database to exit (`CountOtherDBBackends`). Only a connection still open after
+ * that wait, a real leak, makes it fail with `55006`; the database is then dropped `WITH (FORCE)`
+ * and the leaked client's error stays visible.
+ */
+export async function dropTestDatabase(c: Client, name: string): Promise<void> {
+  try {
+    await c.query(`drop database if exists ${name}`);
+  } catch (err) {
+    if ((err as { code?: unknown }).code !== "55006") throw err;
+    await c.query(`drop database if exists ${name} with (force)`);
+  }
+}
+
+/** Drops a test database as the cluster administrator (see `dropTestDatabase`). */
+export const adminDropDatabase = (name: string) => asAdmin((c) => dropTestDatabase(c, name));
+
 /** Runs `sql` as the cluster administrator (role creation: the owner has no CREATEROLE). */
 export const adminQuery = (sql: string) => asAdmin((c) => c.query(sql));
 
@@ -63,7 +90,7 @@ export async function setupTestDatabase(opts: { ctype?: "C" } = {}): Promise<() 
     await jobHub.close();
     await closeDb();
     await asAdmin(async (c) => {
-      await c.query(`drop database if exists ${name} with (force)`);
+      await dropTestDatabase(c, name);
       await c.query(`drop role if exists ${owner}`);
     });
   };

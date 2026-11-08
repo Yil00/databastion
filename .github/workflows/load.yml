@@ -4,7 +4,10 @@ name: Load / database impact
 # (PostgreSQL, MariaDB, MongoDB; MVP criterion < 2 %), the Audit path under a sustained workload
 # (pgbench, sysbench; nothing dropped, p95 latency with and without Audit) and the agent's CPU / RSS
 # over a 10-minute run. About 30 minutes: NOT part of the required "CI result" check (ci.yml).
-# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey / Redis targets the same way.
+# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey / Redis targets the same way;
+# load-sqlite measures the impact of a SQLite scan on a concurrent writer (SQLite has no server);
+# load-firebird runs the Firebird target in the e2e-firebird layout, with the ADR-0060 measurements
+# (8g, 3m, the checkpoint and ledger I/O, the 10 000-object schema of the RELEASE.md gate).
 # Runs weekly, on demand, and on pull requests labelled `load-test`; the harness unit tests run on
 # every pull request.
 on:
@@ -17,10 +20,10 @@ on:
         required: false
         default: "600"
       only:
-        description: Run one job only (all, database, cas, sqlserver, redis)
+        description: Run one job only (all, database, cas, sqlserver, redis, sqlite, firebird)
         required: false
         type: choice
-        options: [all, database, cas, sqlserver, redis]
+        options: [all, database, cas, sqlserver, redis, sqlite, firebird]
         default: all
       sqlserver_version:
         description: "load-sqlserver: SQL Server version (2019 and 2025: the engine matrix pins; 2019 has the Extended Events source only)"
@@ -46,6 +49,22 @@ on:
         description: "load-sqlserver, sqlserver_xevents only: a burst of 60 statements near the 128 KiB event bound every N seconds of the Audit run (0: never; ADR-0051 refinement of 2026-10-22)"
         required: false
         default: "0"
+      firebird_version:
+        description: "load-firebird: Firebird version (the pins of dev/firebird/it.sh; 4.0.7 is amd64 only)"
+        required: false
+        type: choice
+        options: ["5.0.4", "4.0.7"]
+        default: "5.0.4"
+      firebird_parts:
+        description: "load-firebird: load (Discovery, Audit, checkpoint I/O, 8g, 3m), schema (the 10 000-object schema), or both"
+        required: false
+        type: choice
+        options: ["load,schema", load, schema]
+        default: "load,schema"
+      firebird_burst_size:
+        description: "load-firebird: concurrent attaches per 8g burst (256: ADR-0060 R7's measurement; up to 1024 to probe past its bound, the 8g checks then fail by design)"
+        required: false
+        default: "256"
   pull_request:
     branches: [main, dev]
     types: [opened, synchronize, reopened, labeled]
@@ -69,7 +88,7 @@ jobs:
       - name: Unit tests (seed generator, sampler, analysis)
         run: timeout 120 python3 -m unittest discover -s e2e/load -p 'test_*.py' -v
       - name: shellcheck
-        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/sqlserver.sh e2e/load/redis.sh e2e/load/side-clients.sh e2e/load/pg-side-clients.sh e2e/load/initdb/*.sh
+        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/sqlserver.sh e2e/load/redis.sh e2e/load/sqlite.sh e2e/load/firebird.sh e2e/load/side-clients.sh e2e/load/pg-side-clients.sh e2e/load/initdb/*.sh
 
   load:
     name: Load / database impact
@@ -272,5 +291,115 @@ jobs:
         with:
           name: load-${{ matrix.engine }}-logs
           path: load-${{ matrix.engine }}-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The SQLite targets (e2e/load/README.md "SQLite targets", ADR-0059 decision 10 "Load"): two files of
+  # about 1 GiB (WAL, held open; rollback journal, `rollback_mode: read`), mounted read-only into the
+  # agent; a writer at 200 transactions per second with its busy timeout at 0 and at 5 s, without then
+  # during a paced Discovery scan: its commit latency, SQLITE_BUSY count and -wal growth, and the CPU
+  # and memory of the agent and its readers. Needs the console to list `engine.sqlite` (P10-E). In
+  # parallel with the other runs, same triggers.
+  load-sqlite:
+    name: Load / SQLite targets
+    needs: unit
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'sqlite')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      LOAD_LOG_DIR: ${{ github.workspace }}/load-sqlite-logs
+      LOAD_RESULTS_DIR: ${{ github.workspace }}/load-sqlite-results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          echo "CPUs: $(nproc)"; free -m | head -n 2
+          df -h "$GITHUB_WORKSPACE" /var/lib/docker 2>/dev/null || true
+          stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
+          uname -r
+      - name: Run e2e/load/sqlite.sh
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 3300 e2e/load/sqlite.sh
+      # Counters, timings and latencies only: no value, no secret (sqlite.sh redacts every generated
+      # secret from its outputs on exit, whatever the result).
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-sqlite-results
+          path: load-sqlite-results/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-sqlite-logs
+          path: load-sqlite-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The Firebird target (e2e/load/README.md "Firebird target", ADR-0060 decision 9 "End to end and
+  # load", R7 / 8g, R25 / 3m, R41 items 2 and 9; the RELEASE.md gate "Firebird Audit: the 10 000-object
+  # schema measurement"): Firebird 5.0.4 (4.0.7 on demand, input firebird_version) in the e2e-firebird
+  # layout (the agent in its container in the server's network and pid namespaces, the runner's
+  # identity files declared and mounted read-only, the log volume's named-user ACLs). Part `load`: a
+  # paced Discovery scan against the < 2 % criterion, a fixed-rate point-read workload without then
+  # with Audit (every statement an event, the agent's own records never reported, its CPU / RSS), the
+  # checkpoint and ledger I/O, bursts of 256 concurrent attaches opening the database (8g), per-row
+  # statements and pending groups (3m). Part `schema`: a schema of more than 10 000 objects, the
+  # dependent-set read time and the always-reported events with a complete, an invalidated and a cut
+  # set. In parallel with the other runs, same triggers.
+  load-firebird:
+    name: Load / Firebird target
+    needs: unit
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'firebird')
+    runs-on: ubuntu-latest
+    # About 90 minutes with the defaults (local run at a 180 s soak and 60 s flood phases: 52 min).
+    timeout-minutes: 120
+    env:
+      LOAD_LOG_DIR: ${{ github.workspace }}/load-firebird-logs
+      LOAD_RESULTS_DIR: ${{ github.workspace }}/load-firebird-results
+      LOAD_SOAK_S: ${{ inputs.soak_s || '600' }}
+      # Validated by firebird.sh (never interpolated into a script).
+      LOAD_FIREBIRD_VERSION: ${{ inputs.firebird_version || '5.0.4' }}
+      LOAD_FIREBIRD_PARTS: ${{ inputs.firebird_parts || 'load,schema' }}
+      LOAD_FB_BURST_SIZE: ${{ inputs.firebird_burst_size || '256' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          echo "CPUs: $(nproc)"; free -m | head -n 2
+          df -h "$GITHUB_WORKSPACE" /var/lib/docker 2>/dev/null || true
+          stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
+          uname -r
+      - name: Run e2e/load/firebird.sh
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 6900 e2e/load/firebird.sh
+      # Counters, timings, sizes and latencies only: no statement text, no value, no secret (the trace
+      # log is read in place by fbload.py and never copied; firebird.sh redacts every generated secret
+      # from its outputs on exit, whatever the result).
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-firebird-results
+          path: load-firebird-results/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-firebird-logs
+          path: load-firebird-logs/
           retention-days: 7
           if-no-files-found: ignore

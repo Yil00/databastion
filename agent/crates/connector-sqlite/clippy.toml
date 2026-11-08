@@ -1,0 +1,10 @@
+# The workspace settings (agent/clippy.toml), which this file replaces for
+# this crate, plus ADR-0059 decision 5 (security review L1): no
+# `to_string`, so a `rusqlite::Error` (or a raw name or value) is never
+# turned into text; see the architecture test `sqlite_errors_are_never_formatted`.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+disallowed-methods = [
+    { path = "std::string::ToString::to_string", reason = "ADR-0059 decision 5: no rusqlite::Error, raw name or value turned into text" },
+]

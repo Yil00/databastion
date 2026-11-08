@@ -1691,10 +1691,9 @@ mod tests {
                 // The poll stats text finds its own thread by its
                 // connection id (`PS_OWN_THREAD_EXPR`), not the processlist.
                 if d == "processlist"
-                    && lower
+                    && !lower
                         .replace(&PS_OWN_THREAD_EXPR.to_lowercase(), "")
-                        .find("processlist")
-                        .is_none()
+                        .contains("processlist")
                 {
                     continue;
                 }

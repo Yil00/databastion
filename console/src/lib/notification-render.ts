@@ -1,5 +1,5 @@
 import { inlineCode, isKeyPatternSource } from "@/lib/key-pattern";
-import { isKeyPatternEngine } from "@/lib/location-labels";
+import { isKeyPatternEngine, locationDatabaseShown } from "@/lib/location-labels";
 import { SYSTEM_ALERT_EVENTS, type SystemAlertEvent } from "@/lib/notification-model";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 
@@ -262,6 +262,9 @@ function locationText(l: IncidentOpenedPayload["location"]): string {
     // separator of key patterns.
     return [one(l.database, 128), ...(l.schema !== null ? [one(l.schema, 128)] : []), keyPatternText(l.object), one(l.field, 128)].join(" / ");
   }
+  // SQLite (ADR-0059 decision 6): the database is `main` on every target (the target line above
+  // tells files apart), so the table and the column only, each named.
+  if (!locationDatabaseShown(l.engine)) return `table ${one(l.object, 128)} / column ${one(l.field, 128)}`;
   return [l.database, l.schema, l.object, l.field].filter((x): x is string => x !== null).map((x) => one(x, 128)).join(".");
 }
 

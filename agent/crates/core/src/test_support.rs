@@ -81,10 +81,51 @@ pub fn sent_labels(note: &crate::TargetNote, all_revisions: bool) -> Vec<String>
         r2026_10: all_revisions,
         r2026_10_b: all_revisions,
         r2026_10_c: all_revisions,
+        r2026_10_d: all_revisions,
     };
     crate::notes::to_protocol(std::slice::from_ref(note), revisions)
         .first()
         .and_then(|n| n.labels.as_ref())
         .map(|l| l.iter().map(ToString::to_string).collect())
         .unwrap_or_default()
+}
+
+/// The `TargetStatus` the heartbeat would send for `health` (a console
+/// listing every note label revision), through the core's last step for
+/// `sqlite` and `firebird` targets (`sanitize::enforce_target_status`), as
+/// JSON.
+/// `server_version` is what a connector would report.
+///
+/// # Panics
+/// On an invalid built-in identifier (never).
+#[must_use]
+pub fn contract_target_status_json(
+    health: &crate::TargetHealth,
+    engine: TargetEngine,
+    server_version: Option<&str>,
+) -> String {
+    let mut status = databastion_protocol::TargetStatus {
+        audit_level: crate::runtime::proto_audit_level(health.audit_level),
+        audit_source: None,
+        edition: None,
+        engine: crate::runtime::proto_engine(engine),
+        last_error: health.failure,
+        metrics: None,
+        name_case: None,
+        notes: crate::notes::to_protocol(
+            &health.notes,
+            crate::notes::LabelRevisions {
+                r2026_10: true,
+                r2026_10_b: true,
+                r2026_10_c: true,
+                r2026_10_d: true,
+            },
+        ),
+        reachable: health.reachable,
+        server_version: server_version
+            .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
+        target_id: databastion_protocol::TargetId::try_from("test-target").expect("target id"),
+    };
+    crate::sanitize::enforce_target_status(&mut status);
+    serde_json::to_string(&status).expect("a target status serializes")
 }

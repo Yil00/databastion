@@ -66,9 +66,10 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.failed_logins_not_audited": {
-    "description": "The audit source records no failed logins (SQL Server Audit: no enabled audit specification with FAILED_LOGIN_GROUP; Extended Events: no error_reported event in the session): failed authentications are not seen.",
+    "description": "The audit source records no failed logins (SQL Server Audit: no enabled audit specification with FAILED_LOGIN_GROUP; Extended Events: no error_reported event in the session; Firebird trace: a wrong password writes no record of the target database): failed authentications are not seen.",
     "engines": [
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "audit.failed_operations_not_logged": {
@@ -120,7 +121,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.log_not_readable": {
-    "description": "The audit log configured for the target is not readable by the agent: the file configured in agent.yaml (on CAS, also when it is refused because the agent could write it or one of its parent directories), or on Redis / Valkey none of SLOWLOG, COMMANDLOG and ACL LOG.",
+    "description": "The audit log configured for the target is not readable by the agent: the file configured in agent.yaml (on CAS and Firebird, also when it is refused because the agent could write it or one of its parent directories), or on Redis / Valkey none of SLOWLOG, COMMANDLOG and ACL LOG.",
     "engines": [
       "postgres",
       "mysql",
@@ -128,7 +129,8 @@ export const TARGET_NOTE_REGISTRY = {
       "mongodb",
       "cas",
       "redis",
-      "valkey"
+      "valkey",
+      "firebird"
     ]
   },
   "audit.log_plugin_mismatch": {
@@ -136,6 +138,18 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "audit.log_readable_by_others": {
+    "description": "A uid other than root, the server's account and the agent's account can read the Firebird trace log, a rotated file it still tracks or new files in its directory (mode bits, groups, access or default ACLs; also when a group's members cannot be enumerated, or the agent's identity files are not the host's): that account sees the logged statements, passwords set through SQL included, and the record tokens that tell forged trace records apart. Partial is withheld while it lasts.",
+    "engines": [
+      "firebird"
+    ]
+  },
+  "audit.log_records_ambiguous": {
+    "description": "{count} Firebird trace record(s) in the last 24 h could not be told apart from text a client wrote (a forged or split record, an unexpected header token, a cut text, a database path matched only by file name or inode, an unconfirmed server run): each is reported as a read of * by an unchecked principal, and the level is Limited for 24 h. Label run_confirmation_stalled: the stream stopped more than 60 s within one hour waiting for server run confirmations.",
+    "engines": [
+      "firebird"
     ]
   },
   "audit.log_without_row_counts": {
@@ -153,7 +167,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "audit.performance_schema_not_readable": {
@@ -189,7 +204,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.records_dropped": {
-    "description": "{count} audit log record(s) dropped in the last 24 h: not parsable, oversized or damaged, or (SQL Server, Redis / Valkey) lost before the agent read them: rotated or overwritten, or the audit source restarted.",
+    "description": "{count} audit log record(s) dropped in the last 24 h: not parsable, oversized or damaged, or (SQL Server, Redis / Valkey, Firebird) lost before the agent read them: rotated or overwritten, or the audit source restarted.",
     "engines": [
       "postgres",
       "mysql",
@@ -199,7 +214,8 @@ export const TARGET_NOTE_REGISTRY = {
       "cas",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "firebird"
     ]
   },
   "audit.records_dropped_severity": {
@@ -227,6 +243,12 @@ export const TARGET_NOTE_REGISTRY = {
       "cas"
     ]
   },
+  "audit.services_not_audited": {
+    "description": "The Firebird trace services section is not enabled with log_services: backups and user management through the services API are not recorded as services ({labels}).",
+    "engines": [
+      "firebird"
+    ]
+  },
   "audit.slow_operations_only": {
     "description": "The audit source only records the operations the server logs or profiles (MongoDB: slower than slowms, or sampled; Redis / Valkey: the slow log and the command log): fast reads, such as a quick dump of a small collection or keyspace, can go unseen.",
     "engines": [
@@ -236,10 +258,11 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.source_not_configured": {
-    "description": "No usable Audit source is configured for the target. MongoDB: declare the auditLog or the server log file in agent.yaml (mongodb.audit_log), or grant find on system.profile of the monitored databases. SQL Server: no running Extended Events session with an event_file target, nor an enabled server audit with a FILE target, is named in agent.yaml (sqlserver.audit).",
+    "description": "No usable Audit source is configured for the target. MongoDB: declare the auditLog or the server log file in agent.yaml (mongodb.audit_log), or grant find on system.profile of the monitored databases. SQL Server: no running Extended Events session with an event_file target, nor an enabled server audit with a FILE target, is named in agent.yaml (sqlserver.audit). Firebird: no firebird.audit block in agent.yaml, or the target is reached through a tunnel (no local log).",
     "engines": [
       "mongodb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "audit.sqlserver_audit_needs_control_server": {
@@ -256,10 +279,11 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.statement_text_limit_low": {
-    "description": "The audit source cuts statement texts at {count} bytes (server_audit_query_log_limit or performance_schema_max_sql_text_length), below the agent's longest statement: the agent's own statements, such as its CAS store guard queries, are cut and reported as reads of * by its account (loud, never quiet). Keep the limit at 1024 or more.",
+    "description": "The audit source cuts statement texts at {count} bytes (server_audit_query_log_limit, performance_schema_max_sql_text_length, or Firebird's max_sql_length), below the agent's longest statement: the agent's own statements, such as its CAS store guard queries, are cut and reported as reads of * by its account (loud, never quiet). Keep the limit at 1024 or more (Firebird: 4096 or more).",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "firebird"
     ]
   },
   "audit.stream_not_available": {
@@ -281,7 +305,20 @@ export const TARGET_NOTE_REGISTRY = {
       "cas",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "firebird"
+    ]
+  },
+  "audit.trace_config_not_evaluated": {
+    "description": "Limited: a declared database's Firebird trace configuration was not evaluated: firebird_conf_unreadable or trace_config_unreadable (unreadable, refused or unparsed), trace_config_file_mismatch (AuditTraceConfigFile names another file), config_changed_since_start, server_process_not_visible (e.g. another pid namespace), similar_to_pattern (SIMILAR TO, _ or % in a file name), databases_conf (alias map unproven), foreign_databases_logged (undeclared databases logged), database_path_not_unique (hard-linked).",
+    "engines": [
+      "firebird"
+    ]
+  },
+  "audit.trace_settings_missing": {
+    "description": "Limited: the Firebird trace configuration section of a declared database lacks settings the Partial level needs (enabled, log_filename the declared log, log_connections, log_statement_finish, log_blr_requests, the procedure, function and trigger finish events, log_transactions, log_initfini, log_sweep, log_errors, time_threshold 0, print_perf, no include_filter or exclude_filter, connection_id 0, max_log_size 0, max_sql_length at most 983040): {labels}.",
+    "engines": [
+      "firebird"
     ]
   },
   "audit.xe_causality_off": {
@@ -337,7 +374,9 @@ export const TARGET_NOTE_REGISTRY = {
       "cas",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "sqlite",
+      "firebird"
     ]
   },
   "check.timed_out": {
@@ -351,7 +390,9 @@ export const TARGET_NOTE_REGISTRY = {
       "cas",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "sqlite",
+      "firebird"
     ]
   },
   "coverage.cas_guard_tripped": {
@@ -364,7 +405,9 @@ export const TARGET_NOTE_REGISTRY = {
       "openldap",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "sqlite",
+      "firebird"
     ]
   },
   "coverage.cluster_node_only": {
@@ -375,15 +418,41 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "coverage.computed_columns_not_sampled": {
-    "description": "{count} computed column(s) not sampled: reading them can run user code (a function in the column's expression).",
+    "description": "{count} computed column(s) not sampled: reading them can run user code (a function in the column's expression; on SQLite, a VIRTUAL generated column's expression taken from the file).",
     "engines": [
-      "sqlserver"
+      "sqlserver",
+      "sqlite",
+      "firebird"
     ]
   },
   "coverage.encrypted_columns": {
     "description": "{count} Always Encrypted column(s) not sampled: the server holds their ciphertext only.",
     "engines": [
       "sqlserver"
+    ]
+  },
+  "coverage.external_file_tables": {
+    "description": "{count} external-file table(s) not sampled: reading them makes the server read a file outside the database (counted in skipped_remote).",
+    "engines": [
+      "firebird"
+    ]
+  },
+  "coverage.file_path_refused": {
+    "description": "The declared SQLite path or a file next to it is refused: a symbolic link in the path, not a regular file, more than one hard link, the same file as another target, a refused location (the agent's own state, configuration or key files), a -wal, -shm or -journal file of another owner or on another file system, or an open file that is not the checked one.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.filesystem_not_read_only": {
+    "description": "The file system holding the SQLite file is not mounted read-only for the agent: mount its directory read-only (systemd ProtectSystem=strict or BindReadOnlyPaths=, a :ro bind mount in a container). The file is refused until then.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.hot_journal_pending": {
+    "description": "The SQLite database has a hot rollback journal (an interrupted write the application has not recovered yet): it cannot be read without writing, so it is not read until the application recovers it at its next open.",
+    "engines": [
+      "sqlite"
     ]
   },
   "coverage.masked_columns": {
@@ -399,11 +468,29 @@ export const TARGET_NOTE_REGISTRY = {
       "valkey"
     ]
   },
+  "coverage.network_filesystem_refused": {
+    "description": "The SQLite file is on a network or FUSE file system (NFS, SMB / CIFS, 9P, Ceph, AFS, Coda, Lustre, GPFS, FUSE): file locks and the WAL index are not reliable there, so the file is refused.",
+    "engines": [
+      "sqlite"
+    ]
+  },
   "coverage.other_engine_tables": {
     "description": "{count} table(s) with a storage engine outside the local-data allow-list, not sampled.",
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "coverage.reader_process_failed": {
+    "description": "{count} SQLite reader process failure(s) in the last scan (killed by a signal, out of its limits, or broken off on an invalid message): each cost one unit of work; after 3 the scan stopped for this target. The agent process is not affected.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.reader_sandbox_unavailable": {
+    "description": "The sandboxed SQLite reader process cannot run on this host (no Landlock in the kernel, or a sandbox step failed): the agent opens no SQLite file without it.",
+    "engines": [
+      "sqlite"
     ]
   },
   "coverage.registry_files_skipped": {
@@ -422,7 +509,8 @@ export const TARGET_NOTE_REGISTRY = {
   "coverage.relations_without_select": {
     "description": "{count} relation(s) without SELECT for the agent's role, not sampled.",
     "engines": [
-      "postgres"
+      "postgres",
+      "firebird"
     ]
   },
   "coverage.remote_engine_tables": {
@@ -439,10 +527,22 @@ export const TARGET_NOTE_REGISTRY = {
       "sqlserver"
     ]
   },
+  "coverage.rollback_mode_not_read": {
+    "description": "The SQLite database is in rollback-journal mode, where every read delays the application's commits: it is not read unless sqlite.rollback_mode is read in agent.yaml for this target (counted in skipped_unsupported).",
+    "engines": [
+      "sqlite"
+    ]
+  },
   "coverage.schemas_without_usage": {
     "description": "{count} schema(s) without USAGE for the agent's role, not covered.",
     "engines": [
       "postgres"
+    ]
+  },
+  "coverage.security_database_excluded": {
+    "description": "{count} declared Firebird database(s) excluded from Discovery and Audit: a security database (its own, shown by MON$SEC_DATABASE or a SecurityDatabase key in databases.conf naming itself, or one holding a PLG$SRP verifier relation or a legacy user-manager relation), or not shown not to be one (a failed or cut read). Their trace records are handled as an undeclared database's; the target's other databases keep running.",
+    "engines": [
+      "firebird"
     ]
   },
   "coverage.timeseries_not_readable": {
@@ -451,13 +551,33 @@ export const TARGET_NOTE_REGISTRY = {
       "mongodb"
     ]
   },
+  "coverage.unrecognized_file_format": {
+    "description": "The declared SQLite file is not a database file the agent reads: its header is not a SQLite 3 header within the supported file format range (an encrypted, compressed or other file), the file is not a database, or its schema cannot be loaded (syntax newer than the bundled SQLite, a schema entry above the length limits, corruption). Nothing was sampled.",
+    "engines": [
+      "sqlite"
+    ]
+  },
   "coverage.views_not_sampled": {
     "description": "{count} view(s) not sampled (their base tables or collections are).",
     "engines": [
       "mysql",
       "mariadb",
       "mongodb",
-      "sqlserver"
+      "sqlserver",
+      "sqlite",
+      "firebird"
+    ]
+  },
+  "coverage.virtual_tables_not_sampled": {
+    "description": "{count} virtual table(s) not sampled: reading them would run a module's code. Their shadow tables, which hold the indexed content, are ordinary tables and are sampled.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.wal_files_not_readable": {
+    "description": "The SQLite database is in WAL mode and its -wal and -shm files are missing (no application holds the file open), only one exists, one is unreadable, the -wal is above 128 MiB, or the WAL index cannot be read without writing: the file is not read; it is read again while the application holds it open.",
+    "engines": [
+      "sqlite"
     ]
   },
   "privilege.accesslog_without_audit": {
@@ -490,7 +610,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "privilege.cluster_actions": {
@@ -504,6 +625,12 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "openldap",
       "cas"
+    ]
+  },
+  "privilege.database_file_writable": {
+    "description": "The SQLite file, one of its -wal, -shm or -journal files, or a directory on its path is writable by the agent's account: the agent must only read, so the file is refused until the agent's write access is removed.",
+    "engines": [
+      "sqlite"
     ]
   },
   "privilege.database_roles": {
@@ -525,15 +652,17 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "privilege.global_privileges": {
-    "description": "{count} global or server-level privilege(s) beyond those the agent needs (MySQL / MariaDB: other than SELECT and USAGE; SQL Server: server permissions other than CONNECT SQL and VIEW ANY DATABASE); the most severe: {labels}.",
+    "description": "{count} global or server-level privilege(s) beyond those the agent needs (MySQL / MariaDB: other than SELECT and USAGE; SQL Server: server permissions other than CONNECT SQL and VIEW ANY DATABASE; Firebird: system privileges, a credential relation other than the account's own SEC$USERS row readable, or the server configuration readable through RDB$CONFIG); the most severe: {labels}.",
     "engines": [
       "mysql",
       "mariadb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "privilege.global_select": {
@@ -548,11 +677,12 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "privilege.not_evaluated": {
-    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped; on MongoDB, connectionStatus not readable; on PostgreSQL, the CAS store guard's candidate relation or column list cut at its limit, a name not UTF-8, or its query failed); on SQL Server, a check read that could not run or was cut, such as logon triggers (hidden from the minimal grants, never reported absent); on Redis 6.2, the ACL (no ACL DRYRUN). Reads: {labels}.",
+    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, rows skipped, or its query failed): on MongoDB, connectionStatus not readable; on PostgreSQL, the CAS store guard's candidate relation or column list (also a name not UTF-8); on SQL Server, a check read such as logon triggers (hidden from the minimal grants, never reported absent); on Redis 6.2, the ACL (no ACL DRYRUN); on Firebird, the role graph. Reads: {labels}.",
     "engines": [
       "mysql",
       "mariadb",
@@ -560,7 +690,8 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "firebird"
     ]
   },
   "privilege.other_roles": {
@@ -573,7 +704,8 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "Owner of {count} object(s).",
     "engines": [
       "postgres",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "privilege.password_attributes_readable": {
@@ -620,7 +752,8 @@ export const TARGET_NOTE_REGISTRY = {
   "privilege.refused": {
     "description": "The agent's account holds a right it must never hold ({labels}): Discovery and Audit do not run for this target until it is revoked.",
     "engines": [
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "privilege.registry_writable": {
@@ -677,7 +810,8 @@ export const TARGET_NOTE_REGISTRY = {
       "mongodb",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "firebird"
     ]
   },
   "privilege.write_actions": {
@@ -719,6 +853,18 @@ export const TARGET_NOTE_REGISTRY = {
       "valkey"
     ]
   },
+  "security.file_world_readable": {
+    "description": "The SQLite database file is readable by every local user: every account of the host can read its data. Restrict it to the application and the agent's group.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "security.firebird_tunnel": {
+    "description": "The Firebird target is reached through a tunnel the operator runs (firebird.tunnel in agent.yaml): its security is the operator's, and the target has no Audit.",
+    "engines": [
+      "firebird"
+    ]
+  },
   "security.init_connect": {
     "description": "init_connect is set: SQL runs at every login of the agent's account.",
     "engines": [
@@ -727,10 +873,11 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "security.login_event_trigger": {
-    "description": "An enabled login event trigger runs user code at every connection of the agent.",
+    "description": "An enabled login event trigger runs user code at every connection of the agent (Firebird: an ON CONNECT database trigger; ON TRANSACTION START triggers too, in the agent's log).",
     "engines": [
       "postgres",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "security.ticket_registry_unencrypted": {
@@ -740,7 +887,8 @@ export const TARGET_NOTE_REGISTRY = {
       "mysql",
       "mariadb",
       "mongodb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "security.tls_disabled": {

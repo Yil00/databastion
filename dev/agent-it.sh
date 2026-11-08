@@ -4,12 +4,13 @@
 # matching CI job (.github/workflows/ci.yml: agent-pg, agent-mysql, agent-mongodb, agent-openldap,
 # agent-redis, agent-sqlserver).
 #
-#   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|sqlserver|all   (or: make agent-it [ENGINE=...])
+#   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|sqlserver|sqlite|all   (or: make agent-it [ENGINE=...])
 #   dev/agent-it.sh ENGINE [TEST_FILTER...]   one engine, the test binary's arguments after --nocapture
 #                                             (a test name filter, --exact, ...); not with `all`
 #
 # `redis` needs the opt-in profile (`make dev-redis`: Valkey and Redis) and is not part of `all`;
-# `sqlserver` needs `make dev-sqlserver` and is not part of `all` either.
+# `sqlserver` needs `make dev-sqlserver` and is not part of `all` either; `sqlite` needs no service
+# but sudo (its reader tests run as root) and is not part of `all`.
 #
 # Not covered here (CI-only extra steps, see ci.yml): the PostgreSQL local cluster (TLS, weak
 # authentication), the MongoDB verify_full TLS server and the Percona Server for MongoDB auditLog
@@ -175,11 +176,29 @@ it_sqlserver() {
   cargo_it databastion-connector-sqlserver --test-threads 1 "$@"
 }
 
+# SQLite (ADR-0059): no dev service needed. The connector's own tests as the caller, then the
+# reader-process tests (agent/crates/agent/tests/sqlite_reader.rs) as root through sudo, as the CI
+# job agent-sqlite: they play the application's and the agent's accounts and bind-mount their files
+# read-only; their seeded-files test writes the dev seed (dev/seed/out/sqlite.json) with the bundled
+# library, or reads DATABASTION_IT_SQLITE_SEEDED (a directory written by
+# `dev/sqlite/build.py matrix --hold`, the engine matrix).
+it_sqlite() {
+  export DATABASTION_IT_SQLITE_REQUIRE=1
+  cargo_it databastion-connector-sqlite "$@"
+  local exe
+  exe="$(cd agent && cargo test -p databastion-agent --test sqlite_reader --all-features --locked --no-run \
+    --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sqlite_reader"
+      and .executable != null) | .executable')"
+  [ -x "$exe" ] || { echo "the sqlite_reader test binary was not built" >&2; exit 1; }
+  sudo env DATABASTION_IT_SQLITE_REQUIRE=1 ${DATABASTION_IT_SQLITE_SEEDED:+DATABASTION_IT_SQLITE_SEEDED="$DATABASTION_IT_SQLITE_SEEDED"} \
+    "$exe" --test-threads 1 --nocapture "$@"
+}
+
 case "$ENGINE" in
-  postgres | mysql | mongodb | openldap | redis | sqlserver) "it_$ENGINE" "${@:2}" ;;
+  postgres | mysql | mongodb | openldap | redis | sqlserver | sqlite) "it_$ENGINE" "${@:2}" ;;
   # Subshells: each engine exports its own DATABASTION_TEST_REQUIRE.
   all)
     [ "$#" -le 1 ] || { echo "no test filter with \`all\`" >&2; exit 2; }
     for e in postgres mysql mongodb openldap; do (echo "== $e"; "it_$e"); done ;;
-  *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap, redis, sqlserver or all)" >&2; exit 2 ;;
+  *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap, redis, sqlserver, sqlite or all)" >&2; exit 2 ;;
 esac

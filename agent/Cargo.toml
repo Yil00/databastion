@@ -11,6 +11,8 @@ members = [
     "crates/connector-cas",
     "crates/connector-redis",
     "crates/connector-sqlserver",
+    "crates/connector-sqlite",
+    "crates/connector-firebird",
     "crates/protocol",
     "crates/protocol-codegen",
 ]
@@ -20,9 +22,10 @@ members = [
 [workspace.package]
 version = "0.9.0"
 edition = "2024"
-# The real minimum (let-chains in the classifiers, and `regress` 0.12 through the protocol crate,
-# need 1.88), checked by the "Agent MSRV" CI job; release.yml pins the same toolchain.
-rust-version = "1.88"
+# The real minimum (`rusqlite` 0.41, which bundles SQLite 3.54.1, needs 1.89; let-chains in the
+# classifiers and `regress` 0.12 need 1.88), checked by the "Agent MSRV" CI job; release.yml pins
+# the same toolchain.
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/Yil00/databastion"
 publish = false
@@ -38,6 +41,8 @@ databastion-connector-openldap = { path = "crates/connector-openldap" }
 databastion-connector-cas = { path = "crates/connector-cas" }
 databastion-connector-redis = { path = "crates/connector-redis" }
 databastion-connector-sqlserver = { path = "crates/connector-sqlserver" }
+databastion-connector-sqlite = { path = "crates/connector-sqlite" }
+databastion-connector-firebird = { path = "crates/connector-firebird" }
 databastion-protocol = { path = "crates/protocol" }
 databastion-protocol-codegen = { path = "crates/protocol-codegen" }
 
@@ -100,3 +105,11 @@ print_stderr = "warn"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# An integer overflow panics instead of wrapping silently (maintainer
+# decision of 2026-11-07, after the fuzz finding of #429). The panic is
+# contained where it lands (`databastion_core::panics`: `guard` around every
+# connector call, `isolate` around each Audit record, the SQLite reader in
+# its own process); intended wrapping is written `wrapping_*`. The panic
+# strategy stays `unwind` (the default): `catch_unwind` needs it. `bench`
+# inherits this; the fuzz workspace (fuzz/Cargo.toml) has its own profile.
+overflow-checks = true

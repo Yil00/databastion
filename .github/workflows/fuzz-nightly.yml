@@ -70,16 +70,46 @@ jobs:
           - { target: sqlserver_xe_records, seconds: 180 }
           - { target: core_csv_splitter, seconds: 180 }
           - { target: classifiers_names, seconds: 300 }
+          # ADR-0059 decision 5: hostile SQLite files (with their -wal, -shm and -journal files)
+          # through the reader's pipeline, the header pre-check and the reader IPC decoders. The
+          # bundled SQLite C code is built with AddressSanitizer and coverage instrumentation
+          # (.github/scripts/fuzz-nightly.sh) and the production LIBSQLITE3_FLAGS.
+          - { target: sqlite_file, seconds: 600 }
+          - { target: sqlite_header, seconds: 120 }
+          - { target: sqlite_ipc, seconds: 180 }
+          # ADR-0060 decision 1: the Firebird protocol-16 client's parsers (server messages and
+          # status vectors, describe answers and rows, SRP data, wire-crypt keys) and the
+          # /proc/net/tcp lookup of the peer-uid rule (decision 3).
+          - { target: firebird_messages, seconds: 300 }
+          - { target: firebird_describe_rows, seconds: 300 }
+          - { target: firebird_srp_data, seconds: 120 }
+          - { target: firebird_keys, seconds: 120 }
+          - { target: firebird_proc_net_tcp, seconds: 180 }
+          # ADR-0060 decision 5: Discovery's catalog rows, conversions, batches and values.
+          - { target: firebird_catalog, seconds: 180 }
+          # ADR-0060 decision 6: the system audit trace log and configuration parsers, and the
+          # Firebird mode of the statement analysis.
+          - { target: firebird_trace_log, seconds: 600 }
+          # Review L1 of P10-F: the stream's multi-record state machine over assembled records,
+          # seeded with the recorded trace logs.
+          - { target: firebird_trace_stream, seconds: 600 }
+          - { target: firebird_trace_conf, seconds: 300 }
+          - { target: firebird_statement, seconds: 300 }
+          # ADR-0060 refinement of 2026-10-31 (R52 item 4): the identity files of the readers
+          # check and the mount-id lookup.
+          - { target: firebird_host_identity, seconds: 180 }
+          # ADR-0060 R25 items 7 and 9: the Audit stream's persisted parser checkpoint and ledger.
+          - { target: firebird_checkpoint, seconds: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Sanitizers need a nightly toolchain; an unpinned nightly can break the build on a given
       # night, which is acceptable for a non-required scheduled job.
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent/fuzz
           shared-key: fuzz-nightly-asan

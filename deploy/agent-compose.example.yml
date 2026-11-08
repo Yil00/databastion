@@ -64,7 +64,38 @@ services:
       # Audit log files, read-only; give the agent read access through a group (group_add), never
       # ownership (agent README, "Audit log files"):
       # - /var/log/postgresql:/logs/postgresql:ro
+      #
+      # Firebird target with Audit (ADR-0060 decision 3 and its refinement of 2026-10-31, R43 to
+      # R52; agent/agent.example.yaml, `firebird.audit.host_identity`): uncomment these mounts and
+      # `network_mode` / `pid` below, and set in agent.yaml host 127.0.0.1, a numeric
+      # `firebird.peer_uid` (the server's uid), the `audit` paths as the server sees them and
+      # `host_identity` with the paths below.
+      # The Firebird root, its configuration and its trace log directory, read-only, at the paths
+      # the server uses (read access for uid 10001 through ACLs, never ownership; user guide,
+      # "Firebird Audit"):
+      # - /opt/firebird:/opt/firebird:ro
+      # - /var/log/firebird/audit:/var/log/firebird/audit:ro
+      # The HOST's identity files, each a single-file bind mount, read-only, straight from the
+      # host (never a copy, a file of this directory or a volume). At every check the agent
+      # requires each one to be the root of its own read-only mount, owned by root, not group- or
+      # other-writable, with one hard link. After a change of host accounts or groups (useradd,
+      # groupmod... replace these files), restart this container: a stale mount is refused.
+      # - /etc/passwd:/run/databastion/host/passwd:ro
+      # - /etc/group:/run/databastion/host/group:ro
+      # - /etc/nsswitch.conf:/run/databastion/host/nsswitch.conf:ro
+      # Optional (without them every uid or gid of 100000 or more counts as subordinate):
+      # - /etc/subuid:/run/databastion/host/subuid:ro
+      # - /etc/subgid:/run/databastion/host/subgid:ro
     # group_add: ["<gid of the log files>"]
+    # Firebird (see above): the agent reaches the server on loopback only, in the server's network
+    # namespace, and finds the server process in its pid namespace.
+    # network_mode: "service:firebird"   # or "container:<server container>"; no `networks` / `ports` then
+    # pid: "service:firebird"            # or "container:<server container>", or "host"
+    # Keep `user: "10001:10001"` (never root) and `cap_drop: [ALL]` (NET_RAW and NET_ADMIN
+    # included) from x-agent above, and no user namespace remapping (no `userns_mode`, no
+    # userns-remap or rootless daemon: the uid and gid maps must be the identity). Every other
+    # container in the shared network namespace, the Firebird server's included, must drop
+    # NET_RAW and NET_ADMIN (in its service: cap_drop: [NET_RAW, NET_ADMIN]).
     secrets: [pg_password]      # the target password files named in agent.yaml (`secret: {file: ...}`)
 
 secrets:

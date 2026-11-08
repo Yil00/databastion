@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { applyAccessEventsBytesOnline, DEFERRED_VALIDATIONS, ONLINE_0027_TAG, quotePlainIdentifier, validateDeferredConstraints } from "@/db/online-constraints";
 import { MIGRATION_LOCK_KEY, MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
-import { adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
+import { adminDropDatabase, adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
 
 async function withClient<T>(url: string, fn: (c: Client) => Promise<T>): Promise<T> {
   const c = new Client({ connectionString: url });
@@ -263,6 +263,37 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
     });
   });
 
+  describe("0048: policy_exceptions.cross_target (P10-E, P10-C review R2)", () => {
+    it("adds a not-null boolean defaulting to false, a validated CHECK, and the runtime role writes it", async () => {
+      const columns = await withClient(ownerUrl, (c) =>
+        c.query<{ data_type: string; is_nullable: string; column_default: string | null }>(
+          `select data_type, is_nullable, column_default from information_schema.columns
+            where table_schema = 'public' and table_name = 'policy_exceptions' and column_name = 'cross_target'`,
+        ),
+      );
+      expect(columns.rows).toEqual([{ data_type: "boolean", is_nullable: "NO", column_default: "false" }]);
+      const check = await withClient(ownerUrl, (c) =>
+        c.query<{ convalidated: boolean }>(
+          "select convalidated from pg_constraint where conrelid = 'public.policy_exceptions'::regclass and conname = 'policy_exceptions_cross_target'",
+        ),
+      );
+      expect(check.rows).toEqual([{ convalidated: true }]);
+      // A small, administrator-written table: validated in the migration, never deferred.
+      expect(DEFERRED_VALIDATIONS.map((d) => d.constraint)).not.toContain("policy_exceptions_cross_target");
+      const { url } = await createRuntimeRole();
+      await withClient(url, async (c) => {
+        const ok = await c.query<{ cross_target: boolean }>(
+          `insert into policy_exceptions (location, reason, cross_target) values ('{"object": "customers"}', 'r', true) returning cross_target`,
+        );
+        expect(ok.rows).toEqual([{ cross_target: true }]);
+        const plain = await c.query<{ cross_target: boolean }>("insert into policy_exceptions (target_id, reason) values ('t', 'r') returning cross_target");
+        expect(plain.rows).toEqual([{ cross_target: false }]);
+        await expect(c.query("insert into policy_exceptions (target_id, reason, cross_target) values ('t', 'r', true)")).rejects.toThrow(/policy_exceptions_cross_target/);
+        await c.query("delete from policy_exceptions where reason = 'r'");
+      });
+    });
+  });
+
   describe("concurrent migrate runs are serialized (security review L1)", () => {
     it("two concurrent runs on a fresh database both succeed, each migration applied once; a run waits for the lock", async () => {
       const suffix = randomBytes(6).toString("hex");
@@ -296,7 +327,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
           expect(done).toBe(true);
         });
       } finally {
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
       }
     });
@@ -396,7 +427,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         }
       } finally {
         before.cleanup();
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
       }
     });
@@ -475,7 +506,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         });
       } finally {
         before.cleanup();
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
       }
     });
@@ -517,7 +548,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         await adminInDb(db, `alter schema pgboss owner to ${owner}`);
         await expect(runMigrations(url)).resolves.toBeUndefined();
       } finally {
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
         await adminQuery(`drop role if exists ${other}`);
       }
@@ -544,7 +575,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
           expect(rows[0]).toEqual({ absent: true });
         });
       } finally {
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
         await adminQuery(`drop role if exists ${other}`);
       }

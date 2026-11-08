@@ -15,7 +15,9 @@ MariaDB and a MongoDB target, the agent and two workload clients) and measures:
 
 The SQL Server, Valkey / Redis and CAS targets have runs of their own on the same model:
 [SQL Server target](#sql-server-target), [Valkey and Redis targets](#valkey-and-redis-targets) and
-[CAS target](#cas-target).
+[CAS target](#cas-target); SQLite, which has no server, measures the impact on a concurrent writer:
+[SQLite targets](#sqlite-targets); Firebird adds the ADR-0060 measurements (attach bursts, per-row
+statements, the checkpoint I/O, the 10 000-object schema): [Firebird target](#firebird-target).
 
 The CI job is `load` in [`.github/workflows/load.yml`](../../.github/workflows/load.yml): weekly,
 on demand (`workflow_dispatch`, with the Audit run length as input) and on pull requests labelled
@@ -582,6 +584,196 @@ with Audit; every check passed:
   service time p95 1.127 ms without and 1.081 ms with Audit.
 - Agent: 0.019 core with Audit on (97 ms of CPU per 1 000 commands), 32.7 MiB peak RSS, no growth,
   nothing spooled or dropped.
+
+## SQLite targets
+ROADMAP P10-D, [ADR-0059](../../docs/adr/0059-sqlite-connector.md) decision 10 ("Load").
+[`sqlite.sh`](sqlite.sh) runs the console and the agent with
+[`docker-compose.sqlite.yml`](docker-compose.sqlite.yml) here (Compose project
+`databastion-load-sqlite`). The CI job is `load-sqlite` in
+[`load.yml`](../../.github/workflows/load.yml) (60 min budget, artifact `load-sqlite-results`); like
+the end-to-end job `e2e-sqlite`, it needs the console to list `engine.sqlite` (ROADMAP P10-E).
+
+SQLite has no server whose CPU a scan could cost: the reader runs in the agent's processes and the
+locks it takes are what an application feels. So the run measures **the impact on a concurrent
+writer**, the application ([`sqlite_writer.py`](sqlite_writer.py), Python standard library, in the
+pinned Python image as uid 10020, gid 10030, no network):
+
+1. **Two files** of about `LOAD_SQLITE_SIZE_MB` (default 1024) in `LOAD_SQLITE_TABLES` (8) tables of
+   1 KiB rows (`sqlite_writer.py seed`), in a volume the agent mounts read-only (`:ro`, group 10030
+   added, read-only root file system; the directory `2750` with the application's owner, ADR-0059
+   decision 2): `load-wal.db` in WAL mode, held open for the whole run by `sqlite-holder` (an
+   application's idle connection: its `-wal` and `-shm` exist), and `load-rollback.db` in
+   rollback-journal mode (`LOAD_SQLITE_ROLLBACK_JOURNAL`: `delete`, the default, `truncate` or
+   `persist`), declared `rollback_mode: read`.
+2. **The workload** (`sqlite_writer.py run`): `LOAD_SQLITE_RATE` (200) transactions per second on a
+   fixed schedule, each `BEGIN IMMEDIATE`, one INSERT and one UPDATE of `load_writes`, `COMMIT`, at
+   the SQLite defaults (`synchronous = FULL`), with `PRAGMA busy_timeout` at 0 and at 5 000 ms. Per
+   transaction its commit latency (BEGIN to the end of COMMIT), whether it committed, and where
+   `SQLITE_BUSY` / `SQLITE_LOCKED` came back (the transaction is then rolled back and counted
+   failed); every second the `-wal` size.
+3. For each file and busy timeout: a **baseline** run of `LOAD_SQLITE_BASELINE_S` (60) without scan,
+   then the writer again with a **paced Discovery scan** of the file (the agent's default 1 % duty
+   cycle, `LOAD_SAMPLE_ROWS` rows per table); the scan phase counts the transactions started from the
+   scan's delivery to its end. Four scans in all.
+4. **The agent's container** (the agent and its reader processes) sampled every second: its CPU over
+   each scan and its peak memory (cgroup anonymous memory, the readers included).
+
+[`sqliteload.py`](sqliteload.py) (unit tests in [`test_sqliteload.py`](test_sqliteload.py)) writes
+`results.json` and `results.md` with these checks, the criteria of ADR-0059 decision 10 (confirmed by the maintainer on 2026-11-06)
+(limits from `LOAD_LIMIT_SQLITE_<NAME>`):
+
+| Check | Criterion |
+|---|---|
+| `sqlite.<mode>.b<busy>.workload_ran` | the baseline issued at least 95 % of rate x duration (else the runner, not the agent, sets the figures) |
+| `sqlite.<mode>.b<busy>.scan_succeeded` | each scan succeeded |
+| `sqlite.wal.b<busy>.busy_during_scan` | WAL mode, both busy timeouts: no `SQLITE_BUSY` during the scan |
+| `sqlite.wal.b<busy>.p95_ms` | WAL mode: the commit p95 within 5 % of the baseline's, plus 0.5 ms for the runner's timer noise |
+| `sqlite.wal.b<busy>.wal_peak_mib` | WAL mode: the `-wal` peak during the scan at most max(2 x the baseline's peak, the baseline's peak + 8 MiB): no checkpoint starvation |
+| `sqlite.rollback.b5000.failed_during_scan` | rollback mode with a 5 s busy timeout: no failed commit |
+| `sqlite.rollback.b5000.p99_added_ms` | rollback mode with a 5 s busy timeout: the commit p99 less than `max_statement_ms` (500 ms) above the baseline's |
+| `sqlite.rollback.b0.busy_during_scan` | rollback mode without a busy timeout: the `SQLITE_BUSY` count and rate **measured, not judged** (ADR-0059 open question 8, answered on 2026-11-06: `rollback_mode` keeps its `skip` default) |
+| `agent.<mode>.b<busy>.cpu_cores_scan` | the agent and its readers under 2 % of one core over each scan (the analogue of the < 2 % criterion: SQLite's work happens on the application's host) |
+| `agent.memory_mb_peak`, `agent.no_loss` | at most 256 MiB at the peak; nothing dropped in the agent's log |
+
+In rollback-journal `delete` mode, the application creates and deletes its `-journal` at every
+commit: a reader whose Landlock grant predates a new `-journal` loses its unit (ADR-0059
+implementation note, item 10), so the rollback scans' coverage (in the scans table) is part of the
+measurement; `LOAD_SQLITE_ROLLBACK_JOURNAL=truncate` or `persist` keeps one `-journal` for the run.
+
+**Status**: first run 40197453899; its figures are in
+[docs/08](../../docs/08-engine-capabilities.md#load-and-database-impact-measured), and the
+maintainer's decisions of 2026-11-06 (the criteria confirmed, `skip` kept, the `delete`-mode advice
+kept) in the ADR-0059 note of that date.
+
+## Firebird target
+ROADMAP P10-D (the Firebird load run) and P10-B (measurements 8g and 3m, the checkpoint and ledger
+I/O, the 10 000-object schema); [ADR-0060](../../docs/adr/0060-firebird-connector.md) decision 9
+("End to end and load"), R7, R25, R41 items 2 and 9, and the implementation notes of 2026-11-01; the
+[RELEASE.md](../../RELEASE.md#open-release-gates) gate "Firebird Audit: the 10 000-object schema
+measurement". [`firebird.sh`](firebird.sh) runs the console, the agent and Firebird 5.0.4
+(`LOAD_FIREBIRD_VERSION=4.0.7`: the other pin of `dev/firebird/it.sh`) in the
+[e2e-firebird](../README.md#firebird-target) layout: the agent in its container in the server's
+network and pid namespaces with every capability dropped, the host's identity files declared in
+`firebird.audit.host_identity` and bind-mounted read-only (the same preconditions,
+`e2e/firebird_hostid.py`), the log volume's named-user ACLs, `max_log_size = 0`. Compose:
+`e2e/docker-compose.yml`, `e2e/docker-compose.firebird.yml`, the run's `hostid.yml` and
+[`docker-compose.firebird.yml`](docker-compose.firebird.yml) here (project
+`databastion-load-firebird`). The CI job is `load-firebird` in
+[`load.yml`](../../.github/workflows/load.yml) (120 min budget, artifact `load-firebird-results`).
+
+The database `crm` is created from the run's own seed, never the dev seed, so it holds no
+ground-truth value: [`seed.py`](seed.py) `firebird` (part `load`) or `firebird-schema` (part
+`schema`), loaded by the dev service's seed step (the image's `isql`, embedded, before the server
+listens; the log emptied), with the load accounts of
+[`initdb/firebird-20-load-users.sh`](initdb/firebird-20-load-users.sh) (passwords from the Docker
+secret on `isql`'s standard input). The client is [`fbload.py`](fbload.py) in the `fb-client`
+image ([`firebird-client/`](firebird-client/Dockerfile): Python, `firebird-driver` pinned by hash,
+the client library of the pinned 5.0.4 image), uid 10001 in the server's network namespace,
+read-only, no capability. `fbload.py trace` reads the trace log in place through the layout's ACL
+and prints counts, ids, sizes and timings only: the log holds every statement text and is never
+copied out. `fbload.py state` samples the agent's state volume read-only (sizes, inodes, mtimes).
+
+**Part `load`** (`LOAD_FB_TABLES` 200 tables, `LOAD_FB_ROWS` 500 000 rows, as `run.sh`'s seed):
+1. **Discovery**: a paced scan, the server's cgroup CPU against the idle baseline (run.sh's method,
+   criterion < 2 % of `LOAD_DB_CPUS`).
+2. **Audit under load**: `LOAD_FB_RATE` (300) point reads per second over `LOAD_CLIENTS` (4)
+   sessions as `LOAD_APP`, each in its own read-only read-committed transaction (an execute, a fetch
+   and a commit timed client-side), `LOAD_BASELINE_S` without Audit, then `LOAD_SOAK_S` with it.
+   Every statement an event (`events_accounted`), the trace log holding every statement
+   (`firebird.trace_holds_every_statement`, the source side), no event of the agent's account, the
+   agent's CPU and RSS, the p95 latency, the spool.
+3. **Checkpoint and ledger I/O**: every 0.5 s from Audit on to the end of part `load`, the size,
+   inode and mtime of `<target>.firebird_audit_trace.checkpoint`, `<target>.firebird_ledger.counters`
+   and the other files of `state_dir/audit/`: writes (a new inode or mtime; the files are written
+   whole), bytes written, rates and sizes. Checked against the implementation note of 2026-11-01:
+   14 MiB, 2 MiB and at most one checkpoint write per second.
+4. **8g** (R7): `LOAD_FB_BURSTS` (5) bursts of `LOAD_FB_BURST_SIZE` (256) concurrent attaches as
+   `LOAD_BURST` (threads released by a barrier, each attached for 1 s), each right after one of the
+   agent's checks, so that it opens the database. From the trace: per burst, whether it opened the
+   database (no attachment live at its first attach), the largest id inversion over every attach of
+   the database in the burst and the latest late record (header times). Checked: within 256 ids and
+   10 s, at least one burst that opened the database, the agent's ambiguous-record count
+   (`audit.log_records_ambiguous`) unchanged.
+5. **3m** (R25): with `LOAD_APP` at `LOAD_FB_RATE` next to them, per-row statements of 10 000 and
+   50 000 rows (and an `INSERT` of 200 000) as `LOAD_ROW` (`INSERT … SELECT` into `LOAD_SINK`, whose triggers are block-less and
+   block-ful per row; `SELECT LOAD_FN_LOOKUP(K)`, a block-ful function per row); then, as `LOAD_TX`,
+   open cursors over a per-row function in many transactions, partly fetched and held: 8 x 8 (within
+   the budget), 2 x 24 (past 16 transactions per binding), 4 x 4 held 15 s (block-ful-only groups past
+   10 s), 260 x 16 (past the stream's 4 096 groups), and 4 x 4 held 40 s with a graceful agent restart
+   12 s in. Checked: every statement in the principal's events; within the bounds, no ambiguous
+   record. Past a bound, the ambiguous count is reported, not judged (R25: fail closed, loud).
+
+**Part `schema`** (the RELEASE.md gate): the server again from fresh volumes, `crm` holding the
+schema of `seed.py` `FbSchema` (scale `LOAD_FB_SCHEMA_SCALE`, default 1), ERP-like proportions,
+11 425 objects at scale 1: 2 000 tables of six columns (300 with two computed columns, 400 with
+three check constraints, 200 with 300 expression indexes, 1 000 with a `BEFORE INSERT` id trigger, its
+sequence and a `BEFORE UPDATE` trigger), 1 500 views joining two tables, 3 000 procedures reading one
+to three tables, 400 functions, 100 packages of three procedures, and 25 monitoring routines and
+views over `MON$STATEMENTS` / `MON$ATTACHMENTS` (the dependent set's roots); about 33 500
+`RDB$DEPENDENCIES` rows. Then:
+6. **The dependent-set read** (R41 item 2): after three checks, the agent's four constant catalog
+   reads from the trace (per read: count, server-side time, rows fetched; per check, their sum) and
+   the agent's "dependent-set read cut or failed" warnings. Checked: at least 10 000 objects, the read
+   complete, each read under `check()`'s 3 s statement timeout, the four under its 9 s budget.
+7. **The flood**: six principals, one per category (`LOAD_PLAIN`, `LOAD_EXPR`, `LOAD_CHECK`,
+   `LOAD_COMP`, `LOAD_VIEW`, `LOAD_PROC`: plain, expression-index, check-constraint and
+   computed-column tables, views, selectable procedures), `LOAD_FB_SCHEMA_RATE` (10) point reads per
+   second each for `LOAD_FB_SCHEMA_PHASE_S` (120) s, three times: with the complete set; right after
+   a `CREATE VIEW` (an invalidated set until a check after its commit, R41 item 8); and after
+   procedures added past 65 536 dependency rows (a cut set, after three checks; the agent's cut
+   warning checked). Per phase and principal: statements, events and always-reported (`*`)
+   statements, measured, not judged (ADR-0060 says "measure"); every statement reported is checked.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOAD_FIREBIRD_VERSION` | 5.0.4 | 5.0.4 or 4.0.7 (amd64), the pins of `dev/firebird/it.sh` |
+| `LOAD_FIREBIRD_PARTS` | `load,schema` | `load`, `schema` or both |
+| `LOAD_FB_TABLES`, `LOAD_FB_ROWS` | 200, 500 000 | the load seed |
+| `LOAD_FB_RATE` | 300 | workload statements per second |
+| `LOAD_FB_BURSTS`, `LOAD_FB_BURST_SIZE` | 5, 256 | 8g (the burst size up to 1024; workflow input `firebird_burst_size`) |
+| `LOAD_FB_SCHEMA_SCALE` | 1 | the schema's object counts multiplied (0.1 to 4) |
+| `LOAD_FB_SCHEMA_RATE`, `LOAD_FB_SCHEMA_PHASE_S` | 10, 120 | the flood workload, per principal |
+
+**CI runs (2026-11-03 and 2026-11-04), every check passed:** load runs 41714461890 (4.0.7),
+41723479359 (5.0.4) and 41731951122 (4.0.7, bursts of 512), and schema-only runs 41749337262 (5.0.4)
+and 41751673735 (4.0.7) after #408. The figures are in
+[docs/08](../../docs/08-engine-capabilities.md#load-and-database-impact-measured) and the ADR-0060
+implementation note of 2026-11-04.
+
+**Earlier local runs, 2026-11-03** (not CI: a 4-CPU VM with cgroup v1, the stand-in
+`firebird-audit-init` image locally; 180 s soak, 60 s flood phases, 3 bursts). Every check passed but `firebird.8g_bursts_seen` (a client-side driver race
+lost part of some bursts; fixed since, and a second 4.0.7 run had 6 of 6 full bursts) and, on the first run, the stream's
+first open before the first check, now declared as expected:
+
+| | 5.0.4 | 4.0.7 |
+|---|---|---|
+| Discovery impact (203 tables, 500 000 rows) | 0.538 % (217 s scan) | 0.531 % (188 s scan) |
+| Audit: statements / in the trace / events | 54 000 / 54 000 / 54 000 | 54 000 / 54 000 / 54 000 |
+| p95 off / on (ms), drain (s) | 2.61 / 2.40, 63.6 | 1.96 / 1.94, 63.6 |
+| Agent CPU (core, Audit on), peak RSS (MiB) | 0.0137, 73.5 | 0.0126, 66.2 |
+| Events under the agent's account | 0 | 0 |
+| Checkpoint: writes, bytes written, peak size, over ~1 450 s | 67, 5.2 MB, 624 KB | 57, 4.3 MB, 623 KB |
+| Ledger: writes, bytes written, peak size | 114, 13.9 MB, 162 KB | 104, 12.6 MB, 159 KB |
+| 8g: largest inversion, latest late record (bursts that opened the database) | 18 ids, 0.114 s | 256 ids, 0.998 s (a second run, 6 full bursts: 26, 13, 243, 241, 16, 256 ids) |
+| 8g: ambiguous records | 0 | 0 |
+| 3m: statements reported / expected; ambiguous records | all; 0 (every step, the 260 x 16 step too) | all, the restart step 31 for 16 (re-sent after the restore); 0 |
+| Schema: objects, dependency rows | 11 430, 33 525 | 11 430, 33 525 |
+| Dependent-set read: slowest read, four reads per check (server-side) | 70 ms, 136 ms (complete) | 67 ms, 148 ms (complete) |
+| Cut set (65 601 rows fetched): slowest read, cut warnings | 161 ms, 3 of 3 checks | 164 ms, 3 of 3 checks |
+
+On 4.0.7 the inversion grows with the burst, as R7 measured: in half the bursts the late records
+are almost the whole burst (237 to **256** ids for 256 attaches, about 1 s late), so a 256-attach
+burst reaches R7's count bound exactly (accepted: no ambiguous record) and a larger one would pass
+it; the workflow input `firebird_burst_size` probes past the bound. The always-reported share per principal
+(600 statements each per phase): expression-index tables 100 % with the complete and the
+invalidated set, **0 % with a cut set** (a fail-open, fixed by #408: 100 % in the CI schema runs); check-constraint tables 0 % (their check triggers depend on
+no always-reported relation); views, procedures and computed-column tables 0 %, 100 % with a cut
+set; an invalidating `CREATE VIEW` (4.0.7) made about 80 statements per principal always reported,
+plain tables included, for 7.8 s after its commit.
+
+Not covered here (the ADR's 3m list): a restart while an external-source binding's events are held
+and long caller transactions with a local external data source (R29); the Garbage Collector's end
+under a linger (8i, measured in #378) is not driven, only met when a burst closes the database.
 
 ## Event census (ADR-0053 decision 6, informational)
 

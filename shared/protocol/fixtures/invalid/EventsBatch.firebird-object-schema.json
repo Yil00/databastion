@@ -1,0 +1,28 @@
+{
+  "batch_id": "019a1d2d-0c11-7e4f-8a33-5d6e7f809a1d",
+  "events": [
+    {
+      "target_id": "fb-crm",
+      "ts": "2026-10-25T09:01:00Z",
+      "principal": {
+        "db_user": "ETL_READER",
+        "client_addr": "127.0.0.1"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "object": "CUSTOMERS",
+          "schema": "public"
+        }
+      ],
+      "rows": 250000,
+      "signals": [
+        "shape.full_table_read",
+        "volume.large_result"
+      ],
+      "source": "firebird_audit_trace",
+      "aggregated_count": 1
+    }
+  ]
+}

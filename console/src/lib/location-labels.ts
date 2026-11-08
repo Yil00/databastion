@@ -24,6 +24,15 @@ import type { AuditSource, Engine } from "@/lib/protocol/enums";
  * `value` for strings and members, or `#key` / `#field` for values found in names. Key patterns
  * follow the contract's rendering rule (`KeyPattern`): escaped text only, never a link or `href`,
  * inline code in plain-text messages (`src/lib/key-pattern.ts`).
+ *
+ * SQLite (ADR-0059 decision 6, contract `Location` text): `database` is always `main` (SQLite's
+ * name for the file's own database, the same on every target), no schema, `object` the table and
+ * `field` the column. The views show the target, the table and the column, never `main` as if it
+ * told files apart: the target id does (`locationDatabaseShown`).
+ *
+ * Firebird (ADR-0060 decision 5, contract `Location` text): database (the name declared in
+ * `agent.yaml`, never a file path or alias), table, column; no schema (the contract refuses one).
+ * Shown on one line, as for MySQL, without a schema part.
  */
 
 export interface LocationPartLabels {
@@ -39,6 +48,8 @@ const CAS_REGISTRY: LocationPartLabels = { database: "store", schema: "service t
 const CAS_AUDIT: LocationPartLabels = { database: "store", schema: "schema", object: "log", field: "field" };
 const SQL_SERVER: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
 const KEY_VALUE: LocationPartLabels = { database: "database", schema: "type", object: "key pattern", field: "field" };
+const SQLITE: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
+const FIREBIRD: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
 
 /**
  * Display names of the contract engines. Exhaustive: a new contract engine fails `tsc` until it is
@@ -54,6 +65,8 @@ const ENGINE_NAMES: Record<Engine, string> = {
   sqlserver: "Microsoft SQL Server",
   redis: "Redis",
   valkey: "Valkey",
+  sqlite: "SQLite",
+  firebird: "Firebird",
 };
 
 /** Display name of an engine; a string that is not a contract engine is returned as is. */
@@ -72,12 +85,41 @@ export function isCasEngine(engine: string | null | undefined): boolean {
   return engine === "cas";
 }
 
+export function isSqliteEngine(engine: string | null | undefined): boolean {
+  return engine === "sqlite";
+}
+
+/**
+ * Engines with Discovery only: no server and Audit None by nature, so no audit source, server
+ * version or edition, and no Audit settings (ADR-0059 decision 7; the agent ends an
+ * `audit.configure` job `unsupported`, and the console never queues one). Shown as "Discovery only".
+ */
+export const DISCOVERY_ONLY_ENGINES: readonly Engine[] = ["sqlite"];
+
+export function isDiscoveryOnlyEngine(engine: string | null | undefined): boolean {
+  return (DISCOVERY_ONLY_ENGINES as readonly string[]).includes(engine ?? "");
+}
+
+/** What the views show for the audit level of a Discovery-only target. */
+export const DISCOVERY_ONLY_LABEL = "Discovery only";
+export const DISCOVERY_ONLY_TITLE =
+  "This engine has no server and no access log: the agent reads the declared database file for Discovery only, and Audit is None by nature (ADR-0059). There are no Audit settings and no access events for such targets.";
+
+/**
+ * Whether the `database` part of a location tells anything: false on SQLite, where it is `main` on
+ * every target (the target id tells files apart), so the views leave it out.
+ */
+export function locationDatabaseShown(engine: string | null | undefined): boolean {
+  return !isSqliteEngine(engine);
+}
+
 /**
  * Engines whose location parts are shown with their own names rather than on one line: OpenLDAP,
- * CAS, and Redis / Valkey (the key pattern is shown apart, as inline code).
+ * CAS, Redis / Valkey (the key pattern is shown apart, as inline code) and SQLite (table and
+ * column, without the constant database `main`).
  */
 export function hasNamedLocationParts(engine: string | null | undefined): boolean {
-  return isLdapEngine(engine) || isCasEngine(engine) || isKeyPatternEngine(engine);
+  return isLdapEngine(engine) || isCasEngine(engine) || isKeyPatternEngine(engine) || isSqliteEngine(engine);
 }
 
 /** Names of the location parts; `database` tells the CAS service registry from its audit log. */
@@ -86,6 +128,8 @@ export function locationPartLabels(engine: string | null | undefined, database: 
   if (isCasEngine(engine)) return database === CAS_AUDIT_STORE ? CAS_AUDIT : CAS_REGISTRY;
   if (engine === "sqlserver") return SQL_SERVER;
   if (isKeyPatternEngine(engine)) return KEY_VALUE;
+  if (isSqliteEngine(engine)) return SQLITE;
+  if (engine === "firebird") return FIREBIRD;
   return GENERIC;
 }
 
@@ -115,6 +159,7 @@ const SOURCE_ENGINES: Record<AuditSource, readonly Engine[]> = {
   redis_commandlog: ["redis", "valkey"],
   redis_acl_log: ["redis", "valkey"],
   redis_sync: ["redis", "valkey"],
+  firebird_audit_trace: ["firebird"],
 };
 
 /** Every contract `AuditSource` with its engines. */

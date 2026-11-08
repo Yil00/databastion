@@ -29,8 +29,11 @@ jobs:
       oidc: ${{ steps.e2e.outputs.oidc }}
       cas: ${{ steps.e2e.outputs.cas }}
       sqlserver: ${{ steps.e2e.outputs.sqlserver }}
+      firebird: ${{ steps.e2e.outputs.firebird }}
       e2e_sqlserver: ${{ steps.e2e.outputs.e2e_sqlserver }}
       e2e_redis: ${{ steps.e2e.outputs.e2e_redis }}
+      e2e_sqlite: ${{ steps.e2e.outputs.e2e_sqlite }}
+      e2e_firebird: ${{ steps.e2e.outputs.e2e_firebird }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,6 +101,15 @@ jobs:
             sqlserver=false
           fi
           echo "sqlserver=$sqlserver" | tee -a "$GITHUB_OUTPUT"
+          # Firebird connector (agent-firebird, ADR-0060 lots 1 and 2): the agent, the
+          # throwaway-server scripts (image pins), the dev seed and its ground truth, and this
+          # workflow.
+          if [ -z "$changed" ] || grep -qE '^(agent/|dev/firebird/|dev/seed/out/firebird\.sql$|dev/ground-truth\.json$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            firebird=true
+          else
+            firebird=false
+          fi
+          echo "firebird=$firebird" | tee -a "$GITHUB_OUTPUT"
           # SQL Server target end to end (e2e/sqlserver.sh, the 2.3 GB image): the agent, the console,
           # the e2e harness, the SQL Server dev service and its seed, the ground truth, the compose
           # file (image pin) and this workflow.
@@ -115,8 +127,24 @@ jobs:
             e2e_redis=false
           fi
           echo "e2e_redis=$e2e_redis" | tee -a "$GITHUB_OUTPUT"
+          # SQLite targets end to end (e2e/sqlite.sh): the same, with the SQLite writer sidecar and its
+          # seed.
+          if [ -z "$changed" ] || grep -qE '^(agent/|console/|shared/|e2e/|deploy/initdb/|dev/sqlite/|dev/seed/out/sqlite|dev/ground-truth\.json$|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e_sqlite=true
+          else
+            e2e_sqlite=false
+          fi
+          echo "e2e_sqlite=$e2e_sqlite" | tee -a "$GITHUB_OUTPUT"
+          # Firebird target end to end (e2e/firebird.sh): the same, with the Firebird dev service (its
+          # image pin, configuration, trace configuration, entrypoint and ACL init step) and its seed.
+          if [ -z "$changed" ] || grep -qE '^(agent/|console/|shared/|e2e/|deploy/initdb/|dev/firebird/|dev/seed/out/firebird\.sql$|dev/ground-truth\.json$|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e_firebird=true
+          else
+            e2e_firebird=false
+          fi
+          echo "e2e_firebird=$e2e_firebird" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
-              || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
+              || grep -qE '^(agent/|console/|deploy/|e2e/sqlite-unit\.sh$|e2e/sqlite_unit_driver\.py$|e2e/firebird-unit\.sh$|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
           else
             packaging=false
@@ -134,11 +162,14 @@ jobs:
       # Release settings guard of release.yml / publish.yml (ADR-0034) on fixture rulesets.
       - name: Release settings check (fixtures)
         run: timeout 60 .github/scripts/test_check_release_settings.sh
+      # Final-version checks of publish.yml (ADR-0058, implementation note of 2026-10-24) on fixtures.
+      - name: Final release checks (fixtures)
+        run: timeout 60 .github/scripts/test_check_final_release.sh
 
   secrets:
     name: Secret scanning (gitleaks)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     env:
       GITLEAKS_VERSION: 8.30.1
     steps:
@@ -149,9 +180,19 @@ jobs:
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -sSfLO "$base/$archive"
-          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " ${archive}\$" | sha256sum -c -
-          tar -xzf "$archive" gitleaks
+          # GitHub release downloads answer 504 at times: retry, and fall back to building the same
+          # version from the Go module proxy (its content is verified against sum.golang.org).
+          retry=(--retry 3 --retry-delay 10 --retry-all-errors --retry-max-time 90)
+          if curl -sSfL "${retry[@]}" -o "$archive" "$base/$archive" \
+            && curl -sSfL "${retry[@]}" -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"; then
+            grep " ${archive}\$" checksums.txt | sha256sum -c -
+            tar -xzf "$archive" gitleaks
+          else
+            echo "::warning::gitleaks release download failed; building v${GITLEAKS_VERSION} from the Go module proxy"
+            GOTOOLCHAIN=auto GOFLAGS=-mod=mod go install "github.com/zricethezav/gitleaks/v8@v${GITLEAKS_VERSION}"
+            cp "$(go env GOPATH)/bin/gitleaks" ./gitleaks
+          fi
+          ./gitleaks version
       - name: Scan history
         run: ./gitleaks git --redact --verbose --exit-code 1 .
 
@@ -242,11 +283,11 @@ jobs:
         working-directory: agent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       - run: cargo fmt --all --check
@@ -265,7 +306,7 @@ jobs:
           cargo test -p databastion-classifiers --test holdout --all-features --locked -- --ignored --nocapture
       - name: Minimal build (no connector)
         run: cargo build --no-default-features --locked
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-deny@0.20.2
       # Policy in agent/deny.toml: banned crates (OpenSSL, native-tls, HTTP servers…),
@@ -284,7 +325,7 @@ jobs:
   # left out. Bump `toolchain` together with `rust-version` in agent/Cargo.toml and the pin in
   # release.yml. Required through ci-result.
   agent-msrv:
-    name: Agent MSRV (Rust 1.88.0)
+    name: Agent MSRV (Rust 1.89.0)
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     runs-on: ubuntu-latest
@@ -298,10 +339,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
           key: msrv
@@ -370,10 +411,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       - name: Start the dev PostgreSQL service
@@ -432,10 +473,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       - name: Start the dev MySQL and MariaDB services
@@ -495,10 +536,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       - name: Start the dev MongoDB service
@@ -563,10 +604,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       - name: Start the dev OpenLDAP service
@@ -631,10 +672,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       # With the Unix sockets published to the runner (dev/redis/compose.socket.yml, #239 re-review
@@ -680,6 +721,93 @@ jobs:
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
 
+  # SQLite connector tests (P10-A, ADR-0059): no service container. The connector's own tests
+  # (unit, property and in-process integration tests on files they create) run as the runner's
+  # user; the reader-process tests (agent/crates/agent/tests/sqlite_reader.rs: the agent binary in
+  # its sandboxed `sqlite-reader` mode, Landlock and seccomp, the strict file policy on a
+  # read-only bind mount, the writer in another process, a truncated -shm killing the reader and
+  # never the agent) run as root, which they need to play the application's account, the agent's
+  # account and the read-only mount; DATABASTION_IT_SQLITE_REQUIRE=1 makes them fail instead of
+  # skipping (no root, no Landlock). Required through ci-result (a matrix job: ci-result sees one
+  # result, failed if any leg failed).
+  # Two legs (re-review N3 of P10-A): amd64 and arm64. The reader's seccomp allow-list is built per
+  # architecture (`target_arch` cfgs in connector-sqlite/src/sandbox.rs: the system call numbers,
+  # the audit architecture, `open` on x86_64 only, the x32 rule on x86_64 only), so the arm64 leg
+  # runs the same tests natively on an aarch64 runner kernel: the filter's own unit tests with the
+  # aarch64 audit architecture, tests/sandbox.rs (the sandbox applied for real, every refusal
+  # checked) and the reader-process tests (the reader starts, reads, and its crash stays its own).
+  agent-sqlite:
+    name: Agent SQLite (${{ matrix.arch }})
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: agent
+      - name: Kernel, architecture and Landlock
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          uname -rm
+          cat /sys/kernel/security/lsm 2>/dev/null || true
+          echo
+          case "$ARCH:$(uname -m)" in
+            amd64:x86_64 | arm64:aarch64) ;;
+            *) echo "::error::runner architecture $(uname -m) is not the leg's ($ARCH)"; exit 1 ;;
+          esac
+          # landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION): number 444 on both
+          # architectures (asm-generic and x86_64 tables agree from Linux 5.13).
+          python3 -I -c 'import ctypes, sys; libc = ctypes.CDLL(None, use_errno=True); abi = libc.syscall(444, None, 0, 1); print("Landlock ABI", abi if abi > 0 else "unavailable (errno %d)" % ctypes.get_errno()); sys.exit(0 if abi > 0 else 1)'
+      - name: Connector tests (unit, property, in-process integration, the sandbox's refusals)
+        env:
+          # tests/sandbox.rs applies the reader's sandbox in a child process: it must run.
+          DATABASTION_IT_SQLITE_REQUIRE: "1"
+        run: |
+          set -o pipefail
+          timeout 1200 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-sqlite --all-features --locked 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Reader-process tests (as root, read-only bind mounts)
+        run: |
+          set -o pipefail
+          exe="$(timeout 1200 cargo test -p databastion-agent --test sqlite_reader --all-features --locked --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sqlite_reader" and .executable != null) | .executable')"
+          test -x "$exe"
+          file "$exe"
+          sudo env DATABASTION_IT_SQLITE_REQUIRE=1 timeout 600 "$exe" --test-threads 1 2>&1 | tee -a "$RUNNER_TEMP/it.log"
+      # Not skipped on this architecture: the sandbox applied for real (tests/sandbox.rs), the
+      # filter's unit test with this architecture's numbers, and the reader process started, read
+      # from and crashed without the agent.
+      - name: The sandbox tests ran on this architecture
+        run: |
+          for t in "test sandbox_refusals ... ok" \
+              "test sandbox_refusals_without_openat2 ... ok" \
+              "test sandbox::tests::the_allow_list_refuses_everything_else ... ok" \
+              "test sandbox::tests::grant_opens_without_links ... ok" \
+              "test the_reader_is_sandboxed_and_its_crashes_stay_its_own ... ok" \
+              "test a_rollback_file_is_scanned_by_the_sandboxed_reader ... ok" \
+              "test a_wal_file_is_read_while_another_process_writes_and_nothing_changes ... ok"; do
+            grep -qxF "$t" "$RUNNER_TEMP/it.log" || { echo "::error::not run: ${t}"; exit 1; }
+          done
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+
   # SQL Server connector integration tests (P9-A, P9-D, ADR-0051) against the opt-in dev profile
   # `sqlserver`: SQL Server 2022 Express (MSSQL_PID=Express, set by docker-compose.yml: the
   # maintainer's choice until the Developer license terms are confirmed for CI, ADR-0051 open
@@ -704,10 +832,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
       - name: Start the dev SQL Server service
@@ -733,6 +861,47 @@ jobs:
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
 
+  # Firebird connector integration tests (ADR-0060 decision 10): lot 1, the own protocol-16
+  # client, SRP-256, ChaCha64 / ChaCha (Arc4 and unencrypted servers refused), the loopback,
+  # peer-uid and forwarder rules (a socat forwarder) and check() against throwaway servers of the
+  # pinned 5.0.4 and 4.0.7 images run as uid 84 on the loopback of a dedicated network namespace
+  # (the tests enter it with sudo nsenter and run as the runner user; every container drops NET_RAW
+  # and NET_ADMIN), the authentication mappings to SYSDBA and RDB$ADMIN, plus Firebird 3.0's
+  # refusal; lot 2, Discovery against the dev seed (dev/seed/out/firebird.sql, loaded as `crm`)
+  # and dev/ground-truth.json with the I2 check, the CAS store guard, pacing, and the account
+  # mapped to SYSDBA refused (dev/firebird/it.sh). Fake random passwords in 0600 files, never on a
+  # command line nor in an environment variable.
+  agent-firebird:
+    name: Agent Firebird integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true' && needs.detect.outputs.firebird == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50 # the two 20-minute test steps, plus setup (review N8)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: agent
+      - name: Connector integration tests (Firebird 5.0.4)
+        run: |
+          set -o pipefail
+          timeout 1200 dev/firebird/it.sh 5 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Connector integration tests (Firebird 4.0.7)
+        run: |
+          set -o pipefail
+          timeout 1200 dev/firebird/it.sh 4 2>&1 | tee -a "$RUNNER_TEMP/it.log"
+      # Last, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error|^\[it\] " "$RUNNER_TEMP/it.log" | head -n 120 || true
+
   # Release-mode Unicode sweep of the Redis / Valkey key-pattern gate against the contract's
   # KeyPattern rule (classifiers test keys_contract): every code point, in the shapes the rules look
   # at, so that a Unicode version drift between the `regex` crate and the contract's validator shows
@@ -752,10 +921,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent
           key: release-sweep
@@ -779,10 +948,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: agent/fuzz
       - name: Fuzz targets, 10 s each
@@ -1059,6 +1228,121 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # SQLite targets end to end (ROADMAP P10-D, ADR-0059 decision 10; e2e/README.md "SQLite targets"):
+  # the dev seed's three files written and held open by the application sidecar, mounted read-only
+  # into the agent; Discovery against the ground truth, "Discovery only" on the agent page, an
+  # audit.configure attempt ending unsupported, a -shm truncated during a scan, the I2 check.
+  # Needs the console to list `engine.sqlite` (P10-E, #357). Required through ci-result, like
+  # e2e-cas, e2e-sqlserver and e2e-redis.
+  e2e-sqlite:
+    name: E2E SQLite targets
+    needs: detect
+    if: needs.detect.outputs.e2e_sqlite == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-sqlite-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || true
+          echo
+      - name: shellcheck
+        run: |
+          timeout 60 shellcheck -x e2e/sqlite.sh e2e/lib.sh dev/sqlite/files-init.sh e2e/sqlite-unit.sh e2e/firebird-unit.sh
+          python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' e2e/sqlite_unit_driver.py
+      - name: Unit tests of the I2 leak scanner
+        run: timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
+      - name: Run e2e/sqlite.sh
+        # Within the job budget (40 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 1980 e2e/sqlite.sh
+      # sqlite.sh redacts every generated secret from the logs on exit, whatever the result (and
+      # masks them in the job log).
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlite-logs
+          path: e2e-sqlite-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Firebird target end to end (ROADMAP P10-D; ADR-0060 R39 (j) and the host-identity refinement's
+  # R52 item 2; e2e/README.md "Firebird target"): the RELEASE.md gate "Firebird Audit end to end".
+  # The console and agent images with the dev Firebird 5.0.4 service (uid 84, loopback only, the
+  # system audit trace, the seed as `crm`), the agent in its container in the server's network and
+  # pid namespaces (every container of it without NET_RAW / NET_ADMIN), the Firebird root,
+  # configuration and log directory read-only at the server's paths, and this runner's own
+  # /etc/passwd, /etc/group, /etc/nsswitch.conf (and /etc/subuid, /etc/subgid) as single-file
+  # read-only bind mounts, never edited. Preconditions first (e2e/firebird_hostid.py: uids 84 and
+  # 10001 absent from the runner's passwd and outside its subordinate and systemd ranges, its
+  # nsswitch.conf accepted, uid 1001 present): the job fails rather than picking other uids. Then
+  # the log volume's ACLs (kept by its file system; written to the job summary) and max_log_size = 0
+  # in the trace configuration (R54), Discovery against dev/ground-truth.json, `firebird.audit`
+  # reaching Partial through `firebird.audit.host_identity`, a full read of seeded tables raising a
+  # critical incident, the #82 marker cases, I2, and the four real-kernel negative steps (no
+  # host_identity, a file of the agent image, the passwd file mounted read-write, the agent as uid
+  # 1001), each not Partial with its local reason. Fake random passwords in files of a private
+  # 0700 directory, never on a command line nor in a container's configuration; logs redacted.
+  # Required through ci-result, like the other e2e jobs.
+  e2e-firebird:
+    name: E2E Firebird target
+    needs: detect
+    if: needs.detect.outputs.e2e_firebird == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-firebird-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          uname -r
+          docker info --format '{{.Driver}} {{.DockerRootDir}}'
+          shellcheck --version | head -n 2
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/firebird.sh e2e/lib.sh e2e/target-initdb/firebird-20-clients.sh dev/firebird/entrypoint.sh dev/firebird/acl-init/layout.sh
+      - name: Unit tests of the preconditions and the I2 leak scanner
+        run: |
+          timeout 120 python3 -m unittest discover -s e2e -p 'test_firebird*.py' -v
+          timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
+      - name: Run e2e/firebird.sh
+        # Within the job budget (50 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 2700 e2e/firebird.sh
+      # firebird.sh redacts every generated secret and the #82 markers from the logs on exit, whatever
+      # the result (and masks them in the job log). The ACL check and the event census are in the job
+      # summary too.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-firebird-census
+          path: e2e-firebird-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-firebird-logs
+          path: e2e-firebird-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
   # RELEASE.md section 7 "Compatibility": e2e/run.sh with the console from this PR and the agent of
   # the previous release (its signed image, verified with the exact tag identity and pulled by
   # digest; .github/workflows/e2e-compat.yml, e2e/README.md "Compatibility with the previous agent").
@@ -1089,7 +1373,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-firebird, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-sqlite, e2e-firebird, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

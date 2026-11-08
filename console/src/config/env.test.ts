@@ -98,15 +98,18 @@ describe("agentTokensHold (DATABASTION_AGENT_TOKENS_HOLD, ADR-0022 decision 8)",
   });
 
   it("accepts each known release line, trimmed", () => {
-    expect(AGENT_TOKENS_HOLD_RELEASES).toEqual(["0.8"]);
+    expect(AGENT_TOKENS_HOLD_RELEASES).toEqual(["0.8", "0.9"]);
     expect(hold("0.8")).toBe("0.8");
     expect(hold(" 0.8\n")).toBe("0.8");
+    // P10-E: 0.9.0 shipped, and this build lists engine.sqlite.
+    expect(hold("0.9")).toBe("0.9");
+    expect(hold(" 0.9\n")).toBe("0.9");
   });
 
   it("refuses any other value without echoing it (fail closed: the processes refuse to start)", () => {
     const message =
-      "DATABASTION_AGENT_TOKENS_HOLD must be unset or one of: 0.8 (the release line of the oldest console replica).";
-    for (const v of ["0.8.2", "0.8.0", "v0.8", "0.7", "0.9", "1", "true", "0.8,0.9", "0,8", "08"]) {
+      "DATABASTION_AGENT_TOKENS_HOLD must be unset or one of: 0.8, 0.9 (the release line of the oldest console replica).";
+    for (const v of ["0.8.2", "0.8.0", "v0.8", "0.7", "0.9.0", "0.10", "1", "true", "0.8,0.9", "0,8", "08", "09"]) {
       expect(() => hold(v), v).toThrow(new ConfigError(message));
     }
   });

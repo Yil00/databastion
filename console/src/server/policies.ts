@@ -21,6 +21,7 @@ import {
   type PolicySource,
   type Severity,
 } from "@/lib/policy-model";
+import { exceptionIsCrossTarget } from "@/lib/policy-common";
 import { validateSchema } from "@/lib/protocol/validate";
 
 import { writeAudit } from "./audit";
@@ -296,9 +297,17 @@ export interface ExceptionInput {
   location: LocationPattern | null;
   reason: string;
   expiresAt: Date | null;
+  /**
+   * `cross_target: true` (P10-C review R2): the administrator confirms that this location
+   * exception, not scoped to one agent and one target, also covers SQLite items, whose locations
+   * are `main` on every file (`TARGET_SCOPED_EXCEPTION_ENGINES`). Refused (`cross_target`) on an
+   * exception without a location or scoped to an agent and a target, where it means nothing.
+   * Absent: false (`parseExceptionInput` always sets it).
+   */
+  crossTarget?: boolean;
 }
 
-const EXCEPTION_KEYS = ["policy_id", "agent_id", "target_id", "classifier", "location", "reason", "expires_at"] as const;
+const EXCEPTION_KEYS = ["policy_id", "agent_id", "target_id", "classifier", "location", "reason", "expires_at", "cross_target"] as const;
 /** At most ~10 years ahead: an expiry is a reminder, not a way around the "no silent forever" rule. */
 const MAX_EXPIRY_MS = 3653 * 24 * 3600_000;
 
@@ -325,6 +334,11 @@ export function parseExceptionInput(v: unknown, now = Date.now()): { ok: true; v
     // An exception always has a scope: it can never silence every finding.
     return { ok: false, error: "scope" };
   }
+  // P10-C review R2: the confirmation is a JSON `true` or absent (`false` and `null`: not given),
+  // and only on an exception it changes: a location exception not scoped to an agent and a target.
+  if (v.cross_target !== undefined && v.cross_target !== null && typeof v.cross_target !== "boolean") return { ok: false, error: "cross_target" };
+  const crossTarget = v.cross_target === true;
+  if (crossTarget && !exceptionIsCrossTarget({ agentId, targetId, location })) return { ok: false, error: "cross_target" };
   if (typeof v.reason !== "string" || v.reason.trim() === "" || !isDescription(v.reason, REASON_MAX)) {
     return { ok: false, error: "reason" };
   }
@@ -334,7 +348,16 @@ export function parseExceptionInput(v: unknown, now = Date.now()): { ok: true; v
     if (!Number.isFinite(t) || t <= now || t > now + MAX_EXPIRY_MS) return { ok: false, error: "expires_at" };
     expiresAt = new Date(t);
   }
-  return { ok: true, value: { policyId, agentId, targetId, classifier, location, reason: v.reason.trim(), expiresAt } };
+  return { ok: true, value: { policyId, agentId, targetId, classifier, location, reason: v.reason.trim(), expiresAt, crossTarget } };
+}
+
+/** How an exception reaches the SQLite items (P10-C review R2; `exceptionReachesItem`). */
+export type ExceptionSqliteScope = "not_location" | "target" | "every_target" | "excluded";
+
+export function exceptionSqliteScope(x: Pick<ExceptionInput, "agentId" | "targetId" | "location" | "crossTarget">): ExceptionSqliteScope {
+  if (x.location === null) return "not_location";
+  if (!exceptionIsCrossTarget(x)) return "target";
+  return x.crossTarget === true ? "every_target" : "excluded";
 }
 
 export type ExceptionWriteOutcome = { outcome: "ok"; id: string } | { outcome: "unknown_policy" } | { outcome: "unknown_agent" };
@@ -368,6 +391,10 @@ export async function createException(db: Database, input: ExceptionInput, actor
         classifier: input.classifier,
         location: input.location !== null,
         expires_at: input.expiresAt?.toISOString() ?? null,
+        // P10-C review R2: whether it reaches SQLite items on every target (confirmed), or none
+        // of them (a location exception not scoped to an agent and a target, not confirmed).
+        cross_target: input.crossTarget === true,
+        sqlite_scope: exceptionSqliteScope(input),
       },
     });
     return { outcome: "ok" as const, id: row.id };
@@ -416,6 +443,8 @@ export interface ExceptionView {
   reason: string;
   expiresAt: Date | null;
   createdAt: Date;
+  /** The `cross_target` confirmation (P10-C review R2). */
+  crossTarget: boolean;
 }
 
 export async function listExceptions(db: Database, policyId?: string): Promise<ExceptionView[]> {
@@ -432,6 +461,7 @@ export async function listExceptions(db: Database, policyId?: string): Promise<E
       reason: policyExceptions.reason,
       expiresAt: policyExceptions.expiresAt,
       createdAt: policyExceptions.createdAt,
+      crossTarget: policyExceptions.crossTarget,
     })
     .from(policyExceptions)
     .leftJoin(policies, eq(policies.id, policyExceptions.policyId))

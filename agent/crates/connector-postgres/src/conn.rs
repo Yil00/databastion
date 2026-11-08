@@ -43,6 +43,16 @@ pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// `idle_in_transaction_session_timeout` of every transaction: the
 /// connector never idles inside a transaction, so a short bound.
 pub(crate) const IDLE_IN_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Oldest supported server, as `server_version_num` (ADR-0039 decision 1:
+/// PostgreSQL 12 and 13 are end of life and refused).
+const MIN_SERVER_VERSION_NUM: u32 = 140_000;
+
+/// Whether a server of `server_version_num` is supported; an older one,
+/// or a version that cannot be read (`0`), is refused at connection time
+/// (`unsupported`), before any other statement.
+pub(crate) fn supported_version(server_version_num: u32) -> bool {
+    server_version_num >= MIN_SERVER_VERSION_NUM
+}
 
 /// Timeouts applied to a transaction. The statement timeout comes from the
 /// clamped job parameter (`ScanJob::statement_timeout`), at least 100 ms.
@@ -258,6 +268,16 @@ impl Session {
             .try_get(5)
             .map_err(|e| PgError::from_driver(&e, Stage::SessionSetup))?;
         session.server_version_num = version.parse().unwrap_or(0);
+        if !supported_version(session.server_version_num) {
+            // The session is dropped (closed) unused: no sampling, no
+            // check query, no Audit poll on it.
+            tracing::warn!(
+                target_id = %target.id,
+                server_version_num = session.server_version_num,
+                "server version not supported (PostgreSQL 14+)"
+            );
+            return Err(PgError::new(FailureCode::Unsupported, Stage::Connect));
+        }
         Ok(session)
     }
 
@@ -466,6 +486,22 @@ fn refused_auth(e: &tokio_postgres::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0039 decision 1: PostgreSQL 14+ only, fail closed on an
+    /// unreadable version.
+    #[test]
+    fn old_servers_are_refused() {
+        for v in [0, 90_624, 100_023, 120_022, 130_018, 130_099, 139_999] {
+            assert!(!supported_version(v), "{v}");
+        }
+        for v in [
+            140_000, 140_024, 150_019, 160_015, 170_011, 180_006, 190_000,
+        ] {
+            assert!(supported_version(v), "{v}");
+        }
+        // `server_version_num` text that does not parse reads as 0.
+        assert!(!supported_version("13.18".parse().unwrap_or(0)));
+    }
 
     #[test]
     fn statement_timeout_is_never_zero() {

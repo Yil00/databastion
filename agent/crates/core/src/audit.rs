@@ -46,6 +46,10 @@ use crate::job::AuditConfig;
 const MAX_CURSOR_BYTES: usize = 64 * 1024;
 /// Largest counters file (see [`CursorStore::counters`]), in bytes.
 pub(crate) const MAX_COUNTERS_BYTES: usize = 2 * 1024 * 1024;
+/// Largest checkpoint file (see [`CursorStore::checkpoint`]), in bytes:
+/// with a 2 MiB counters file beside it, the 16 MiB of ADR-0060 R25 item
+/// 9's one cap on the persisted state.
+pub const MAX_CHECKPOINT_BYTES: usize = 14 * 1024 * 1024;
 
 /// Audit statements reported before their last record because a
 /// connector's pending state was full (heartbeat metric
@@ -193,6 +197,29 @@ impl CursorStore {
         store.path = store.path.with_extension("counters");
         store.max_bytes = MAX_COUNTERS_BYTES;
         Some(store)
+    }
+
+    /// The checkpoint file `name` of `target_id` in `dir` (normally
+    /// obtained through `AuditConfig::checkpoint`): like
+    /// [`Self::counters`], but a `<target_id>.<name>.checkpoint` file of at
+    /// most [`MAX_CHECKPOINT_BYTES`], for a source's parser state kept with
+    /// its read position (ADR-0060 R25 item 7). It is never part of the
+    /// stream's position registry (a panic does not pin it): the source
+    /// binds it to its read position itself.
+    #[must_use]
+    pub fn checkpoint(dir: &Path, target_id: &str, name: &str) -> Option<Self> {
+        let mut store = Self::new(dir, target_id, name)?;
+        store.path = store.path.with_extension("checkpoint");
+        store.max_bytes = MAX_CHECKPOINT_BYTES;
+        Some(store)
+    }
+
+    /// The sub-key set by [`Self::with_tag_key`], for a source that keys
+    /// or authenticates what it persists (never sent, never logged; the
+    /// source separates its uses by a purpose label in what it tags).
+    #[must_use]
+    pub fn local_tag_key(&self) -> Option<std::sync::Arc<LocalTagKey>> {
+        self.tag_key.clone()
     }
 
     /// With a request to skip `n` records (see [`Self::skip_records`]).

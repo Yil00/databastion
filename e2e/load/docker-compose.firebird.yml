@@ -1,0 +1,55 @@
+# Firebird load run (e2e/load/firebird.sh, e2e/load/README.md "Firebird target"): merged over
+# e2e/docker-compose.yml, e2e/docker-compose.firebird.yml and the run's generated
+# $E2E_WORK_DIR/hostid.yml (project databastion-load-firebird), the layout of e2e-firebird (the agent
+# in its container in the server's network and pid namespaces, the host identity files, the
+# named-user ACLs of the log volume, max_log_size = 0). Only the measurement settings change:
+#   firebird   the image under test (LOAD_FB_IMAGE: 5.0.4 by default, 4.0.7 by input, the pins of
+#              dev/firebird/it.sh), a fixed CPU limit (its "capacity"), the healthcheck every 2 s
+#              while starting then every 60 s (each check is a process in the measured cgroup);
+#              the database crm created from the run's own seed ($E2E_WORK_DIR/load/seed.sql: the
+#              scaled load seed, or the 10 000-object schema) and the load accounts
+#              (initdb/firebird-20-load-users.sh) instead of the dev seed: no ground-truth value.
+#   fb-client  the workload client and the file reader (firebird-client/, fbload.py), one-shot
+#              (`tools`): uid 10001 in the server's network namespace (loopback only), every
+#              capability dropped, read-only; the trace log read through the layout's ACL and the
+#              agent's state volume read-only (counts, sizes and timings only); the client
+#              passwords as Docker secrets.
+
+services:
+  firebird:
+    image: ${LOAD_FB_IMAGE:?set by firebird.sh}
+    cpus: ${LOAD_DB_CPUS:-2}
+    secrets: [target_fb_sysdba_password, target_agent_password, target_client_password]
+    volumes: !override
+      - firebird-root:/opt/firebird
+      - firebird-data:/var/lib/firebird/data
+      - firebird-audit:/var/lib/firebird/audit
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
+      - ../dev/firebird/entrypoint.sh:/databastion/entrypoint.sh:ro
+      - ../dev/firebird/seed.sh:/databastion/seed.sh:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/load/seed.sql:/databastion/seed/firebird.sql:ro
+      - ./load/initdb/firebird-20-load-users.sh:/databastion/initdb.d/20-load-users.sh:ro
+    healthcheck:
+      interval: 60s
+      start_interval: 2s
+      start_period: 900s
+      retries: 5
+
+  fb-client:
+    profiles: [tools]
+    build: ./load/firebird-client
+    image: ${LOAD_FB_CLIENT_IMAGE:-databastion-load/firebird-client:ci}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    network_mode: "service:firebird"
+    restart: "no"
+    tmpfs: [/tmp]
+    secrets: [target_client_password, target_fb_sysdba_password]
+    volumes:
+      - ./load/fbload.py:/databastion/fbload.py:ro
+      - ${E2E_WORK_DIR:?set by firebird.sh}/load/client:/databastion/in:ro
+      - firebird-audit:/var/lib/firebird/audit:ro
+      - agent-state:/state:ro

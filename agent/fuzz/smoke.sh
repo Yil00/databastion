@@ -6,7 +6,8 @@
 # Builds the targets with libFuzzer's coverage instrumentation (the flags cargo-fuzz passes, without
 # a sanitizer: sanitizers need a nightly toolchain) plus debug assertions and overflow checks, then
 # runs each target for SECONDS from a temporary corpus (empty, or seeded with the committed CAS
-# fixtures for cas_registry, cas_registry_yaml, cas_registry_yaml_diff and cas_audit_log). Exits non-zero on the
+# fixtures for cas_registry, cas_registry_yaml, cas_registry_yaml_diff and cas_audit_log, and the
+# recorded Firebird trace logs for firebird_trace_stream). Exits non-zero on the
 # first crash, panic, timeout or out-of-memory; the crashing input is kept under
 # $CARGO_TARGET_DIR/fuzz-artifacts/ (never commit it if it was built from real data).
 # For longer campaigns, use cargo-fuzz on nightly (README.md).
@@ -16,6 +17,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SECS="${1:-10}"
 TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HERE/target}"
+# Under agent/: cargo reads agent/.cargo/config.toml from the current directory, which sets the
+# production LIBSQLITE3_FLAGS of the bundled SQLite (ADR-0059 decision 1; the sqlite_* targets'
+# self-check fails without them).
+cd "$HERE"
 # --target keeps these flags off the build scripts (as cargo-fuzz does).
 RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
 -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table \
@@ -42,6 +47,21 @@ seed() {
     cas_audit_log)
       grep -E '"action":"OAUTH2_ACCESS_TOKEN_(REQUEST|RESPONSE)_CREATED"' "$AUDIT_FIXTURE" >"$2/token-records.jsonl"
       split -l 2 "$2/token-records.jsonl" "$2/token-pair-" ;;
+    # A small SQLite file (rollback mode) and a WAL set, as length-prefixed parts (ADR-0059).
+    sqlite_file)
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -I "$HERE/sqlite_seed.py" "$2/seed" || true
+      fi ;;
+    # The regression input of fuzz smoke job 128413708621: a restored stream body whose confirmed
+    # clock offset is i64::MIN (the grid_offset overflow).
+    firebird_checkpoint)
+      printf '%s' '9wAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+        | base64 -d >"$2/grid-offset-min" ;;
+    # Whole records of the recorded Firebird trace logs, under -max_len (ADR-0060, review L1).
+    firebird_trace_stream)
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -I "$HERE/firebird_trace_seed.py" "$HERE/../crates/connector-firebird/testdata" "$2"
+      fi ;;
   esac
 }
 for src in "$HERE"/fuzz_targets/*.rs; do

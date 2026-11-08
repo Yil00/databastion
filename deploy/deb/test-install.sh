@@ -73,6 +73,15 @@ grep -qx 'SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register' "$u
   || fail "io_uring not denied by the unit"
 log "ok  no socket unit, no Listen*=, SocketBindDeny=any, bind / listen / accept / accept4 / io_uring denied"
 
+log "SQLite reader (ADR-0059 decision 4): the sandbox system calls are allowed by the unit"
+grep -qx 'SystemCallFilter=landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp' "$unit" \
+  || fail "the unit does not allow the SQLite reader's sandbox calls"
+for call in landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp; do
+  systemd-analyze syscall-filter --no-pager 2>/dev/null | grep -qw "$call" \
+    || log "note: this systemd's syscall tables do not list $call"
+done
+log "ok  landlock_* and seccomp allowed by name"
+
 log "no core dumps"
 grep -qx 'LimitCORE=0' "$unit" || fail "the unit does not set LimitCORE=0"
 log "ok  LimitCORE=0"
@@ -105,6 +114,48 @@ case "$rc" in
 esac
 grep -q 'agent is not enrolled' /tmp/agent-run.log || { cat /tmp/agent-run.log; fail "run failed for another reason"; }
 log "ok  exit $rc: not enrolled (the state directory and the configuration were accepted)"
+
+log "SQLite reader: the installed binary's sandboxed reader mode (ADR-0059 decision 4)"
+# The reader runs as the agent's account with no other descriptor than its IPC socket, applies
+# its sandbox (Landlock, seccomp) and its self-check, then refuses this file because the
+# container's file system is not mounted read-only: that answer proves the sandbox and the
+# bundled SQLite's self-check work on this system. sandbox_unavailable means Landlock (the host
+# kernel) or the landlock_* calls (the container's seccomp profile) are missing.
+if ! command -v python3 >/dev/null; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq >/dev/null
+  apt-get install -y -qq --no-install-recommends python3-minimal >/dev/null
+fi
+install -d -o root -g databastion -m 0750 /srv/databastion-sqlite-test
+head -c 4096 /dev/zero >/srv/databastion-sqlite-test/app.db
+chown root:databastion /srv/databastion-sqlite-test/app.db
+chmod 0640 /srv/databastion-sqlite-test/app.db
+answer="$(python3 -I - <<'PY'
+import socket, struct, subprocess
+agent, reader = socket.socketpair()
+path = b"/srv/databastion-sqlite-test/app.db"
+body = bytes([1]) + struct.pack(">I", len(path)) + path + struct.pack(">I", 500) + bytes([1])
+p = subprocess.Popen(["/usr/bin/databastion-agent", "sqlite-reader"], stdin=reader,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={},
+                     user="databastion", group="databastion", extra_groups=[], close_fds=True)
+reader.close()
+agent.settimeout(20)
+agent.sendall(struct.pack(">I", len(body)) + body)
+head = agent.recv(4)
+n = struct.unpack(">I", head)[0]
+resp = b""
+while len(resp) < n:
+    resp += agent.recv(n - len(resp))
+p.kill(); p.wait()
+codes = {4: "filesystem_not_read_only", 6: "sandbox_unavailable", 7: "self_check_failed"}
+print(codes.get(resp[1], "code %d" % resp[1]) if resp[0] == 0x80 else "opened")
+PY
+)"
+rm -rf /srv/databastion-sqlite-test
+case "$answer" in
+  filesystem_not_read_only) log "ok  the reader sandboxed itself, passed its self-check and refused a writable mount" ;;
+  *) fail "SQLite reader: $answer" ;;
+esac
 
 log "reinstall with a modified configuration: the change and the permissions are kept"
 echo "# local change" >>/etc/databastion/agent.yaml

@@ -15,6 +15,7 @@ import { getDb } from "@/db/client";
 import { alertingWarnings } from "@/server/alerting-config";
 import { CASE_INVENTORY_QUEUE } from "@/server/case-inventory-queue";
 import { runStartupCaseInventory } from "@/server/exception-case-inventory";
+import { runStartupSqliteReevaluation } from "@/server/sqlite-reach-reevaluation";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 
@@ -102,6 +103,10 @@ async function main(): Promise<void> {
   // ADR-0054 decision 6: at the first start after the upgrade, the location exceptions that no
   // longer cover names differing by case only (ids and counts only; never blocks the start).
   void runStartupCaseInventory(getDb(), log);
+  // P10-E (security review L1): at the first start of this build, SQLite findings are evaluated
+  // again with the reach rule of location exceptions (an older worker did not apply it). Once,
+  // recorded in the audit log; never blocks the start.
+  void runStartupSqliteReevaluation(getDb(), log);
   // ADR-0055 decision 7: the inventory of each target whose name case semantics changed
   // (debounced: at most once per target and hour).
   await registerNameCaseInventoryQueue(boss, getDb, log);

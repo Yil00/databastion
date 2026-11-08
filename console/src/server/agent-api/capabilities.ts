@@ -70,7 +70,20 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * their targets, connectors, detected targets, findings (`KeyPattern` objects for Redis / Valkey)
  * and events (`account_not_recorded` principals included, ADR-0052 decision 8) are validated,
  * stored and rendered like those of any engine. The gate (`unlistedEngineDetails`, P9-C review H1)
- * stays for any engine token added to the contract later.
+ * stays for any engine token added to the contract later. `engine.sqlite` (ADR-0059 decision 8) is
+ * listed since P10-E: `sqlite` targets (Discovery only: audit level `none`, no server version,
+ * edition, audit source or name case, the schema's rules), connectors and findings (`database` is
+ * always `main`, no schema) are validated, stored and rendered; the agent page shows such targets as
+ * "Discovery only", Audit settings are refused for them (`audit_unsupported`), and location
+ * exceptions reach a `sqlite` finding or event only when scoped to its agent and target, or created
+ * with the explicit `cross_target` confirmation (P10-C review R2, `exceptionReachesItem` in
+ * src/lib/policy-common.ts), since `main` cannot tell two SQLite files apart. `engine.firebird`
+ * (ADR-0060 decision 8) is listed since P10-E, together with `target_status.note_labels.2026_10_d`
+ * (both or neither, in every list): `firebird` targets (never `full`, no edition or name case, the
+ * schema's rules), connectors, detected targets (port 3050 or the `firebird` process), findings
+ * (database, table, column: no schema) and `firebird_audit_trace` events are validated, stored and
+ * rendered like those of any engine; location exceptions compare Firebird names with case and
+ * without trailing spaces (`CASE_SENSITIVE_EXCEPTION_ENGINES`, `TRAILING_SPACE_BLIND_ENGINES`).
  *
  * `target_status.note_labels.2026_10` (ADR-0051 decision 4, ADR-0022 decision 4): the SQL Server
  * `TargetNoteLabel` values of that revision are accepted and rendered with their display names
@@ -80,13 +93,21 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * with `privilege.not_evaluated`), accepted and rendered the same way.
  * `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9 follow-ups):
  * `on_failure_probe`, the `ON_FAILURE = CONTINUE` failure counter the agent's grants do not read,
- * accepted and rendered the same way.
+ * accepted and rendered the same way. `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4
+ * and 6, and its refinements): the Firebird labels below `on_failure_probe` (system privileges,
+ * the refusal-list identities, credential relations, probes, the reasons of
+ * `audit.trace_config_not_evaluated`, `run_confirmation_stalled` and the `fbtrace.conf` settings),
+ * accepted and rendered with their Firebird display names (`src/lib/target-notes.ts`). It is listed
+ * with `engine.firebird` only: those labels are sent on `firebird` targets only, and an agent that
+ * learned one token without the other would send `other` for every Firebird label.
  */
 export const CONSOLE_ACCEPTS = [
   "access_event.bytes",
   "access_event.objects_overflowed",
   "engine.cas",
+  "engine.firebird",
   "engine.redis",
+  "engine.sqlite",
   "engine.sqlserver",
   "engine.valkey",
   "job_progress.coverage",
@@ -96,6 +117,7 @@ export const CONSOLE_ACCEPTS = [
   "target_status.note_labels.2026_10",
   "target_status.note_labels.2026_10_b",
   "target_status.note_labels.2026_10_c",
+  "target_status.note_labels.2026_10_d",
   "target_status.notes",
 ] as const;
 
@@ -115,7 +137,21 @@ export type ConsoleCapability = (typeof CONSOLE_ACCEPTS)[number];
  * `access_event.objects_overflowed` (ADR-0053, #296), `target_status.name_case` (ADR-0055, #302),
  * `location.altered` and `object_ref.altered` (ADR-0056, #324) and
  * `target_status.note_labels.2026_10_c` (#280: a 0.8 replica answers `400` to `on_failure_probe`).
- * The engine tokens and every earlier token are in the 0.8 list, so they are listed as always.
+ * The engine tokens of 0.8 (`engine.sqlite` and `engine.firebird` came later) and every earlier token are in the 0.8
+ * list, so they are listed as always.
+ *
+ * `0.9`: the list of 0.9.0 (`git show 0.9.0:console/src/server/agent-api/capabilities.ts`). Held
+ * back with it: `engine.sqlite` (ADR-0059, P10-E): a 0.9 replica answers `400` to a heartbeat
+ * carrying a `sqlite` target or connector and to a findings batch with a `sqlite` location, so an
+ * agent must not learn the token from an upgraded replica while one remains; until then it holds
+ * its `sqlite` findings in the spool (ADR-0042 decision 2) and reports no `sqlite` target.
+ *
+ * `engine.firebird` and `target_status.note_labels.2026_10_d` (ADR-0060, P10-E) came after both
+ * lines, so `0.8` and `0.9` both hold them: a 0.8 or 0.9 replica answers `400` to a heartbeat
+ * carrying a `firebird` target, connector, detected target or 2026_10_d label, and to a findings or
+ * events batch of a `firebird` location or `firebird_audit_trace` source. While held, an agent
+ * reports no `firebird` target and holds its Firebird findings and events in the spool (ADR-0042
+ * decision 2).
  *
  * A release line is added here when its successor lists a new token (its entry is the list it
  * shipped, never edited afterwards); the env value set is `AGENT_TOKENS_HOLD_RELEASES`
@@ -132,6 +168,22 @@ export const RELEASE_ACCEPTS: Record<AgentTokensHold, readonly ConsoleCapability
     "job_progress.coverage",
     "target_status.note_labels.2026_10",
     "target_status.note_labels.2026_10_b",
+    "target_status.notes",
+  ],
+  "0.9": [
+    "access_event.bytes",
+    "access_event.objects_overflowed",
+    "engine.cas",
+    "engine.redis",
+    "engine.sqlserver",
+    "engine.valkey",
+    "job_progress.coverage",
+    "location.altered",
+    "object_ref.altered",
+    "target_status.name_case",
+    "target_status.note_labels.2026_10",
+    "target_status.note_labels.2026_10_b",
+    "target_status.note_labels.2026_10_c",
     "target_status.notes",
   ],
 };
@@ -194,7 +246,13 @@ type Connector = ProtocolSchemas["Connector"];
 type DetectedProcess = NonNullable<ProtocolSchemas["DetectedTarget"]["process"]>;
 
 /** Every `engine.<value>` token of the contract, listed by this console or not yet. */
-export type EngineToken = "engine.cas" | "engine.sqlserver" | "engine.redis" | "engine.valkey";
+export type EngineToken =
+  | "engine.cas"
+  | "engine.sqlserver"
+  | "engine.redis"
+  | "engine.valkey"
+  | "engine.sqlite"
+  | "engine.firebird";
 
 /**
  * The tokens gating each `Engine` value (ADR-0039 decision 8, ADR-0042): none for the engines of
@@ -214,6 +272,8 @@ const ENGINE_TOKENS: Record<Engine, readonly EngineToken[]> = {
   sqlserver: ["engine.sqlserver"],
   redis: ["engine.redis"],
   valkey: ["engine.valkey"],
+  sqlite: ["engine.sqlite"],
+  firebird: ["engine.firebird"],
 };
 
 /** Engines each `Connector` serves (`mysql` covers MySQL and MariaDB, `redis` Redis and Valkey). */
@@ -225,6 +285,8 @@ const CONNECTOR_ENGINES: Record<Connector, readonly Engine[]> = {
   cas: ["cas"],
   sqlserver: ["sqlserver"],
   redis: ["redis", "valkey"],
+  sqlite: ["sqlite"],
+  firebird: ["firebird"],
 };
 
 /** Engine of each `DetectedTarget.process`. */
@@ -237,6 +299,7 @@ const PROCESS_ENGINES: Record<DetectedProcess, readonly Engine[]> = {
   sqlservr: ["sqlserver"],
   "redis-server": ["redis"],
   "valkey-server": ["valkey"],
+  firebird: ["firebird"],
 };
 
 function tokensOf(engines: readonly Engine[]): readonly EngineToken[] {

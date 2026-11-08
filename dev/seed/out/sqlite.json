@@ -1,0 +1,36 @@
+{
+ "files": [
+  {
+   "encoding": "UTF-8",
+   "file": "crm.db",
+   "journal_mode": "delete",
+   "rollback_mode": "read",
+   "sql": "sqlite-crm.sql",
+   "target": "sqlite-crm"
+  },
+  {
+   "encoding": "UTF-8",
+   "file": "app.db",
+   "journal_mode": "wal",
+   "rollback_mode": "skip",
+   "sql": "sqlite-app.sql",
+   "target": "sqlite-app"
+  },
+  {
+   "encoding": "UTF-16le",
+   "file": "intl.db",
+   "journal_mode": "delete",
+   "rollback_mode": "read",
+   "sql": "sqlite-intl.sql",
+   "target": "sqlite-intl"
+  }
+ ],
+ "generator": "dev/seed/generate.py",
+ "note": "FAKE data only. Read by dev/sqlite/build.py; the SQL is run after the pragmas of its file.",
+ "requires_markers": [
+  "-- databastion:requires {module}",
+  "-- databastion:end"
+ ],
+ "seed": 20260928,
+ "version": 1
+}

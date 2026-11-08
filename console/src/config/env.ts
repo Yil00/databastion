@@ -105,7 +105,7 @@ export function getDatabaseUrl(
  * the release lines whose token set the console knows.
  */
 export const AGENT_TOKENS_HOLD_VAR = "DATABASTION_AGENT_TOKENS_HOLD";
-export const AGENT_TOKENS_HOLD_RELEASES = ["0.8"] as const;
+export const AGENT_TOKENS_HOLD_RELEASES = ["0.8", "0.9"] as const;
 export type AgentTokensHold = (typeof AGENT_TOKENS_HOLD_RELEASES)[number];
 
 /**

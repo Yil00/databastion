@@ -1,0 +1,228 @@
+{
+  "ts": "2026-10-24T09:00:00Z",
+  "agent_version": "0.10.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap",
+    "sqlite"
+  ],
+  "targets": [
+    {
+      "target_id": "crm-app",
+      "engine": "sqlite",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "coverage.views_not_sampled",
+          "count": 2
+        },
+        {
+          "code": "coverage.virtual_tables_not_sampled",
+          "count": 1
+        },
+        {
+          "code": "coverage.computed_columns_not_sampled",
+          "count": 1
+        },
+        {
+          "code": "coverage.cas_guard_tripped",
+          "count": 1
+        },
+        {
+          "code": "coverage.reader_process_failed",
+          "count": 1
+        },
+        {
+          "code": "security.file_world_readable"
+        }
+      ],
+      "metrics": {
+        "sqlite_reader_failures_total": 1
+      }
+    },
+    {
+      "target_id": "legacy-app",
+      "engine": "sqlite",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "coverage.rollback_mode_not_read"
+        }
+      ]
+    },
+    {
+      "target_id": "notes-wal",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "target_unreachable",
+      "notes": [
+        {
+          "code": "coverage.wal_files_not_readable"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_connect"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "orders-journal",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "target_unreachable",
+      "notes": [
+        {
+          "code": "coverage.hot_journal_pending"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_connect"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "shared-nfs",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "unsupported",
+      "notes": [
+        {
+          "code": "coverage.network_filesystem_refused"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_connect"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "rw-mount",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "unsupported",
+      "notes": [
+        {
+          "code": "coverage.filesystem_not_read_only"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_connect"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "linked-path",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "unsupported",
+      "notes": [
+        {
+          "code": "coverage.file_path_refused"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_connect"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "agent-writable",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "unsupported",
+      "notes": [
+        {
+          "code": "privilege.database_file_writable"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_connect"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "no-landlock",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "unsupported",
+      "notes": [
+        {
+          "code": "coverage.reader_sandbox_unavailable"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_session_setup"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "not-a-db",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "unsupported",
+      "notes": [
+        {
+          "code": "coverage.unrecognized_file_format"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_introspection"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "busy-app",
+      "engine": "sqlite",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "timeout",
+      "notes": [
+        {
+          "code": "check.timed_out"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_columns"
+          ]
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

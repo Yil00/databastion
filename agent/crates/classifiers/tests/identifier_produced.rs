@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use databastion_classifiers::detect::scan_tokens;
 use databastion_classifiers::names::{
     self, IDENTIFIER_PRODUCED_RULES, PathPart, normalize_field_path, normalize_ldap_attribute,
     normalize_ldap_dn, normalize_path,
@@ -203,6 +204,125 @@ fn alphabet() -> impl Strategy<Value = String> {
     prop::collection::vec(pieces, 0..24).prop_map(|v| v.concat())
 }
 
+/// The indices of the `.`-separated parts of `input` that one detector
+/// token spans together with the refused value (at part `at`): read as the
+/// names module reads a name, raw and with the ASCII separators as spaces.
+fn joined_with_value(input: &str, value: &str, at: usize) -> Vec<usize> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for part in input.split('.') {
+        ranges.push(offset..offset + part.len());
+        offset += part.len() + 1;
+    }
+    let n = value.split('.').count();
+    let value_range = ranges[at].start..ranges[at + n - 1].end;
+    let spaced: String = input
+        .chars()
+        .map(|c| {
+            if matches!(c, '.' | '_' | '-' | '/') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let overlap =
+        |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| a.start < b.end && b.start < a.end;
+    let tokens: Vec<_> = scan_tokens(input, &|_| true)
+        .into_iter()
+        .chain(scan_tokens(&spaced, &|_| true))
+        .map(|t| t.range)
+        .filter(|t| overlap(t, &value_range))
+        .collect();
+    ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| tokens.iter().any(|t| overlap(t, r)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The words of `pre` and `post` (around the refused `value`, joined with
+/// dots into the input) that `out` should keep and does not: words of
+/// non-hexadecimal letters (first names excepted), unless `out` is `*` or
+/// the word and the value together are one detected value
+/// ([`joined_with_value`]). The value takes `value.split('.')` parts of the
+/// input, so a word of `post` at index `i` of `pre ++ post` is part
+/// `i + n` (security review L1 of #420).
+fn lost_words(pre: &[String], value: &str, post: &[String], out: &str) -> Vec<String> {
+    let input = pre
+        .iter()
+        .map(String::as_str)
+        .chain([value])
+        .chain(post.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".");
+    let n = value.split('.').count();
+    let joined = joined_with_value(&input, value, pre.len());
+    pre.iter()
+        .chain(post)
+        .enumerate()
+        .filter(|(i, w)| {
+            let part = if *i < pre.len() { *i } else { *i + n };
+            out != "*"
+                && w.chars().all(|c| ('g'..='z').contains(&c))
+                && !names::segment_looks_like_value(w)
+                && !joined.contains(&part)
+        })
+        .map(|(_, w)| w)
+        .filter(|w| {
+            !out.split('.')
+                .any(|s| s.trim_end_matches("[]") == w.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Security review L1 of #420: with a value of three parts, an ordinary
+/// word after it is checked (it was excused when the oracle counted the
+/// value as one part), and one the detector joins to the value is not.
+#[test]
+fn the_oracle_counts_every_part_of_a_dotted_value() {
+    let v = "be45.f207.2c8b";
+    let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // Kept by the agent: nothing lost.
+    let post = words(&["txyz", "gg"]);
+    let out = normalize_path("be45.f207.2c8b.txyz.gg");
+    assert!(lost_words(&[], v, &post, out.as_str()).is_empty());
+    // An output that dropped the ordinary word is caught.
+    assert_eq!(lost_words(&[], v, &post, "*.gg"), ["txyz"]);
+    // Before the value too.
+    assert_eq!(lost_words(&words(&["mmm"]), v, &post, "*.txyz.gg"), ["mmm"]);
+    // The word that completes an IBAN with the value is excused.
+    assert!(lost_words(&[], v, &words(&["txyy", "gg"]), "*.gg").is_empty());
+}
+
+/// The CI failure on #419: `txyy` after the dotted MAC `be45.f207.2c8b`
+/// completes `BE45 F207 2C8B TXYY`, an IBAN whose check digits hold
+/// (country length and mod 97, the classifier's rule). The whole IBAN is a
+/// value: `txyy` is masked with it (fail closed), the word after it kept.
+/// With a neighbour whose checksum fails (`txyz`), only the MAC is masked.
+#[test]
+fn a_neighbour_completing_an_iban_is_masked_with_the_value() {
+    let keys = |s: &'static str| s.split('.').map(PathPart::Key).collect::<Vec<_>>();
+    for (input, want) in [
+        ("be45.f207.2c8b.txyy.gg", "*.gg"),
+        ("be45.f207.2c8b.txyz.gg", "*.txyz.gg"),
+    ] {
+        assert_eq!(normalize_path(input).as_str(), want, "{input}");
+        assert_eq!(normalize_field_path(&keys(input)).as_str(), want, "{input}");
+    }
+    assert_eq!(
+        joined_with_value("be45.f207.2c8b.txyy.gg", "be45.f207.2c8b", 0),
+        [0, 1, 2, 3]
+    );
+    assert!(
+        joined_with_value("be45.f207.2c8b.txyz.gg", "be45.f207.2c8b", 0)
+            .iter()
+            .all(|i| *i < 3)
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4000))]
 
@@ -372,14 +492,12 @@ proptest! {
             prop_assert!(!out.contains(&value), "{:?} -> {:?}", input, out);
             // Words of non-hexadecimal letters are kept (first names
             // excepted), unless the whole name is `*` (the digit bounds of
-            // rule 5 count the neighbouring words' digits too).
-            for w in pre.iter().chain(&post).filter(|w| {
-                out != "*"
-                    && w.chars().all(|c| ('g'..='z').contains(&c))
-                    && !names::segment_looks_like_value(w)
-            }) {
-                prop_assert!(out.split('.').any(|s| s.trim_end_matches("[]") == w), "{:?} -> {:?} lost {:?}", input, out, w);
-            }
+            // rule 5 count the neighbouring words' digits too), or the word
+            // and the value together are one detected value (an IBAN read
+            // across the dots: masking the word too is fail closed, keeping
+            // it would send part of the value).
+            let lost = lost_words(&pre, &value, &post, out);
+            prop_assert!(lost.is_empty(), "{:?} -> {:?} lost {:?}", input, out, lost);
         }
         let dn = normalize_ldap_dn(&format!("uid=x,ou={value},dc=example"));
         // `+` makes an RDN multi-valued: the whole DN is `*`.

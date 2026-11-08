@@ -7,6 +7,7 @@ import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
   alteredPartsCoverable,
   ENGINES,
+  exceptionReachesItem,
   fail,
   globMatch,
   isGlob,
@@ -308,6 +309,12 @@ export interface ExceptionScope {
   classifier: string | null;
   location: LocationPattern | null;
   expiresAt: Date | null;
+  /**
+   * The explicit `cross_target` confirmation (`policy_exceptions.cross_target`, P10-C review R2):
+   * without it, a location exception not scoped to an agent and a target never covers a finding
+   * of `TARGET_SCOPED_EXCEPTION_ENGINES` (`sqlite`), `exceptionReachesItem`.
+   */
+  crossTarget: boolean;
 }
 
 /**
@@ -317,11 +324,15 @@ export interface ExceptionScope {
  * MySQL and MariaDB while their target reports no `name_case` (ADR-0054 decision 1); with one,
  * per part as the target compares names (ADR-0055 decision 6, `exceptionPartOptions`). A part
  * the agent reported altered by its name normalization is covered only by an absent glob or
- * exactly `*` (ADR-0056 decision 3 item 4, `alteredPartsCoverable`).
+ * exactly `*` (ADR-0056 decision 3 item 4, `alteredPartsCoverable`). On SQLite, whose locations
+ * are `main` on every target, a location exception covers only the findings of the agent and
+ * target it names, unless it carries the `cross_target` confirmation (P10-C review R2,
+ * `exceptionReachesItem`); names are compared with case there (ADR-0059 decision 6).
  */
 export function exceptionCovers(e: ExceptionScope, policyId: string, f: FindingFacts, now: Date): boolean {
   if (e.expiresAt !== null && e.expiresAt.getTime() <= now.getTime()) return false;
   if (e.policyId !== null && e.policyId !== policyId) return false;
+  if (!exceptionReachesItem(e, f.engine)) return false;
   if (e.agentId !== null && e.agentId !== f.agentId) return false;
   if (e.targetId !== null && e.targetId !== f.targetId) return false;
   if (e.classifier !== null && !classifierSelected([e.classifier], f.classifier)) return false;

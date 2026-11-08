@@ -285,9 +285,15 @@ fn load_truth() -> Truth {
         let s = |k: &str| loc[k].as_str().map(str::to_owned);
         // Phase 9 engines (P9-D seeds): their locations are scored by the
         // connector tests of P9-A / P9-B, not by this seed-file test yet.
+        // SQLite (P10-D): one location key per table of three files, scored
+        // per file by `seeded_dev_files_match_the_ground_truth`
+        // (crates/agent/tests/sqlite_reader.rs). Firebird (P10-B): scored
+        // by the connector's integration test against the real server
+        // (`discovery_matches_the_ground_truth_and_keeps_i2`,
+        // crates/connector-firebird/src/it.rs).
         if matches!(
             s("engine").as_deref(),
-            Some("sqlserver" | "redis" | "valkey")
+            Some("sqlserver" | "redis" | "valkey" | "sqlite" | "firebird")
         ) {
             continue;
         }

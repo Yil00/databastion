@@ -272,6 +272,105 @@ targets:
   #     # auto naming both: the server audit when usable, else the session.
   #     # audit: {source: auto, audit_name: databastion_audit, xe_session: databastion_xe}
 
+  # SQLite (ADR-0059; in development, not released yet: results reach a
+  # console that lists engine.sqlite only). Discovery only (Audit none). One
+  # declared database file per target: no directory, no glob, no search. The
+  # path is never sent nor logged (refusals name the target and the rule).
+  # Requirements: Linux with Landlock enabled (the file is read by a sandboxed
+  # reader process); the file and its directory owned by the application,
+  # readable by the agent through a group, never writable by it (e.g. file
+  # 0640 and directory 2750, group databastion); no symlink in the path; and
+  # the file system mounted read-only for the agent (ProtectSystem=strict
+  # under the systemd unit, BindReadOnlyPaths= for /home, `:ro` in a
+  # container). A WAL database is read while its application holds it open.
+  # - id: crm-app
+  #   engine: sqlite
+  #   sqlite:
+  #     path: /srv/crm/data/crm.db
+  #     # Statement deadline, 50..=5000 ms (default 500): a local limit.
+  #     # max_statement_ms: 500
+  #     # Rollback-journal mode files: skip (default; every read delays the
+  #     # application's commits) or read.
+  #     # rollback_mode: skip
+
+  # Firebird 4.0 or 5.0 (ADR-0060), on loopback only: the agent runs on the
+  # server's host (Firebird has no TLS; its wire encryption has no integrity
+  # and no server authentication). Create the account with the Srp user
+  # manager and a random password of at least 32 characters, a reader role
+  # with SELECT on each table, granted DEFAULT:
+  #   CREATE USER DATABASTION_AGENT PASSWORD '<random>' USING PLUGIN Srp;
+  #   CREATE ROLE DATABASTION_READER;
+  #   GRANT SELECT ON TABLE CUSTOMERS TO ROLE DATABASTION_READER;
+  #   GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT;
+  # firebird.conf: AuthServer listing Srp256, WireCrypt = Required and
+  # WireCryptPlugin listing ChaCha64 or ChaCha; RemoteBindAddress = 127.0.0.1
+  # when no other client needs the network. No other container may share the
+  # agent's and the server's network namespace unless it drops NET_RAW and
+  # NET_ADMIN. Discovery and Audit (from the system audit trace, below) are
+  # not released yet. Setup: docs/10-user-guide.md, "Firebird Audit".
+  # - id: app-fb
+  #   engine: firebird
+  #   host: 127.0.0.1
+  #   account: DATABASTION_AGENT
+  #   secret:
+  #     file: /etc/databastion/secrets/app-fb
+  #   firebird:
+  #     # host above: 127.0.0.1 or ::1 only (no name). The account that owns
+  #     # the server's sockets: a user name (default firebird) or a number;
+  #     # a number when the agent runs in a container; 0 refused unless
+  #     # peer_uid_root: true.
+  #     peer_uid: firebird
+  #     databases:
+  #       # name: the label sent to the console; attach: a databases.conf
+  #       # alias (recommended: the server sees it in clear on loopback
+  #       # before wire encryption starts) or an absolute path. Never sent
+  #       # to the console.
+  #       - name: app
+  #         attach: appdb
+  #     # A remote server reached through a TLS or WireGuard tunnel you run,
+  #     # ending on this host's loopback (peer_uid: the tunnel's account;
+  #     # no Audit): tunnel: true
+  #     # tunnel: false
+  #     # The role holds SELECT_ANY_OBJECT_IN_DATABASE (it also exposes the
+  #     # server configuration, RDB$CONFIG):
+  #     # extended_grants: false
+  #     # Audit from the system audit trace (refused with tunnel: true):
+  #     # canonical absolute paths on this host, read only, never sent.
+  #     audit:
+  #       # The Firebird root ($(root)); the server binary is in <root>/bin.
+  #       root: /opt/firebird
+  #       # Must be <root>/firebird.conf.
+  #       firebird_conf: /opt/firebird/firebird.conf
+  #       # The file AuditTraceConfigFile names in firebird.conf.
+  #       trace_config: /opt/firebird/fbtrace.conf
+  #       # The log_filename of the trace configuration's sections.
+  #       log: /var/log/firebird/audit/audit.log
+  #       # Optional, must be <root>/databases.conf: the alias map.
+  #       databases_conf: /opt/firebird/databases.conf
+  #       # Only for an agent in a container (refused on the host, where the
+  #       # agent reads /etc/passwd, /etc/group and /etc/nsswitch.conf
+  #       # itself): the host's identity files, each bind-mounted read-only,
+  #       # file by file, from the host (host bind mounts or hostPath only,
+  #       # never a ConfigMap, Secret or emptyDir), checked at every check.
+  #       # The agent's container must share the server's pid namespace
+  #       # (pid: service:<firebird>, or pid: host), see the Firebird root,
+  #       # configuration and log directory read-only at the server's paths,
+  #       # run with identity uid and gid maps (no user namespace) and not
+  #       # as root. Restart the agent's container after a change of host
+  #       # accounts or groups (a stale mount is refused).
+  #       # host_identity:
+  #       #   passwd: /run/databastion/host/passwd
+  #       #   group: /run/databastion/host/group
+  #       #   nsswitch: /run/databastion/host/nsswitch.conf
+  #       #   # Optional: the host's subordinate ids; without them every uid
+  #       #   # or gid of 100000 or more is treated as subordinate.
+  #       #   subuid: /run/databastion/host/subuid
+  #       #   subgid: /run/databastion/host/subgid
+  #       #   # Optional: the only names the server's and the agent's uids
+  #       #   # may carry in the host's passwd file (absent otherwise).
+  #       #   server_account: firebird
+  #       #   agent_account: databastion
+
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
 # it is rejected.

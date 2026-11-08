@@ -142,7 +142,7 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis`, `valkey` and `sqlserver` since 0.8.0 ([Redis / Valkey](#redis--valkey-targets), [Microsoft SQL Server](#microsoft-sql-server-targets));
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis`, `valkey` and `sqlserver` since 0.8.0 ([Redis / Valkey](#redis--valkey-targets), [Microsoft SQL Server](#microsoft-sql-server-targets)); `sqlite` and `firebird` since 0.10.0 ([SQLite](#sqlite-targets), [Firebird](#firebird-targets));
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
@@ -417,6 +417,242 @@ What to do:
 
 **Not covered**: a refused `xp_cmdshell` leaves no event on this source; the plan cache (`sys.dm_exec_query_stats`) is not a source, so a server where neither SQL Server Audit nor a session is usable reports None; RPC calls of user procedures, `event_file` rollover while the agent reads, Windows servers and the Developer edition are not measured; this source is not in the end-to-end or load tests (integration tests and the engine matrix only).
 
+### SQLite targets
+*Since 0.10.0 (phase 10, [ADR-0059](adr/0059-sqlite-connector.md)).* A SQLite target is one database file declared in `agent.yaml`. SQLite has no server and no access log, so a SQLite target is **Discovery only**: its audit level is `none`, the agent page shows "Discovery only" and no server version, and the console refuses Audit settings for it. The agent needs a console that lists the `engine.sqlite` capability; until then it reports no SQLite target and keeps their findings spooled. What is read and what is not: [08-engine-capabilities.md](08-engine-capabilities.md#sqlite-discovery); the security model: [05-security.md](05-security.md#sqlite-connector).
+
+**Declare each file**:
+
+```yaml
+targets:
+  - id: crm-app                  # named after the application, not the file
+    engine: sqlite
+    sqlite:
+      path: /srv/crm/data/crm.db # absolute, canonical, no symbolic link in any component
+      max_statement_ms: 500      # optional, 50 to 5000 (default 500): a local limit
+      rollback_mode: skip        # optional: skip (default) or read
+```
+
+- **`path`**: one database file per target. No directory, glob or search: to scan several files, declare several targets. The path must be absolute and canonical (no `.`, `..`, `//` or trailing `/`), at most 1 024 bytes, with **no symbolic link in any component**: declare the real path. It may not be under the agent's own directories, `/etc/databastion`, a directory holding a file `agent.yaml` references, `/proc`, `/sys`, `/dev` or `/run/user`, and two targets may not name the same file. The path is never sent to the console nor written to the agent's log. `host`, `port`, `socket`, `account` and `secret` are refused for `engine: sqlite`.
+- **`max_statement_ms`**: the deadline of each statement the reader runs. In rollback mode it is also the longest time one statement can delay the application's commits.
+- **`rollback_mode`**: a file in a rollback-journal mode (`DELETE`, `TRUNCATE`, `PERSIST`) is skipped by default (`coverage.rollback_mode_not_read`), because every read there delays the application's commits. Set `read` for files that are rarely written, or whose application sets a busy timeout. WAL files are read either way. With `read`:
+  - **an application without a busy timeout gets failed commits while a scan runs**: `SQLITE_BUSY`, about 1.7 per second for a writer at 200 transactions per second in the load run ([docs/08](08-engine-capabilities.md#load-on-the-application)). With a 5 s busy timeout the same writer had none;
+  - **an application in `DELETE` journal mode loses coverage**: it recreates its `-journal` at every commit, and each unit read across such a commit is lost (counted `skipped_error`, the scan shown with "partial coverage"; 3 to 6 of 9 tables per scan in the load run). For full coverage of a file that is written often, have the application use WAL, or the `TRUNCATE` or `PERSIST` journal mode.
+
+**File ownership and permissions.** The agent only reads; a file, side file or directory on the path that its account could write is refused (`privilege.database_file_writable`). Give it read access through a group:
+
+```sh
+# The application runs as "crm"; the agent's account is in the group "databastion".
+chown -R crm:databastion /srv/crm/data
+chmod 2750 /srv/crm/data            # setgid: the -wal, -shm and -journal files get the group
+chmod 0640 /srv/crm/data/crm.db
+# The application should create its files with a umask that keeps the group read bit (027).
+```
+
+Every ancestor directory needs search (`x`) permission for the agent, and the file's directory must not be writable by every local user. A database file readable by every local user is read and reported (`security.file_world_readable`): restrict it to the application and the agent's group.
+
+**A read-only file system for the agent.** The file system holding the database must be mounted read-only in the agent's view, or the file is refused (`coverage.filesystem_not_read_only`):
+- **systemd unit** (`.deb`): `ProtectSystem=strict` already makes every path outside `/var/lib/databastion` read-only for the agent. A file **under `/home`** is hidden by `ProtectHome=yes`: expose its directory read-only with a drop-in, rather than `ProtectHome=read-only`, which would expose every home directory:
+
+  ```ini
+  # systemctl edit databastion-agent
+  [Service]
+  BindReadOnlyPaths=/home/crm/data
+  # If the files' group is not the agent account's own group:
+  # SupplementaryGroups=databastion
+  ```
+
+- **Container**: bind-mount the directory read-only (`-v /srv/crm/data:/srv/crm/data:ro`, or `:ro` in Compose), with the files' group added to the agent's container (`--group-add`). Docker's default seccomp profile allows the reader's Landlock calls since Docker 25 (moby 25); an older engine, or a custom profile without them, gives `coverage.reader_sandbox_unavailable`.
+- **Manual run**: a read-only bind mount of the directory.
+
+**Kernel requirements.** The file is read by a sandboxed reader process that needs **Landlock**: Linux 5.13 or later, with Landlock in the kernel's active security modules (`cat /sys/kernel/security/lsm` lists `landlock`; on some distributions it must be added with the `lsm=` boot parameter). Without it, no SQLite file is read (`coverage.reader_sandbox_unavailable`). Network and FUSE file systems are refused. Only Linux is supported.
+
+**WAL files are read while the application holds them open.** A WAL database can be read only while its `-wal` and `-shm` files exist; when the last application connection closes cleanly, SQLite deletes them and the agent cannot open the file without writing (`coverage.wal_files_not_readable`). The file is read again at the next check after the application reopens it. If the application truncates its `-shm` during a scan, the scan loses its remaining units (`skipped_error`) until the application rebuilds its WAL index; the agent keeps running.
+
+**Notes you may see, and what to do**:
+
+| Note | What to do |
+|------|------------|
+| `coverage.filesystem_not_read_only` | Mount the directory read-only for the agent (above) |
+| `privilege.database_file_writable` | Remove the agent's write access to the file, its `-wal` / `-shm` / `-journal` files and every directory on the path (owner, group and other bits, ACLs) |
+| `coverage.file_path_refused` | Declare the real path (no symbolic link), give the file one hard link, keep side files owned by the application on the same file system, and do not declare the same file twice or a file under a refused location |
+| `coverage.network_filesystem_refused` | Move the file to a local file system; NFS, SMB, FUSE and the like are refused |
+| `coverage.reader_sandbox_unavailable` | Enable Landlock in the kernel; in a container, use Docker 25 or later or a seccomp profile that allows the `landlock_*` calls |
+| `coverage.unrecognized_file_format` | The file is not a SQLite 3 database the agent reads: encrypted (SQLCipher and the like are not supported), another file type, a corrupt schema or syntax newer than the bundled SQLite 3.54.1. Check that the path is the right file |
+| `coverage.wal_files_not_readable` | The application does not hold the WAL file open, or its `-wal` is above 128 MiB: the file is read while the application runs; checkpoint the WAL if it keeps growing |
+| `coverage.hot_journal_pending` | An interrupted write is waiting for the application to recover it at its next open; nothing to do on the agent's side |
+| `coverage.rollback_mode_not_read` | Expected with `rollback_mode: skip`; set `read` if the impact on the application's commits is acceptable |
+| `coverage.reader_process_failed` | The reader process died during the scan (count): the file may be crafted or its `-shm` truncated. Check the agent's log for the target; the agent and its other targets are not affected |
+| `security.file_world_readable` | Remove the "other" read bit from the database file |
+| `coverage.views_not_sampled`, `coverage.virtual_tables_not_sampled`, `coverage.computed_columns_not_sampled` | Information: these objects are never read (their base or shadow tables are). On SQLite, `coverage.computed_columns_not_sampled` also counts columns whose `DEFAULT` or `STORED` expression uses a function outside the reader's list (a UUID default with `randomblob`, for example), and every such column of a table whose `CREATE TABLE` text is not valid UTF-8 (a Latin-1 literal); the table's other columns are read ([docs/08](08-engine-capabilities.md#what-is-not-read)) |
+| `check.timed_out` | A writer held its lock past the reader's busy timeout, or a statement hit `max_statement_ms`; it is retried at the next check |
+
+While a scan runs, the agent page shows the target's state from the last check before the scan: the scan's reader checks the file before every unit, but the console sees a change only after the scan.
+
+**Name the target after the application, not the file** (`crm-app`, not `customers.db` or a path): the target id is the only thing that tells two SQLite files apart in the console, and the path is never sent. Every SQLite location is the database `main`, so the console shows a SQLite finding as its target, its table and its column.
+
+**Location exceptions are scoped to the target**: an exception with a location pattern covers SQLite findings only when it names both the agent id and the target. Without both, it still applies to the other engines but covers no SQLite target, and the console says so when you create it. To cover the same table and column names in every SQLite file of the exception's scope, tick the cross-target confirmation: the confirmation is recorded in the console audit log. Exceptions without a location (agent, target or classifier only) work as on other engines. SQLite names are compared with case, and trailing spaces count. Exceptions follow the target id, not the file: if you point a target at another file in `agent.yaml`, its exceptions now apply to the new file.
+
+### Firebird targets
+*Since 0.10.0 (phase 10, [ADR-0060](adr/0060-firebird-connector.md)).* Firebird 4.0 and 5.0 are supported; 3.0 and 6.0 are refused. The agent needs a console that lists the `engine.firebird` capability. What Discovery reads: [08-engine-capabilities.md](08-engine-capabilities.md#firebird-discovery); the security model: [05-security.md](05-security.md#firebird-connector). Audit, Partial at best, is set up in the [next section](#firebird-audit).
+
+**Run the agent on the server's host, over loopback.** Firebird has no TLS, and its wire encryption protects neither the integrity of the connection nor the server's identity, so the agent connects only to `127.0.0.1` or `::1`. Declare the target:
+
+```yaml
+targets:
+  - id: app-fb
+    engine: firebird
+    host: 127.0.0.1                # or ::1; never a name, not even localhost (port: 3050 by default)
+    account: DATABASTION_AGENT
+    secret:
+      file: /etc/databastion/secrets/app-fb
+    firebird:
+      peer_uid: firebird           # the account that owns the server's sockets: a name, or a number
+      databases:
+        - name: app                # the label the console shows
+          attach: appdb            # a databases.conf alias (recommended) or an absolute path; never sent to the console
+      # tunnel: false              # true: a remote server through a tunnel you run (below)
+      # extended_grants: false     # true: the reader role holds SELECT_ANY_OBJECT_IN_DATABASE
+```
+
+- **`databases`**: the databases to scan, 1 to 64 per target; the agent never lists the server's databases. Prefer an **alias** in `attach`: the name you declare there travels **in clear on loopback**, before wire encryption starts (the server picks its per-database settings by that name), and so does the account name. Neither is sent to the console or logged.
+- **`peer_uid`**: before it sends anything, the agent checks that the server side of its connection belongs to this account, so that a local user who binds port 3050 while Firebird is down gets nothing. **When the agent runs in a container, give a number** (a name would be looked up in the agent image's own `/etc/passwd`). `0` (root) is refused unless `peer_uid_root: true`; do not use it: the official Firebird image runs the server as root, so run it as its own account instead (uid 84 in the image) and declare that uid. A wrong `peer_uid` shows as `target_unreachable`, with the reason in the agent's log.
+- **Containers: the network namespace.** The agent's container shares the server's network namespace (`network_mode: service:<firebird>` in Compose). **No other container may share that namespace unless every container in it drops `NET_RAW` and `NET_ADMIN`** (`cap_drop: [NET_RAW, NET_ADMIN]`): a process holding either there can capture or alter the agent's connection, guess its password offline from the capture and read the sampled values. Docker gives `NET_RAW` by default. On a plain host, only root holds them.
+- **A remote server: `tunnel: true`.** Run a TLS or WireGuard tunnel (stunnel, `ssh -L`, WireGuard) that ends on the agent host's loopback, declare its loopback end as `host` / `port`, set `tunnel: true` and set `peer_uid` to the tunnel process's account (required). The target then shows the permanent note `security.firebird_tunnel` (the tunnel's security is yours) and has no Audit. Without `tunnel: true`, a forwarder on loopback is detected and refused.
+
+**Server settings** (`firebird.conf`, and the database's entry in `databases.conf` if it sets them): `AuthServer` listing `Srp256`; `WireCrypt = Required`; `WireCryptPlugin` listing `ChaCha64` or `ChaCha`; and `RemoteBindAddress = 127.0.0.1` when no other client needs the network. The agent refuses a server without ChaCha wire encryption (`Arc4` is refused) or that asks for a login plugin other than `Srp256`. A wire-encryption failure is shown on the agent page as `check.stage_failed` with "wire encryption (stage_tls)".
+
+**The account.** Create a user with the `Srp` user manager and a **random password of at least 32 characters** (a process that impersonates the server gets one offline guess per candidate), then a reader role with `SELECT` on each table, granted as a default role:
+
+```sql
+CREATE USER DATABASTION_AGENT PASSWORD '<random, 32+ characters>' USING PLUGIN Srp;
+CREATE ROLE DATABASTION_READER;
+GRANT SELECT ON TABLE CUSTOMERS TO ROLE DATABASTION_READER;   -- one per table
+GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT;
+```
+
+A new table needs a new grant (`coverage.relations_without_select` lists the tables not covered). Never use `SYSDBA`, the database owner, `RDB$ADMIN` or a user mapped to them: the agent refuses to scan or audit with them (`privilege.refused`), and with the system privileges listed in [05-security.md](05-security.md#firebird-connector). Give each agent its own account. Details: [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only).
+
+**Notes you may see, and what to do**:
+
+| Note | What to do |
+|------|------------|
+| `check.stage_failed` with "wire encryption (stage_tls)" | Set `WireCrypt = Required` and list `ChaCha64` or `ChaCha` in `WireCryptPlugin` |
+| `privilege.refused` | Use a dedicated user with the reader role only, not `SYSDBA`, the owner, `RDB$ADMIN`, a mapped user or a refused system privilege |
+| `privilege.beyond_select`, `privilege.grant_option`, `privilege.owner_of_objects`, `privilege.global_privileges` | Remove the extra rights or ownership. On Firebird, `credential_relation_readable` names a credential relation the account can read; a global authentication mapping no longer raises it (`SEC$GLOBAL_AUTH_MAPPING` is not probed, #420) |
+| `coverage.relations_without_select` | Grant `SELECT` on the new tables to the reader role, or leave them out on purpose |
+| `coverage.external_file_tables`, `coverage.views_not_sampled`, `coverage.computed_columns_not_sampled` | Information: these objects are never read |
+| `security.login_event_trigger` | A database trigger runs at each of the agent's attachments or transactions; check that it writes nothing in an autonomous transaction |
+| `security.firebird_tunnel` | Expected with `tunnel: true` |
+
+### Firebird Audit
+*Since 0.10.0 (phase 10, [ADR-0060](adr/0060-firebird-connector.md), lot 3). The Firebird target itself (account, `databases`, `peer_uid`, loopback) is in the [previous section](#firebird-targets); [`agent/agent.example.yaml`](../agent/agent.example.yaml) shows the block.*
+
+**What to expect first** (each point is detailed below):
+- **After an agent restart** without the state the agent keeps in `state_dir` (a server restart, a host reboot, a change of the declared databases, a log rotation while the agent was stopped), Partial can be withheld for up to 24 h and the agent's own recent reads can be reported under the agent's account. A pending routine read restored from that state, and the re-read reads of a database whose schema changed or that was restored while the agent was stopped, are reported as `*`.
+- **After a kill** (SIGKILL, the OOM killer) during a check or a scan, the check's reads can be reported under the agent's account, or a statement of about the last second before the kill can be ambiguous.
+- **Never exclude the agent's account** from "every read" policies: the exclusion would also hide reads made with a stolen copy of its credential.
+
+**Level: Partial at best, never Full.** The target reaches Partial when all of these hold, and stays Limited otherwise (None whenever no record of a declared database was parsed in the last 24 h):
+- the agent reads the trace log locally, and every enabled section that writes it has `max_log_size = 0` (see "Rotation" below);
+- the agent runs on the server's host, or, in a container, the host's identity files are declared and mounted read-only (below);
+- the readers check passes: only root, the server's account and the agent can read the log, its directory and its rotated files (below);
+- every trace setting below is present, the services section included, and the server was restarted after the configuration changed;
+- the server is not in Classic mode (Limited at best otherwise);
+- a recent read-back probe: the agent's own constant probe statement found in the log;
+- no gap and no ambiguous record in the last 24 h;
+- and the other proofs of [docs/08, Firebird Audit](08-engine-capabilities.md#firebird-audit).
+
+**Failed logins are not audited**: a wrong password writes no record of the target database, so every Firebird target with Audit shows `audit.failed_logins_not_audited`. The note does not lower the level. Watch failed logins on the host, outside DataBastion.
+
+What Audit sees and its limits: [08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit); the trust model: [05-security.md](05-security.md#firebird-audit-trace-log).
+
+The agent reads the server's **system audit trace**, a text log the server writes on its host. Audit needs no database grant; it is refused for a target with `tunnel: true`. Add an `audit` block to the target's `firebird` block, with canonical absolute paths on the agent host:
+
+```yaml
+    firebird:
+      # … databases, peer_uid …
+      audit:
+        root: /opt/firebird                          # the Firebird root ($(root)); the server binary must be in <root>/bin
+        firebird_conf: /opt/firebird/firebird.conf   # must be <root>/firebird.conf
+        databases_conf: /opt/firebird/databases.conf # optional, must be <root>/databases.conf; without it, aliases are not evaluated
+        trace_config: /opt/firebird/fbtrace.conf     # the file AuditTraceConfigFile names
+        log: /var/log/firebird/audit/audit.log       # the log_filename of the trace configuration
+```
+
+**Server configuration.** Set `AuditTraceConfigFile` in `firebird.conf` to the trace configuration, then **restart the server**: it reads both files at start only, and a file changed after the server started is not proven. In the trace configuration:
+
+- a `database = <path>` section for each declared database, with the exact path the server prints (no `SIMILAR TO` pattern: a path holding `_`, `%`, `-` or another metacharacter is not evaluated). Disable the default `database` section, or keep it off the declared log: the log must hold only declared databases;
+- in each of these sections: `enabled = true`, `log_filename` the declared log, `connection_id = 0`, `time_threshold = 0`, `max_log_size = 0` (no rotation by the server, below), `max_sql_length` between 4096 and 983 040, no `include_filter`, `exclude_filter` or GDS-code filter, and `true` (unquoted) for `log_connections`, `log_transactions`, `log_statement_finish`, `log_procedure_finish`, `log_function_finish`, `log_trigger_finish`, `log_blr_requests`, `log_errors`, `log_initfini`, `log_sweep` and `print_perf`;
+- a `services` section with `enabled = true`, `log_services = true`, `max_log_size = 0` and the same `log_filename`.
+
+`ServerMode = Classic` in `firebird.conf` gives Limited at best; use `Super` or `SuperClassic`.
+
+A missing setting is shown as `audit.trace_settings_missing` with the setting's name, and the target is Limited at best: for example `max_log_size` for a section with `max_log_size` other than 0 (the server's default included), or `max_sql_length` for a value above 983 040 (a longer statement line could not be read whole). A `max_sql_length` below 4096 is reported as `audit.statement_text_limit_low`; below the agent's longest own statement, it also gives Limited. The dev service's [`dev/firebird/fbtrace.conf`](../dev/firebird/fbtrace.conf) is a complete example.
+
+**Log file permissions.**
+
+- **The log holds passwords in clear.** Firebird writes the text of `CREATE USER … PASSWORD`, `ALTER USER … PASSWORD` and `EXECUTE STATEMENT … ON EXTERNAL … PASSWORD` statements with the password unmasked (measured on 5.0.4), with every other statement's literals. Protect the log, its directory and every moved log like the database itself: readable only by root, the server's account and the agent, through the named-user ACL below. The agent sends only the kind of such a statement, never its text.
+- The agent's account reads the log, its directory and the rotated files, and can write none of them nor any directory above them. Run the agent as a dedicated account, never as root: with root, every file counts as writable by the agent and the readers check always fails (`host_identity_refused (passwd: writable)` in the agent's log).
+- No account other than root, the server's account and the agent may read them. The server's account is taken from the server process, or from `peer_uid`; both must agree.
+- **Use named-user ACLs, not a group.** The server owns the directory and the log, with no group or other access, and the agent reads them through a named-user ACL. **Create the log yourself before the server starts**, with the ACL below: the server then opens the existing file and keeps its ACL. With the server's account owning the files and the agent's account `databastion` (the layout of the dev service, [`dev/firebird/acl-init/layout.sh`](../dev/firebird/acl-init/layout.sh)):
+  ```sh
+  chmod 0700 <dir>; chmod 0600 <log>
+  setfacl -m 'u::rwx,g::---,o::---,u:databastion:rx,m::rx' <dir>
+  setfacl -d -m 'u::rw,g::---,m::r,o::---,u:databastion:r' <dir>
+  setfacl -m 'u::rw,g::---,o::---,u:databastion:r,m::r' <log>
+  ```
+  A log that the server creates itself (a missing log, or a new one after a server-side rotation) is `0600`: a default ACL's entry for the agent is inherited but masked (`#effective:---` in `getfacl`), so the agent cannot read it and Audit stops with a gap (fail closed). Check the log you created with `getfacl <log>`: the agent's entry `user:databastion:r--` must be there, with no `#effective:---` next to it.
+- **A group that grants read** counts only when every member, named in the group file or by primary group, is root, the server's account or the agent, and when the group file is the only source of groups (below). Prefer the named-user layout.
+- **What the agent reads to decide** (at every check, on the host): `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, and `/etc/subuid` and `/etc/subgid` when present, each owned by root and not writable by group or other (a symbolic link is followed only when every link and directory under `/etc` is root's). It needs Linux 5.6 or later. Consequences:
+  - a `passwd:` line in `nsswitch.conf` that names a source other than `files` and `systemd` (LDAP, SSSD, NIS…) fails the check: users from another source cannot be proven;
+  - a `group:` or `initgroups:` line with any source other than `files` makes every group that grants read count as open. The stock Debian and Ubuntu `group: files systemd` is such a line: use the named-user layout there;
+  - the server's and the agent's uids must not be 65534, 4294967294 or 4294967295, nor lie in a subordinate id range (`/etc/subuid`) or one of systemd's ranges (60001 to 60513, 61184 to 65519, 524288 to 1879048191, 2147352576 to 2147418111); a group that grants read in such a range counts as open;
+  - a host whose root file system is an overlay (a live system, composefs) is taken for a container, and gets no Partial from its own files.
+
+**Agent in a container.** The agent cannot read the host's identity files from its image, so you declare them in the target's `audit` block, each bind-mounted read-only from the host. Without this block, an agent in a container gets no Partial (`agent_in_container` in its log).
+
+```yaml
+      audit:
+        # … root, firebird_conf, databases_conf, trace_config, log …
+        host_identity:
+          passwd: /run/databastion/host/passwd           # the host's /etc/passwd
+          group: /run/databastion/host/group             # the host's /etc/group
+          nsswitch: /run/databastion/host/nsswitch.conf  # the host's /etc/nsswitch.conf
+          subuid: /run/databastion/host/subuid           # optional: the host's /etc/subuid
+          subgid: /run/databastion/host/subgid           # optional: the host's /etc/subgid
+          server_account: firebird                       # optional: the only name the server's uid may have on the host
+          agent_account: databastion                     # optional: the only name the agent's uid may have on the host
+```
+
+- **Each file is its own single-file, read-only bind mount from the host**, at exactly the declared path, for example `- /etc/passwd:/run/databastion/host/passwd:ro` in Compose. Use **host bind mounts only** (`hostPath` on Kubernetes), **never a ConfigMap, a Secret or an `emptyDir`**: the agent checks that each file is owned by root, not writable, has one hard link, and is the root of its own read-only mount, but it cannot check where the mount comes from. A file of the image itself, a writable mount or a whole mounted directory is refused.
+- **The agent trusts the container definition.** The declared files are your statement that they are the host's. Whoever can edit the agent's container definition (a Compose file, a pod specification) or the mounted files can make the check pass for a log others can read: keep that definition as trusted as the host's root. On Kubernetes, where `hostPath` mounts of `/etc` files may be disallowed, an agent installed on the node may be simpler.
+- **Restart the agent's container after a change of host accounts or groups.** Tools that edit `/etc/passwd` or `/etc/group` replace the file, which leaves the mount on the old one; the agent refuses that stale mount until the container restarts.
+- **Without the subordinate id files**, every uid or gid of 100000 or more is treated as subordinate.
+- **Uids**: the server's and the agent's uids must be absent from the host's passwd file, or present there only under `server_account` / `agent_account` (otherwise `uid_collision`). `peer_uid` must be numeric in a container.
+- **The agent must not run as root**, and its uid and gid maps must be the identity (no user namespace: rootless Docker, `userns-remap` or `hostUsers: false` give no Partial).
+- **Namespaces**: the agent's container shares the server's network namespace (`network_mode: service:<firebird>`, as for any Firebird target in a container) and its pid namespace (`pid: service:<firebird>` when the server runs in a container, `pid: host` when it runs on the host, which shows every host process to the agent). Every container of that network namespace drops `NET_RAW` and `NET_ADMIN`.
+- **Paths**: mount the Firebird root, the configuration files and the log directory into the agent's container read-only **at the same paths** as the server sees them.
+- Needs Linux 5.8 or later. A refused file is named in the agent's log by its role and the reason, for example `host_identity_refused (passwd: mount)`, never by its path.
+
+**Rotation** ([ADR-0060 refinement of 2026-10-31 c](adr/0060-firebird-connector.md#refinement-2026-10-31-c-decided-by-the-maintainer-on-2026-10-31-trace-log-rotation)).
+
+- **Partial requires `max_log_size = 0`** in every section that writes the declared log. The server creates each rotated log `0600`, whatever the umask, and that mask hides the agent's ACL entry, so the agent cannot read the new log. The agent therefore refuses Partial when any enabled section that writes the declared log has `max_log_size` other than 0: the target is Limited at best, with `audit.trace_settings_missing` and the label `max_log_size`.
+- **Monitor the log's size**: with no rotation, it grows until you rotate it.
+- **Rotate only with the server stopped**: stop the server, move the log away, re-create it with the owner, mode and ACL above (`chmod 0600`, the `setfacl -m` line for the log), check it with `getfacl`, then start the server.
+- **Each rotation, offline or not, counts as a gap** and caps the target for 24 h.
+- **The moved log still holds statement texts**: keep it with the same restrictions as the live log, or delete it.
+- DataBastion provides no tool that restores the ACL after a rotation by the server.
+
+**Agent restarts.** Keep `state_dir` on a persistent volume: the agent keeps its Firebird parser state there (`<target>.firebird_audit_trace.checkpoint` and `<target>.firebird_ledger.counters`, `0600`), so a restart recognizes the agent's own earlier reads and does not, by itself, make records ambiguous. A graceful stop (`systemctl stop`, `docker stop`) during a check keeps that check's reads the agent's own (#418); a kill (SIGKILL, the OOM killer) during a check can report them as always-reported one-object events under the agent's account (expected; review them), or make ambiguous a statement credited in about the last second before the kill (the agent writes its ledger at each credit, at most once per second). The state is not used after a server restart, a host reboot, a change of the declared databases, or a log rotation while the agent was stopped. Then, as without `state_dir`, restarting the agent while the server is busy can make the first records it re-reads ambiguous, which keeps the target at Limited for up to 24 h (`audit.log_records_ambiguous`), and its own recent reads are reported as reads by the agent's account. A pending routine read restored from the state is reported as `*`, and a database whose schema changed, or that was restored, while the agent was stopped has its re-read reads reported as `*`. No read is hidden. Those reads are always-reported events under the agent's account: expected after such a restart, review them. **Do not exclude the agent's account** from "every read" policies: the exclusion would also hide reads made with a stolen copy of its credential, and `RemoteBindAddress = 127.0.0.1` is recommended, not checked. Scope such policies by object (the relations concerned) instead, or by the agent's loopback client address where the console supports it ([08-engine-capabilities.md](08-engine-capabilities.md#firebird-audit)).
+
+**One account per agent.** Each agent recognizes only its own statements in the trace. If two agent processes use the same Firebird account (two agents, or a test agent beside the production one), each reports the other's reads as reads by that account. Give each agent its own Firebird account.
+
+**Backups.** Run backups through the services manager or over loopback TCP. An embedded `gbak` on the server host writes under its own process and makes its records ambiguous (24 h cap).
+
+**Local external data sources.** Keep `ExtConnPoolSize = 0` (the default) in `firebird.conf` when routines reach a declared database through `EXECUTE STATEMENT … ON EXTERNAL '<path>'`. With pooled external connections (`ExtConnPoolSize` above 0), the agent cannot yet attribute the pool's records: each use makes them ambiguous, and the target is Limited for 24 h ([engine capabilities](08-engine-capabilities.md#gaps-that-cap-the-level-for-24-h)).
+
+**Untraced readers.** The database owner, `RDB$ADMIN` and holders of a utility system privilege (`USE_GBAK_UTILITY`, `USE_GFIX_UTILITY`, `USE_GSTAT_UTILITY` and the like) can read, within their object rights, **with no record in the trace**, so with no event. Grant these privileges only to accounts trusted to read without audit.
+
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
 
@@ -429,6 +665,8 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | Apereo CAS (`cas`) | no account: the registry directory (`0750`) and its files (`0640`) readable through the agent's group, never writable, no access to the CAS configuration | the audit log (`0640`, directory `2750`) readable the same way | [ADR-0041](adr/0041-cas-connector.md), [05-security.md](05-security.md#recommended-database-accounts-read-only) (also the column grants for CAS tables held in a database), [connector README](../agent/crates/connector-cas/README.md) |
 | Microsoft SQL Server (since 0.8.0) | SQL login with `CHECK_POLICY = ON`, a database user and `SELECT` per schema in each monitored database; database `VIEW DEFINITION` too with the row-level security opt-in, or Discovery samples nothing; never `sysadmin`, `db_owner` or the other refused rights | Only where Audit runs. SQL Server Audit (2022+): `VIEW SERVER SECURITY AUDIT` and `VIEW ANY SECURITY DEFINITION`. Extended Events: `VIEW SERVER STATE` (2019) or `VIEW SERVER PERFORMANCE STATE` (2022+), which expose every statement text on the server. Never `VIEW SERVER SECURITY STATE` or `CONTROL SERVER` | [ADR-0051](adr/0051-sqlserver-connector.md), [section 6](#microsoft-sql-server-targets), [05-security.md](05-security.md#microsoft-sql-server-connector) |
 | Redis / Valkey (since 0.8.0) | ACL user: `-@all` plus `select`, `scan`, `type`, `getrange`, `hrandfield`, `hstrlen`, `hmget`, `srandmember`, `zrandmember`, `lrange`, `xrevrange`, `info`, `acl\|dryrun`, on `%R~*` or the declared patterns, `resetchannels`; never `default` | `slowlog\|get`, `acl\|log`, `client\|list` (Valkey 8.1+: `commandlog\|get`) | [ADR-0052](adr/0052-redis-valkey-connector.md), [05-security.md](05-security.md#redis--valkey-connector) |
+| SQLite (since 0.10.0) | no account: the file `0640` and its directory `2750` readable through the agent's group, never writable, on a file system mounted read-only for the agent | none (Discovery only) | [ADR-0059](adr/0059-sqlite-connector.md), [section 6](#sqlite-targets), [05-security.md](05-security.md#sqlite-connector) |
+| Firebird (since 0.10.0) | a user of the security database (`Srp` user manager, random password of 32+ characters) with a reader role holding `SELECT` per table, granted `DEFAULT`; never `SYSDBA`, the owner or `RDB$ADMIN`; loopback only | no grant: the system audit trace log readable by the agent through a named-user ACL | [ADR-0060](adr/0060-firebird-connector.md), [section 6](#firebird-targets), [05-security.md](05-security.md#firebird-connector) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.
@@ -436,7 +674,7 @@ Also:
 - At every heartbeat the agent checks each account and reports over-privilege and coverage problems as **target notes** on the agent page. A note about over-privilege means the account has more rights than recommended: remove them.
 
 ## 8. Audit prerequisites and levels
-What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. CAS never reaches Full either: Partial means authentications and ticket issuance are logged. SQL Server (since 0.8.0) reaches Partial at best, through SQL Server Audit on 2022 and 2025 or through Extended Events (the only source on 2019), and Redis / Valkey (since 0.8.0) Limited at best. PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)). Since 0.7.0, Full also needs `log_min_messages` and `log_min_error_statement` at `error` or lower (the PostgreSQL defaults), so that failed and cancelled statements are logged with their text, for every role: no `ALTER ROLE … SET`, `ALTER ROLE … IN DATABASE … SET`, `ALTER DATABASE … SET` or function `SET` clause raising them above `error`, and, on PostgreSQL 15+, no `SET` or `ALTER SYSTEM` grant on them (`GRANT SET ON PARAMETER …`) to a role other than superusers (a grant to the agent's role is reported as an over-privilege). The agent reads these two settings only, filtered by the server ([05-security.md](05-security.md#recommended-database-accounts-read-only)). It reads them from `pg_db_role_setting` and `pg_proc` (and, on PostgreSQL 15+, the grants from `pg_parameter_acl`), which every role can read by default: no grant is needed. If `SELECT` on `pg_db_role_setting` was revoked from `PUBLIC`, grant it to the agent's role, or the target stays at Partial; check with `SELECT pg_catalog.has_table_privilege('databastion_agent', 'pg_catalog.pg_db_role_setting', 'SELECT')` (your agent role's name). An override or grant shows the target at Partial, and the agent's log names the database, the setting and the roles or functions. To get Full back, reset them (`ALTER ROLE app RESET log_min_error_statement`, `ALTER DATABASE shop RESET log_min_messages`, `ALTER FUNCTION f() RESET log_min_messages`) and revoke the grants (`REVOKE SET ON PARAMETER log_min_messages FROM app`); the level follows at the next heartbeat. Some operators raise `log_min_error_statement` for an application role to keep its statement texts out of the server log: that role's failed reads then leave no text, so the target is Partial.
+What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. CAS never reaches Full either: Partial means authentications and ticket issuance are logged. SQL Server (since 0.8.0) reaches Partial at best, through SQL Server Audit on 2022 and 2025 or through Extended Events (the only source on 2019), and Redis / Valkey (since 0.8.0) Limited at best. Since 0.10.0, SQLite targets are Discovery only (None), and Firebird reaches Partial at best, through the system audit trace log ([Firebird Audit](#firebird-audit)). PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)). Since 0.7.0, Full also needs `log_min_messages` and `log_min_error_statement` at `error` or lower (the PostgreSQL defaults), so that failed and cancelled statements are logged with their text, for every role: no `ALTER ROLE … SET`, `ALTER ROLE … IN DATABASE … SET`, `ALTER DATABASE … SET` or function `SET` clause raising them above `error`, and, on PostgreSQL 15+, no `SET` or `ALTER SYSTEM` grant on them (`GRANT SET ON PARAMETER …`) to a role other than superusers (a grant to the agent's role is reported as an over-privilege). The agent reads these two settings only, filtered by the server ([05-security.md](05-security.md#recommended-database-accounts-read-only)). It reads them from `pg_db_role_setting` and `pg_proc` (and, on PostgreSQL 15+, the grants from `pg_parameter_acl`), which every role can read by default: no grant is needed. If `SELECT` on `pg_db_role_setting` was revoked from `PUBLIC`, grant it to the agent's role, or the target stays at Partial; check with `SELECT pg_catalog.has_table_privilege('databastion_agent', 'pg_catalog.pg_db_role_setting', 'SELECT')` (your agent role's name). An override or grant shows the target at Partial, and the agent's log names the database, the setting and the roles or functions. To get Full back, reset them (`ALTER ROLE app RESET log_min_error_statement`, `ALTER DATABASE shop RESET log_min_messages`, `ALTER FUNCTION f() RESET log_min_messages`) and revoke the grants (`REVOKE SET ON PARAMETER log_min_messages FROM app`); the level follows at the next heartbeat. Some operators raise `log_min_error_statement` for an application role to keep its statement texts out of the server log: that role's failed reads then leave no text, so the target is Partial.
 
 **PostgreSQL failed and cancelled reads.** With `pgaudit.log_rows = on`, which Full requires, pgaudit writes its record only when a statement completes, so a read that ends in an error or a cancel, including one that already sent rows to the client, has no pgaudit record. Since 0.7.0, the agent reports such reads from the server's `ERROR` lines in the same log file, by SQLSTATE only (it never reads their message, which can quote the value read): a read of the statement's relations with no row count, always reported ([08-engine-capabilities.md](08-engine-capabilities.md#failed-and-cancelled-statements)). Keep `log_min_messages` and `log_min_error_statement` at `error` or lower (the defaults); otherwise the target shows Partial and the agent's log says which setting. Expect events from applications whose queries fail (a missing table, a constraint violation on an `UPDATE`). **Up to 0.6.x**, such reads are not reported at Full: if that matters more than row counts there, set `pgaudit.log_rows = off` for the monitored databases (such reads are then reported, with no row count, and the target shows Partial).
 
@@ -530,6 +768,32 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 
 ## 12. Upgrading
 Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment). Upgrade commands for the Compose console and the `.deb` agent: [deploy/README.md](../deploy/README.md#agent-package-reference) ("Upgrade").
+
+From 0.9.x to **0.10.0** (console and agent; new engines SQLite and Firebird; one console migration, `0048`; the agent refuses PostgreSQL before 14 and MariaDB before 10.11; no grant added on any existing engine; the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)). Upgrade in this order:
+1. **Check the server versions.** A 0.10.0 agent refuses PostgreSQL 12 and 13 and MariaDB 10.6 at connection time: such a target shows as unreachable with the failure code `unsupported`, and nothing is sampled or audited. Upgrade those servers first, or keep the agent that monitors them on 0.9.x until then (0.9.x receives no security fixes once 0.10.0 is released).
+2. **Back up the console database.** At its first start the 0.10.0 worker upgrades the pg-boss schema from 45 to 46, as the runtime role, as for earlier pg-boss upgrades. After the first start, four `CREATE INDEX CONCURRENTLY` builds run in the background on `pgboss.job`; expect extra I/O on a large job table.
+3. **Every console replica and every worker.** `migrate` applies migration `0048` on start: one column with a constant default and a `CHECK` on `policy_exceptions`, which holds administrator-written rows only. With **several replicas**:
+   - set `DATABASTION_AGENT_TOKENS_HOLD=0.9` on every web process of the new build before you roll it out;
+   - check `databastion_console_agent_tokens_hold{release="0.9"} 1` on each replica's `/metrics`;
+   - once **every** web replica **and every worker** runs 0.10.0, remove the variable, restart the replicas, and check that every gauge is back to `0` ([deploy/README.md](../deploy/README.md#rolling-upgrade-of-several-console-replicas)).
+
+   Without the hold, an agent that learns `engine.sqlite` or `engine.firebird` from an upgraded replica sends SQLite and Firebird items to every replica, and a 0.9 replica answers `400` to them. A 0.9 worker would also apply location exceptions to SQLite findings without their target scope. While the hold is set, no agent sends SQLite or Firebird items: do not leave it set.
+4. **The agents**, once every replica and worker runs 0.10.0 and the hold is removed. Existing targets need no change: 0.9 `agent.yaml` files stay valid.
+5. **New SQLite targets** ([SQLite targets](#sqlite-targets)):
+   - the reader needs **Landlock**: on a bare host, a kernel with Landlock enabled; in a container, Docker 25 or later, or a seccomp profile that allows the `landlock_*` calls. Otherwise the target reports `coverage.reader_sandbox_unavailable` and is not read;
+   - the agent's **systemd unit** now allows `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` and `seccomp` (`SystemCallFilter=`). A drop-in that replaces the filter (`SystemCallFilter=` followed by its own list) must list these four calls, or the reader is disabled (fail closed: `coverage.reader_sandbox_unavailable`). Never leave `SystemCallFilter=` empty: that removes the whole filter, including the unit's `bind` / `listen` deny.
+6. **New Firebird targets** ([Firebird targets](#firebird-targets), [Firebird Audit](#firebird-audit)):
+   - reached over **loopback only**; no other container may share the agent's and the server's network namespace unless every container there drops `NET_RAW` and `NET_ADMIN`;
+   - keep `state_dir` on a persistent volume. Without the parser state kept there, an agent restart can withhold Partial for up to 24 h and report the agent's own recent reads under the agent's account; a kill during a check or a scan can do the same for that check, or make a statement of about the last second before the kill ambiguous. A restored pending routine read, and the re-read reads of a database whose check results changed while the agent was stopped, are reported as `*`. No read is hidden;
+   - **never exclude the agent's account** from "every read" policies: the exclusion would also hide reads made with a stolen copy of its credential. Scope them by object, or by the agent's loopback client address where the console supports it.
+
+**Do not downgrade without preparing it**:
+- the console, once it has stored SQLite findings: an older worker would apply exceptions that are not scoped to a target to every SQLite file. Delete those findings first (`DELETE FROM findings WHERE engine = 'sqlite';` as the console's owner role, after a backup);
+- an agent with SQLite or Firebird targets: a 0.9 agent refuses `engine: sqlite` and `engine: firebird` in `agent.yaml`, quarantines their spooled batches (their items are lost) and ignores the Firebird parser state. Remove those targets and let the spool drain first (`spool.batches` at 0 in the heartbeat, with the console reachable).
+
+**Building the agent from source** needs Rust 1.89 or later (1.88 before). The released `.deb` and images are not affected.
+
+Also after the upgrade: Audit settings on MySQL, MariaDB and MongoDB targets warn about a hand-typed sensitive object with a schema (`schema_warning`), which the agent never matches on those engines; and every log-file Audit source keeps the records read just before a log rotation whose new file cannot be opened, or before a read error, which earlier agents lost.
 
 From 0.8.x to **0.9.0** (console and agent; seven console migrations, `0041` to `0047`; new optional protocol fields negotiated per capability token; no grant added on any engine; the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)). Upgrade in this order:
 1. **Webhook receivers.** The `incident.opened` access payload gains `access.objects_overflowed`, so update the receivers that reject unknown keys before the console ([section 11](#11-policies-incidents-and-notifications)). `agent.target_mismatch`'s `details_count` can now reach 64.

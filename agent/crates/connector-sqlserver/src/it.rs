@@ -2414,8 +2414,12 @@ async fn xe_scenario() {
         )
     };
     let (stream, mut rx) = start(&c);
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(!stream.is_finished(), "{:?}", stream.await);
+    if stream.is_finished() {
+        panic!("{:?}", stream.await);
+    }
+    // The activity below must be past the first start's floor
+    // (`xe_first_read`), not after a fixed delay.
+    Box::pin(xe_first_read(&c, &t.id, &stream)).await;
 
     // The agent's own activity while the stream reads.
     let h = Box::pin(c.check(&t)).await;
@@ -5314,6 +5318,41 @@ async fn measure_xe_read_cost() {
     .await;
 }
 
+/// Waits until an Extended Events stream has completed its first poll
+/// (at most 60 s; the stream must not end meanwhile), then for the first
+/// start's clock skew. The first start skips the session's history: every
+/// event stamped before the server time read when the stream opens its
+/// session, plus `XE_CLOCK_SKEW_US`, is history, never reported (by design,
+/// ADR-0051 decision 6). A test that writes the events it counts after a
+/// fixed delay races that first start: on a loaded runner the session
+/// opened after the writes began, and their first part was history (engine
+/// matrix, SQL Server 2025 strict, job 124929503164: 4 769 of 6 000 small
+/// events reported, none dropped by the server or lost by the agent;
+/// reproduced with no delay: 0 of 6 000, all 18 258 events read). The
+/// first poll follows the first start, so events written after it and the
+/// skew are past the floor.
+async fn xe_first_read<T>(
+    c: &SqlserverConnector,
+    target_id: &str,
+    stream: &tokio::task::JoinHandle<T>,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while c.state.audit.xe_reads(target_id).reads == 0 {
+        assert!(
+            !stream.is_finished(),
+            "the stream ended before its first read"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no Extended Events read within 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let skew = u64::try_from(crate::audit::xe::XE_CLOCK_SKEW_US).unwrap_or(0);
+    tokio::time::sleep(Duration::from_micros(2 * skew)).await;
+    assert!(!stream.is_finished(), "the stream started");
+}
+
 /// The large-event test's own Extended Events session
 /// ([`xe_large_events_are_read_by_halving`]).
 const LARGE_XE: &str = "it_large_xe";
@@ -5390,7 +5429,10 @@ const LARGE_DELAY_MS: u32 = 80;
 /// stream, which is restarted as the runtime does, from the same position
 /// at the halved size the connector kept (each restart at one position
 /// reads less, at most [`LARGE_MAX_RESTARTS`], none on small events or
-/// after the memory, the stream alive at the end).
+/// after the memory, the stream alive at the end). The test's session is
+/// `NO_EVENT_LOSS` and checked to have dropped nothing at every step
+/// ([`large_server_kept_all`]): a read the server dropped is not one the
+/// agent could report.
 #[tokio::test]
 async fn xe_large_events_are_read_by_halving() {
     Box::pin(xe_large_scenario()).await;
@@ -5450,7 +5492,16 @@ async fn xe_large_body(major: u32) {
         .replace(
             "max_file_size = 16, max_rollover_files = 2",
             "max_file_size = 256, max_rollover_files = 4",
+        )
+        .replace(
+            "MAX_DISPATCH_LATENCY = 5 SECONDS",
+            "MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = NO_EVENT_LOSS",
         );
+    // No event dropped by the server, whatever the disk
+    // ([`large_server_kept_all`]); `error_reported` cannot be in such a
+    // session (error 25643), and no failed login is read here.
+    let session = without_error_reported(&session);
+    assert!(session.contains("NO_EVENT_LOSS"), "{session}");
     Box::pin(exec(&mut s, &session)).await;
     // The dev session is stopped meanwhile (as in the backlog test), so
     // that the other tests' first starts do not walk these events.
@@ -5484,8 +5535,9 @@ async fn xe_large_body(major: u32) {
     let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
     let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
     let mut stream = large_stream(&c, &cfg, &sink);
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(!stream.is_finished(), "the stream started");
+    // Not a fixed delay: the small events below must be past the first
+    // start's floor (`xe_first_read`).
+    Box::pin(xe_first_read(&c, &t.id, &stream)).await;
     // Counts the stream's reads of `retail.crm.customers` by `sa` until
     // `want` are counted or `wait` passes.
     let mut seen = 0usize;
@@ -5551,6 +5603,7 @@ async fn xe_large_body(major: u32) {
     let got = count_until(small as usize, Duration::from_secs(60)).await;
     let r = c.state.audit.xe_reads(&t.id);
     eprintln!("[it] large events: small backlog {got}/{small}, reads {r:?}");
+    Box::pin(large_server_kept_all(&mut s, &stem, got, small as usize)).await;
     assert_eq!(got, small as usize, "every small read reported once");
     assert!(
         r.largest_asked > crate::audit::BATCH && r.largest_asked <= XE_MAX_ROWS,
@@ -5584,7 +5637,12 @@ async fn xe_large_body(major: u32) {
     }
     let before_run = c.state.audit.xe_reads(&t.id);
     let started = std::time::Instant::now();
+    // A `NO_EVENT_LOSS` session makes the run wait for the file target:
+    // about 36 MB of events, 17 s with the service's writes limited to
+    // 4 MB/s, more than the session's 30 s at 2 MB/s.
+    s.statement_timeout = Duration::from_secs(180);
     Box::pin(large_customer_reads(&mut s)).await;
+    s.statement_timeout = Duration::from_secs(30);
     eprintln!(
         "[it] large events: run written in {} ms",
         started.elapsed().as_millis()
@@ -5605,6 +5663,7 @@ async fn xe_large_body(major: u32) {
     let got = count_until(want, Duration::from_secs(120)).await;
     let r = c.state.audit.xe_reads(&t.id);
     eprintln!("[it] large events: {got}/{want} after the large ones, reads {r:?}");
+    Box::pin(large_server_kept_all(&mut s, &stem, got, want)).await;
     eprintln!(
         "[it] large events: other events of sa {:?}",
         other.lock().unwrap()
@@ -5628,6 +5687,7 @@ async fn xe_large_body(major: u32) {
     let got = count_until(want, Duration::from_secs(60)).await;
     let r = c.state.audit.xe_reads(&t.id);
     eprintln!("[it] large events: {got}/{want} after the memory, reads {r:?}");
+    Box::pin(large_server_kept_all(&mut s, &stem, got, want)).await;
     assert_eq!(got, want, "every read reported once");
     assert_eq!(r.cancels, cancels, "no further cancel: {r:?}");
     assert_eq!(
@@ -5667,6 +5727,71 @@ async fn xe_large_body(major: u32) {
     assert_eq!(facts.dropped, 0, "records dropped");
     assert!(!facts.gap, "no gap");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `session` (a [`backlog_session`] text) without its `error_reported`
+/// event, which a `NO_EVENT_LOSS` session cannot hold (error 25643).
+fn without_error_reported(session: &str) -> String {
+    let from = session
+        .find(", ADD EVENT sqlserver.error_reported")
+        .expect("the session's error_reported event");
+    let to = session[from..]
+        .find(" ADD TARGET")
+        .map(|i| from + i)
+        .expect("the session's target");
+    format!("{}{}", &session[..from], &session[to..])
+}
+
+/// The large-event test's precondition: its session dropped no event, so
+/// that every read it counts is in the session's files and a shortfall is
+/// the agent's. With the default `ALLOW_SINGLE_EVENT_LOSS` and `MAX_MEMORY`
+/// (3 buffers of about 1.4 MB, about 4 580 small events each), the 6 000
+/// small reads written at once (about 18 000 events in a few hundred ms)
+/// filled the buffers faster than a slow runner disk took them into the
+/// file, and the server dropped the events of a whole buffer: job
+/// 128208306747 (SQL Server 2022 Express), 4 569 of 6 000 reported, which
+/// a write limit of 4 MB/s on the service reproduced to the event
+/// (`dropped_event_count` 4 293, 1 431 reads of 3 events; the files held
+/// 4 569 reads, every one reported; the agent counted the gap,
+/// `audit.records_dropped`). The test session is `NO_EVENT_LOSS` since
+/// then (without `error_reported`, [`without_error_reported`]): the
+/// workload waits for a free buffer, and nothing is dropped whatever the
+/// disk. `got` of `want` reads of `retail.crm.customers`
+/// were reported: on a shortfall, the reads the files hold tell the
+/// agent's loss from the server's.
+async fn large_server_kept_all(s: &mut Session, stem: &str, got: usize, want: usize) {
+    let drops = Box::pin(try_rows(
+        s,
+        &format!(
+            "SELECT CONVERT(bigint, dropped_event_count), CONVERT(bigint, dropped_buffer_count) \
+             FROM sys.dm_xe_sessions WHERE name = N'{LARGE_XE}'"
+        ),
+        2,
+    ))
+    .await
+    .and_then(|r| r.first().map(|r| (r[0].as_int(), r[1].as_int())));
+    if got != want {
+        let in_files = Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT CONVERT(bigint, COUNT(*)) FROM \
+                 sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/{stem}_0_*.xel', NULL, NULL, NULL) \
+                 WHERE object_name IN (N'sql_statement_completed', N'sp_statement_completed') \
+                 AND CONVERT(nvarchar(max), event_data) LIKE N'%FROM retail.crm.customers WHERE id = @i%'"
+            ),
+            1,
+        ))
+        .await
+        .and_then(|r| r.first().and_then(|r| r[0].as_int()));
+        eprintln!(
+            "[it] large events: {got}/{want} reported, reads in the session's files {in_files:?}, server drops (events, buffers) {drops:?}"
+        );
+    }
+    assert_eq!(
+        drops,
+        Some((Some(0), Some(0))),
+        "the test session dropped events (a precondition, not the agent): {got}/{want} reported"
+    );
 }
 
 /// The large-event run as the session's files hold it: every event

@@ -176,10 +176,27 @@ impl AuditRunner {
     /// # Errors
     /// [`Refusal`] when the log cannot be read or is refused.
     pub fn poll(&mut self, now: SystemTime) -> Result<Polled, Refusal> {
-        if !self.settings.path.still_resolves() {
-            return Err(Refusal::ResolvedChanged);
+        // The path's checks. When they refuse a path that no longer names
+        // the file already open (a rotation to a file refused, or a log
+        // removed), what remains of the open file is read first and handed
+        // on (security review L3 of #392): it was checked when it was
+        // opened, and the tailer's open check refuses the new path on its
+        // own handle. A refusal of the open file itself is never read past.
+        let path_check = if self.settings.path.still_resolves() {
+            fsread::check_log(self.settings.path.path(), self.policy)
+        } else {
+            Err(Refusal::ResolvedChanged)
+        };
+        if let Err(r) = path_check {
+            use std::os::unix::fs::MetadataExt as _;
+            let moved = self.tailer.open_file().is_some_and(|open| {
+                std::fs::symlink_metadata(self.settings.path.path())
+                    .map_or(true, |m| (m.dev(), m.ino()) != open)
+            });
+            if !moved {
+                return Err(r);
+            }
         }
-        fsread::check_log(self.settings.path.path(), self.policy)?;
         // A refusal of the tailer's open check (on its own handle) is
         // reported as such; any other error of the tailer (an `EACCES` on
         // open, review of #138 I3, a symlink refused by `O_NOFOLLOW`) is
@@ -191,6 +208,12 @@ impl AuditRunner {
                 .take()
                 .unwrap_or(Refusal::NotReadable)
         })?;
+        if let Err(r) = path_check
+            && polled.records.is_empty()
+            && polled.skipped.is_empty()
+        {
+            return Err(r);
+        }
         let lines: Vec<Zeroizing<Vec<u8>>> = polled.records;
         let batch = parse_lines(&lines, self.settings.offset, now);
         drop(lines);
@@ -548,6 +571,50 @@ mod tests {
         let p = r.poll(now).unwrap();
         assert_eq!(p.events.len(), 1);
         assert!(!format!("{:?}", p.events).contains("planted"));
+    }
+
+    /// Security review L3 of #392: lines written to the open log just
+    /// before it rotated to a refused file (a symlink) are read and handed
+    /// on before the refusal; the planted target is never read; the next
+    /// poll is refused. A removed log: its remainder too.
+    #[test]
+    fn the_rest_of_the_open_log_is_read_before_a_refused_rotation() {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        for removed in [false, true] {
+            let dir = TempDir::new("stream-rest");
+            append(&dir, "");
+            let s = settings(&dir);
+            let b = Builder::new(key(), &[], ClientAddrMode::Truncated, None);
+            let mut r =
+                AuditRunner::with_policy(&s, None, b, Arc::new(CasState::default()), Policy::TESTS)
+                    .unwrap();
+            let now = SystemTime::now();
+            assert!(r.poll(now).unwrap().events.is_empty());
+            let when = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let line = |who: &str| {
+                format!(
+                    "{{\"action\": \"AUTHENTICATION_SUCCESS\", \"who\": \"{who}\", \"when\": {when}}}\n"
+                )
+            };
+            append(&dir, &line("before"));
+            let log = dir.path().join("cas_audit.log");
+            if removed {
+                std::fs::rename(&log, dir.path().join("cas_audit.log.1")).unwrap();
+            } else {
+                let other = dir.path().join("elsewhere.log");
+                std::fs::write(&other, line("planted")).unwrap();
+                std::fs::rename(&log, dir.path().join("cas_audit.log.1")).unwrap();
+                std::os::unix::fs::symlink(&other, &log).unwrap();
+            }
+            let p = r.poll(now).unwrap();
+            assert_eq!(p.events.len(), 1, "removed: {removed}");
+            assert!(!format!("{:?}", p.events).contains("planted"));
+            assert!(r.poll(now).is_err(), "removed: {removed}");
+            assert!(r.poll(now).is_err(), "removed: {removed}");
+        }
     }
 
     #[test]

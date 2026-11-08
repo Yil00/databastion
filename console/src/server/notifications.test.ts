@@ -718,8 +718,9 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
     const boss = new PgBoss(pgBossOptions(url));
     boss.on("error", () => undefined);
     await boss.start();
+    const runtimePool = new Pool({ connectionString: url, max: 4 });
     try {
-      const runtimeDb = drizzle(new Pool({ connectionString: url, max: 4 }), { schema });
+      const runtimeDb = drizzle(runtimePool, { schema });
       await registerPolicyQueue(boss, () => runtimeDb, logger, { pollingIntervalSeconds: 0.5 });
       await registerNotificationQueue(boss, () => runtimeDb, logger, { pollingIntervalSeconds: 0.5 });
       const { secret } = await webhookChannel("soc-hook");
@@ -733,9 +734,13 @@ describe.skipIf(!hasDb)("alerting (PostgreSQL)", () => {
       const got = hook.received.slice(n);
       expect(got).toHaveLength(1);
       expect(verifyWebhookSignature(secret, String(got[0]?.headers["x-databastion-signature"]), String(got[0]?.body))).toBe(true);
-      await runtimeDb.$client.end();
     } finally {
-      await boss.stop({ graceful: false, timeout: 2000 });
+      // The workers first (their handlers use the pool), then the pool, even when an expectation failed.
+      try {
+        await boss.stop({ graceful: false, timeout: 2000 });
+      } finally {
+        await runtimePool.end();
+      }
     }
   });
 

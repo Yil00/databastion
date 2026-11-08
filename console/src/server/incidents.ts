@@ -106,6 +106,7 @@ async function loadExceptions(db: Database | Tx): Promise<ExceptionScope[]> {
       classifier: policyExceptions.classifier,
       location: policyExceptions.location,
       expiresAt: policyExceptions.expiresAt,
+      crossTarget: policyExceptions.crossTarget,
     })
     .from(policyExceptions);
   return rows.map((r) => ({ ...r, location: (r.location as LocationPattern | null) ?? null }));

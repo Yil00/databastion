@@ -1,0 +1,23 @@
+{
+  "batch_id": "019a1b2c-3d40-7e5f-8a61-7b8c9d0e1f20",
+  "job_id": "019a1b2b-7f00-7a3c-8b22-1d2e3f4a5b6e",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "crm-app",
+      "location": {
+        "engine": "sqlite",
+        "database": "/srv/clients/jdupont/notes.db",
+        "object": "customers",
+        "field": "email"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.9,
+      "sampled": 64,
+      "matched": 61,
+      "masked_samples": [
+        "j***@*******.***"
+      ]
+    }
+  ]
+}

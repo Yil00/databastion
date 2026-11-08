@@ -107,6 +107,8 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Cas => ProtoConnector::Cas,
         Engine::Redis => ProtoConnector::Redis,
         Engine::Sqlserver => ProtoConnector::Sqlserver,
+        Engine::Sqlite => ProtoConnector::Sqlite,
+        Engine::Firebird => ProtoConnector::Firebird,
     }
 }
 
@@ -591,6 +593,11 @@ struct ScanQueue {
 /// Bound of one target's `check()` in a heartbeat.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound of the connectors' [`Connector::shutdown`] at a stop, all
+/// together (well within `docker stop`'s default 10 s and systemd's
+/// `TimeoutStopSec`).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How a heartbeat target check ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckOutcome {
@@ -862,17 +869,39 @@ impl Runtime {
     }
 
     async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
-        let heartbeat = self.heartbeat_loop(shutdown.clone());
-        let jobs = self.jobs_loop(shutdown.clone());
-        let scans = self.scan_loop(shutdown.clone());
-        let audits = self.audit_loop(shutdown.clone());
-        let spool = self.spool_loop(shutdown);
-        tokio::select! {
-            r = heartbeat => r,
-            r = jobs => r,
-            r = scans => r,
-            r = audits => r,
-            r = spool => r,
+        let result = {
+            let heartbeat = self.heartbeat_loop(shutdown.clone());
+            let jobs = self.jobs_loop(shutdown.clone());
+            let scans = self.scan_loop(shutdown.clone());
+            let audits = self.audit_loop(shutdown.clone());
+            let spool = self.spool_loop(shutdown);
+            tokio::select! {
+                r = heartbeat => r,
+                r = jobs => r,
+                r = scans => r,
+                r = audits => r,
+                r = spool => r,
+            }
+        };
+        // Every loop is dropped now, with the checks, scans and streams it
+        // was running (a check in progress included): the connectors write
+        // the state those left in memory before the runtime goes away
+        // (ADR-0060, the Firebird own-statement ledger).
+        self.shutdown_connectors().await;
+        result
+    }
+
+    /// [`Connector::shutdown`] of every connector, together, within
+    /// [`SHUTDOWN_TIMEOUT`], each isolated from a panic of another (the
+    /// hook logs it without its message).
+    async fn shutdown_connectors(&self) {
+        let all = futures_util::future::join_all(self.connectors.iter().map(|c| async move {
+            if crate::panics::guard(c.shutdown()).await.is_err() {
+                tracing::warn!(engine = %c.engine(), "connector shutdown panicked");
+            }
+        }));
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, all).await.is_err() {
+            tracing::warn!("connector shutdown not finished in time");
         }
     }
 
@@ -1195,6 +1224,9 @@ impl Runtime {
                     r2026_10_c: self
                         .console_caps
                         .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_C),
+                    r2026_10_d: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_D),
                 },
             )
         } else {
@@ -1221,7 +1253,7 @@ impl Runtime {
                 .unwrap_or_else(crate::name_case::NameCaseReport::unknown);
             crate::name_case::to_protocol(&report)
         });
-        let status = TargetStatus {
+        let mut status = TargetStatus {
             audit_level: proto_audit_level(level),
             audit_source,
             edition: None,
@@ -1236,6 +1268,11 @@ impl Runtime {
                 .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
             target_id,
         };
+        // ADR-0059 decision 7 (P10-C review R1) and ADR-0060 (P10-C Firebird
+        // review, merge condition C1): a `sqlite` or `firebird` target
+        // status is rewritten to the contract rules, whatever its connector
+        // reported.
+        crate::sanitize::enforce_target_status(&mut status);
         (status, outcome)
     }
 
@@ -1331,6 +1368,28 @@ impl Runtime {
         }
         // Audit log cursors discarded at open: the file was truncated or
         // rewritten while the agent was stopped (end-of-phase-7 review L1).
+        // SQLite reader processes that died or were killed (ADR-0059
+        // decision 4).
+        if let Ok(key) = MetricsMapKey::try_from("sqlite_reader_failures_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::connector::sqlite_reader_failures() as f64);
+        }
+        // Firebird Audit streams stopped for a run confirmation, and the
+        // confirmations that failed (ADR-0060 R1 rule 2).
+        if let Ok(key) = MetricsMapKey::try_from("firebird_audit_stream_stopped_seconds_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(
+                key,
+                crate::connector::firebird_stream_stopped_ms() as f64 / 1000.0,
+            );
+        }
+        if let Ok(key) = MetricsMapKey::try_from("firebird_audit_run_confirmations_failed_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(
+                key,
+                crate::connector::firebird_run_confirmations_failed() as f64,
+            );
+        }
         if let Ok(key) = MetricsMapKey::try_from("audit_cursor_reset_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::cursor_resets() as f64);
@@ -1413,6 +1472,13 @@ impl Runtime {
             ts: now(),
             uptime_s: crate::sanitize::clamped_count(self.started.elapsed().as_secs()),
         };
+        // ADR-0059 decision 7 (P10-C review R1) and merge condition C1
+        // (ADR-0060): the last step before the heartbeat leaves, on every
+        // target status and detected target.
+        for t in &mut heartbeat.targets {
+            crate::sanitize::enforce_target_status(t);
+        }
+        crate::sanitize::enforce_detected_targets(&mut heartbeat.detected_targets);
         // Engines added after protocol 0.1.0 are reported only once the
         // console lists their token (ADR-0039 decision 8): an older console
         // rejects the whole heartbeat for an unknown `Engine` value.
@@ -2006,8 +2072,14 @@ impl Runtime {
                         Vec::new()
                     }
                 };
-                let left_out = u64::try_from(batch.len()).unwrap_or(u64::MAX)
-                    - u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>()).unwrap_or(0);
+                // Saturating: the core runtime is not panic-isolated, so a
+                // miscount here must not stop the agent (overflow checks).
+                let left_out = u64::try_from(batch.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(
+                        u64::try_from(rest.iter().map(ResultBatch::len).sum::<usize>())
+                            .unwrap_or(0),
+                    );
                 if self
                     .lock_spool()
                     .replace(&key, &rest, left_out)
@@ -2518,13 +2590,15 @@ impl Runtime {
 
     /// Converts and spools aggregated events of a target (the single
     /// conversion in `uplink::to_batches`).
+    /// Spools `events`; `false` when some of them could not be spooled
+    /// (not serializable, invalid, spool full, write error).
     fn spool_events(
         &self,
         target_id: &TargetId,
         events: &[databastion_classifiers::masking::MaskedEvent],
-    ) {
+    ) -> bool {
         if events.is_empty() {
-            return;
+            return true;
         }
         let fingerprints = crate::sanitize::HmacFingerprints(&self.hmac);
         let built = uplink::to_batches(uplink::MaskedResults::Events {
@@ -2533,6 +2607,7 @@ impl Runtime {
             fingerprints: &fingerprints,
         });
         self.count_unserializable(built.unserializable_batches);
+        let mut all = built.unserializable_batches == 0 && built.dropped_items == 0;
         let mut spool = self.lock_spool();
         spool.counters.dropped_items += built.dropped_items;
         if built.dropped_items > 0 {
@@ -2542,7 +2617,11 @@ impl Runtime {
             );
         }
         for batch in &built.batches {
-            if let Err(e) = spool.push(batch) {
+            let before = spool.counters.dropped_items;
+            let pushed = spool.push(batch);
+            // A batch the spool dropped (full, too large) is not durable.
+            all &= pushed.is_ok() && spool.counters.dropped_items == before;
+            if let Err(e) = pushed {
                 let lost = u64::try_from(batch.len()).unwrap_or(u64::MAX);
                 bump(&self.counters.events_lost, lost);
                 tracing::error!(
@@ -2555,10 +2634,12 @@ impl Runtime {
         }
         drop(spool);
         self.spool_pushed.notify_one();
+        all
     }
 
-    /// Filters and spools what the aggregator holds.
-    fn flush_events(&self, cfg: &AuditConfig, target_id: &TargetId, agg: &mut Aggregator) {
+    /// Filters and spools what the aggregator holds; `false` when some of
+    /// it could not be spooled.
+    fn flush_events(&self, cfg: &AuditConfig, target_id: &TargetId, agg: &mut Aggregator) -> bool {
         let (keep, drop): (Vec<_>, Vec<_>) = agg
             .drain()
             .into_iter()
@@ -2570,7 +2651,7 @@ impl Runtime {
             &self.counters.events_filtered,
             u64::try_from(drop.len()).unwrap_or(u64::MAX),
         );
-        self.spool_events(target_id, &keep);
+        self.spool_events(target_id, &keep)
     }
 
     /// Audit worker: runs one stream per target with enabled settings,
@@ -2806,6 +2887,14 @@ impl Runtime {
     ) -> AuditEnd {
         let (sink, mut rx) = EventSink::channel(EVENTS_CHANNEL);
         let mut agg = Aggregator::new(cfg.aggregation_window());
+        // Events received so far: once a flush spooled what the aggregator
+        // held, the first `received` events are durably handled (the
+        // connector reads it through `EventSink::durable`).
+        let mut received: u64 = 0;
+        let flush = |agg: &mut Aggregator, received: u64| {
+            let ok = self.flush_events(cfg, target_id, agg);
+            sink.mark_durable(received, ok);
+        };
         let mut stream = Box::pin(crate::panics::guard(connector.audit_stream(cfg, &sink)));
         let end = loop {
             let can_emit = self.events_can_emit();
@@ -2825,6 +2914,7 @@ impl Runtime {
                 }
                 ev = rx.recv(), if can_emit && !agg.is_full() => {
                     if let Some(e) = ev {
+                        received += 1;
                         bump(&self.counters.events_received, 1);
                         if agg.push(e, Instant::now()) {
                             bump(&self.counters.auth_failures_overflowed, 1);
@@ -2832,28 +2922,29 @@ impl Runtime {
                     }
                 }
                 () = tokio::time::sleep_until(sleep_to), if can_emit && deadline.is_some() => {
-                    self.flush_events(cfg, target_id, &mut agg);
+                    flush(&mut agg, received);
                 }
                 () = tokio::time::sleep(Duration::from_secs(1)), if !can_emit => {}
             }
             if agg.is_full() && self.events_can_emit() {
-                self.flush_events(cfg, target_id, &mut agg);
+                flush(&mut agg, received);
             }
         };
         // The connector future is dropped here (no more cursor updates);
         // what it handed over is kept.
         drop(stream);
-        drop(sink);
         while let Ok(e) = rx.try_recv() {
+            received += 1;
             bump(&self.counters.events_received, 1);
             if agg.push(e, Instant::now()) {
                 bump(&self.counters.auth_failures_overflowed, 1);
             }
             if agg.is_full() {
-                self.flush_events(cfg, target_id, &mut agg);
+                flush(&mut agg, received);
             }
         }
-        self.flush_events(cfg, target_id, &mut agg);
+        flush(&mut agg, received);
+        drop(sink);
         end
     }
 
@@ -3545,7 +3636,7 @@ fn poll_gap(elapsed: Duration, got_jobs: bool, fast_empty: &mut u32, fraction: f
     gap
 }
 
-fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
+pub(crate) fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
     match level {
         AuditLevel::None => databastion_protocol::AuditLevel::None,
         AuditLevel::Limited => databastion_protocol::AuditLevel::Limited,
@@ -3565,6 +3656,8 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Redis => databastion_protocol::Engine::Redis,
         TargetEngine::Valkey => databastion_protocol::Engine::Valkey,
         TargetEngine::Sqlserver => databastion_protocol::Engine::Sqlserver,
+        TargetEngine::Sqlite => databastion_protocol::Engine::Sqlite,
+        TargetEngine::Firebird => databastion_protocol::Engine::Firebird,
     }
 }
 

@@ -3,8 +3,10 @@
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
 # cn=accesslog entries; Redis / Valkey RESP3 replies, INFO sections and key names; CAS service definitions (JSON and YAML, the YAML parser also against
 # serde_yaml_ng as a differential oracle) and JSON audit log lines; and the name normalizers
-# (classifiers, ADR-0057). See
-# README.md.
+# (classifiers, ADR-0057); SQLite database files with their -wal, -shm and -journal
+# files, the SQLite header pre-check and the reader IPC decoders (ADR-0059); the
+# Firebird server messages, describe answers and rows, SRP data, wire-crypt keys and
+# /proc/net/tcp tables (ADR-0060). See README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
 # in agent/ never build it, and the agent binary never links libFuzzer. The
@@ -29,15 +31,30 @@ databastion-connector-openldap = { path = "../crates/connector-openldap", featur
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
 databastion-connector-redis = { path = "../crates/connector-redis", features = ["fuzzing"] }
 databastion-connector-sqlserver = { path = "../crates/connector-sqlserver", features = ["fuzzing"] }
+databastion-connector-firebird = { path = "../crates/connector-firebird", features = ["fuzzing"] }
 # The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
 # connector-cas used before its own.
 serde_yaml_ng = "0.10"
+# SQLite (ADR-0059 decision 5): hostile database files through the reader's
+# pipeline, built with the production LIBSQLITE3_FLAGS (agent/.cargo/config.toml,
+# read when cargo runs under agent/; the targets' setup runs the self-check
+# and fails otherwise).
+databastion-connector-sqlite = { path = "../crates/connector-sqlite", features = ["fuzzing"] }
+# AddressSanitizer for the bundled SQLite C code (feature `asan`, nightly
+# campaigns only: .github/scripts/fuzz-nightly.sh), never outside this workspace.
+libsqlite3-sys = { version = "=0.39.1", optional = true }
+
+[features]
+asan = ["dep:libsqlite3-sys", "libsqlite3-sys/with-asan"]
 
 [workspace]
 members = ["."]
 
 [profile.release]
 debug = 1
+# As the agent's release profile; cargo-fuzz `-a` and smoke.sh also pass
+# `-Coverflow-checks`, this keeps a plain `cargo fuzz run` the same.
+overflow-checks = true
 
 [[bin]]
 name = "mongodb_bson"
@@ -238,6 +255,111 @@ bench = false
 [[bin]]
 name = "classifiers_names"
 path = "fuzz_targets/classifiers_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_file"
+path = "fuzz_targets/sqlite_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_header"
+path = "fuzz_targets/sqlite_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_ipc"
+path = "fuzz_targets/sqlite_ipc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_messages"
+path = "fuzz_targets/firebird_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_describe_rows"
+path = "fuzz_targets/firebird_describe_rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_catalog"
+path = "fuzz_targets/firebird_catalog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_srp_data"
+path = "fuzz_targets/firebird_srp_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_keys"
+path = "fuzz_targets/firebird_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_proc_net_tcp"
+path = "fuzz_targets/firebird_proc_net_tcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_trace_log"
+path = "fuzz_targets/firebird_trace_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_trace_stream"
+path = "fuzz_targets/firebird_trace_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_trace_conf"
+path = "fuzz_targets/firebird_trace_conf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_host_identity"
+path = "fuzz_targets/firebird_host_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_statement"
+path = "fuzz_targets/firebird_statement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_checkpoint"
+path = "fuzz_targets/firebird_checkpoint.rs"
 test = false
 doc = false
 bench = false

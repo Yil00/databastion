@@ -127,6 +127,7 @@ describe("policies view", () => {
       reason: HOSTILE,
       expiresAt: new Date(NOW - 1),
       createdAt: new Date(NOW - 10),
+      crossTarget: false,
     };
     const ex = renderToStaticMarkup(<ExceptionsTable exceptions={[e]} isAdmin={false} csrfToken="c" now={NOW} />);
     expect(ex).not.toContain("<img");
@@ -212,13 +213,14 @@ describe("case-sensitive exceptions (ADR-0054)", () => {
     reason: "r",
     expiresAt: null,
     createdAt: new Date(NOW - 10),
+    crossTarget: false,
   };
   const gone = "01890a5d-ac96-774b-bcce-b302099a8062";
 
   it("the exception form says where names compare with case", () => {
     const html = renderToStaticMarkup(<ExceptionForm csrfToken="c" />);
     expect(html).toContain((EXCEPTION_MATCHING_NOTE.split(" (")[0] ?? "").replaceAll("'", "&#x27;"));
-    expect(EXCEPTION_MATCHING_NOTE).toContain("with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS");
+    expect(EXCEPTION_MATCHING_NOTE).toContain("with case on PostgreSQL, MongoDB, Redis, Valkey, Apereo CAS and SQLite");
     expect(EXCEPTION_MATCHING_NOTE).toContain("without case on OpenLDAP");
     // ADR-0055 decision 7: these engines follow the server's settings.
     expect(EXCEPTION_MATCHING_NOTE).toContain("on SQL Server, MySQL and MariaDB targets according to the server's settings");

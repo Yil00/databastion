@@ -12,9 +12,10 @@
 #
 # Every seed is a committed fixture with fake values only (agent/crates/connector-cas/fixtures/
 # README.md: fake dev user, ticket and token ids, ID tokens, Authorization header and cookies
-# replaced by REDACTED / FAKE placeholders). Crash inputs are mutations of these seeds or of
-# libFuzzer's own random bytes, so they cannot hold a secret: never seed this corpus with real
-# log lines, server replies or service definitions (I2).
+# replaced by REDACTED / FAKE placeholders; the recorded Firebird trace logs of
+# agent/crates/connector-firebird/testdata/ hold the pinned dev images' fake data). Crash inputs
+# are mutations of these seeds or of libFuzzer's own random bytes, so they cannot hold a secret:
+# never seed this corpus with real log lines, server replies or service definitions (I2).
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -47,7 +48,21 @@ case "$TARGET" in
   cas_registry_yaml | cas_registry_yaml_diff)
     cp "$FIXTURES"/registry/*.yml "$FIXTURES"/registry/*.yaml "$FIXTURES"/registry-hostile/*.yml "$CORPUS"/ ;;
   cas_audit_log) split -l 1 -a 3 -d "$FIXTURES/cas-8.0.2-oauth-oidc-audit.jsonl" "$CORPUS/fixture-" ;;
+  sqlite_file) python3 -I "$FUZZ/sqlite_seed.py" "$CORPUS/seed" ;;
+  firebird_trace_stream)
+    python3 -I "$FUZZ/firebird_trace_seed.py" "$ROOT/agent/crates/connector-firebird/testdata" "$CORPUS" ;;
   *) ;; # the MongoDB and OpenLDAP targets start from an empty corpus, as in smoke.sh
+esac
+# The SQLite targets (ADR-0059 decision 5): the bundled C code with AddressSanitizer
+# (libsqlite3-sys's with-asan, feature `asan` of the fuzz crate) and libFuzzer's coverage
+# instrumentation, so the fuzzer sees inside SQLite; clang, as rustc's sanitizer runtime is
+# LLVM's. The production LIBSQLITE3_FLAGS come from agent/.cargo/config.toml (cargo runs under
+# agent/ below); the targets' setup runs the self-check and fails the run without them.
+FEATURES=()
+case "$TARGET" in
+  sqlite_*)
+    export CC=clang CFLAGS="-fsanitize=fuzzer-no-link"
+    FEATURES=(--features asan) ;;
 esac
 echo "fuzz-nightly: $TARGET for ${SECS}s, $(find "$CORPUS" -type f | wc -l) seed input(s)" >&2
 
@@ -55,5 +70,5 @@ cd "$ROOT/agent"
 # The lockfile must be used as committed (cargo-fuzz has no --locked flag).
 cargo fetch --locked --manifest-path fuzz/Cargo.toml
 # Same libFuzzer bounds as smoke.sh, with more memory for the ASan shadow.
-cargo fuzz run --fuzz-dir fuzz -O -a -s address "$TARGET" "$CORPUS" -- \
+cargo fuzz run --fuzz-dir fuzz -O -a -s address "${FEATURES[@]}" "$TARGET" "$CORPUS" -- \
   -max_total_time="$SECS" -max_len=4096 -timeout=10 -rss_limit_mb=2560 -print_final_stats=1

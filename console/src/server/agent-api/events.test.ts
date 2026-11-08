@@ -40,7 +40,7 @@ const HEARTBEAT = {
   agent_version: "0.1.0",
   uptime_s: 12,
   classifiers_version: "2026.09.1",
-  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis"],
+  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis", "firebird"],
   targets: [
     { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" },
     { target_id: "mysql-crm", engine: "mysql", reachable: true, audit_level: "partial" },
@@ -52,12 +52,18 @@ const HEARTBEAT = {
     { target_id: "mssql-2019", engine: "sqlserver", reachable: true, audit_level: "limited", audit_source: "sqlserver_query_stats" },
     { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
     { target_id: "sessions-valkey", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
+    // P10-E: CONSOLE_ACCEPTS lists engine.firebird (Partial at best).
+    { target_id: "fb-crm", engine: "firebird", server_version: "5.0.4", reachable: true, audit_level: "partial", audit_source: "firebird_audit_trace" },
   ],
   detected_targets: [],
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
 };
 
-/** Every valid contract fixture is storable since P9-E lists every engine token of the contract. */
+/**
+ * Every valid fixture is storable: CONSOLE_ACCEPTS lists every engine token of the contract since
+ * P10-E (`engine.firebird`, ADR-0060 decision 8). The gate itself stays for later engine tokens
+ * (`unlistedEngineDetails`, tested in capabilities.test.ts).
+ */
 function storableFixtures(): [string, unknown][] {
   return fixtures("valid", "EventsBatch");
 }
@@ -181,6 +187,11 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
           cause: { code: "23514", constraint: "access_events_principal" },
         });
       }
+    });
+
+    it("leaves no valid fixture to refuse for its engine (every engine token listed since P10-E)", () => {
+      for (const [name, body] of fixtures("valid", "EventsBatch")) expect(unlistedEngineDetails("EventsBatch", body), name).toEqual([]);
+      expect(fixtures("valid", "EventsBatch").map(([name]) => name)).toContain("EventsBatch.firebird.json");
     });
 
     it.each(storableFixtures())("accepts %s and stores exactly the contract fields", async (_name, body) => {

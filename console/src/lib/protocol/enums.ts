@@ -49,6 +49,7 @@ export const AUDIT_SOURCES = exhaustive<AuditSource>()([
   "redis_commandlog",
   "redis_acl_log",
   "redis_sync",
+  "firebird_audit_trace",
 ]);
 
 /** Every contract `Engine`, in contract order. */
@@ -62,6 +63,8 @@ export const ENGINES = exhaustive<Engine>()([
   "sqlserver",
   "redis",
   "valkey",
+  "sqlite",
+  "firebird",
 ]);
 
 /** Every contract `AccessEvent.action`, in contract order. */

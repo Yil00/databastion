@@ -770,6 +770,57 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       }
     });
 
+    it("stores the sqlite heartbeat fixture: Discovery-only targets with every sqlite note as sent (P10-E)", async () => {
+      const [, body] = fixtures("valid", "HeartbeatRequest").find(([f]) => f === "HeartbeatRequest.sqlite.json") ?? [];
+      expect(body).toBeDefined();
+      const hb = body as {
+        connectors: string[];
+        targets: { target_id: string; engine: string; audit_level: string; notes?: unknown[] }[];
+      };
+      expect(unlistedEngineDetails("HeartbeatRequest", hb)).toEqual([]);
+      const auth = await enroll();
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }));
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { accepts: string[] }).accepts).toContain("engine.sqlite");
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+      const sent = [...hb.targets].sort((a, b) => (a.target_id < b.target_id ? -1 : 1));
+      expect(stored.map((t) => [t.targetId, t.engine, t.auditLevel, t.auditSource, t.serverVersion, t.edition, t.nameCase, t.notes])).toEqual(
+        sent.map((t) => [t.target_id, t.engine, t.audit_level, null, null, null, null, t.notes ?? null]),
+      );
+      const sqlite = stored.filter((t) => t.engine === "sqlite");
+      expect(sqlite.length).toBeGreaterThan(0);
+      for (const t of sqlite) expect(t.auditLevel).toBe("none");
+      const detail = await getAgentDetail(getDb(), auth.agentId);
+      expect(detail?.connectors).toEqual(hb.connectors);
+    });
+
+    it("stores the firebird heartbeat fixtures: targets, detected target and every note and 2026_10_d label as sent (P10-E)", async () => {
+      for (const name of ["HeartbeatRequest.firebird.json", "HeartbeatRequest.firebird-labels-2026-10-d.json"]) {
+        const [, body] = fixtures("valid", "HeartbeatRequest").find(([f]) => f === name) ?? [];
+        expect(body, name).toBeDefined();
+        const hb = body as {
+          connectors: string[];
+          targets: { target_id: string; engine: string; audit_level: string; audit_source?: string; server_version?: string; notes?: unknown[] }[];
+          detected_targets: { engine: string }[];
+        };
+        expect(unlistedEngineDetails("HeartbeatRequest", hb), name).toEqual([]);
+        const auth = await enroll();
+        const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }));
+        expect(res.status, name).toBe(200);
+        const accepts = ((await res.json()) as { accepts: string[] }).accepts;
+        expect(accepts).toContain("engine.firebird");
+        expect(accepts).toContain("target_status.note_labels.2026_10_d");
+        const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+        const sent = [...hb.targets].sort((a, b) => (a.target_id < b.target_id ? -1 : 1));
+        expect(stored.map((t) => [t.targetId, t.engine, t.auditLevel, t.auditSource, t.serverVersion, t.edition, t.nameCase, t.notes]), name).toEqual(
+          sent.map((t) => [t.target_id, t.engine, t.audit_level, t.audit_source ?? null, t.server_version ?? null, null, null, t.notes ?? null]),
+        );
+        const detail = await getAgentDetail(getDb(), auth.agentId);
+        expect(detail?.connectors).toEqual(hb.connectors);
+        expect(detail?.detectedTargets.map((d) => d.engine) ?? []).toEqual(hb.detected_targets.map((d) => d.engine));
+      }
+    });
+
     it("stores a target whose audit source does not serve its engine without the source, with an integrity event; 200 (P9-E review M2)", async () => {
       const auth = await enroll();
       const body = {

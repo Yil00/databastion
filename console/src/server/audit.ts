@@ -42,6 +42,7 @@ export type AuditAction =
   | "audit.requeue_deferred"
   | "finding.false_positive"
   | "finding.false_positive_reset"
+  | "findings.reevaluate_target_scoped"
   | "policy.create"
   | "policy.update"
   | "policy.delete"

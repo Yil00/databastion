@@ -37,6 +37,7 @@ const X = (over: Partial<InventoryException> = {}): InventoryException => ({
   classifier: null,
   location: { database: "crm", object: "customers" },
   expiresAt: null,
+  crossTarget: false,
   ...over,
 });
 const F = (over: Partial<FindingNameGroup> = {}): FindingNameGroup => ({
@@ -96,6 +97,17 @@ describe("case inventory comparison (ADR-0054 decision 6, pure)", () => {
     expect(findingCaseChange(field, F({ engine: "sqlserver", fieldName: "Email", nameCase: sensitive }))).toBe(true);
     // Ignored on other engines (L6).
     expect(findingCaseChange(X(), F({ engine: "openldap", nameCase: sensitive }))).toBe(false);
+  });
+
+  it("P10-E (P10-C review R2): a SQLite name counts only for an exception that reaches it", () => {
+    const sqlite = F({ engine: "sqlite", databaseName: "main", schemaName: null });
+    // Not scoped to an agent and a target: it never covered a SQLite finding, with or without case.
+    expect(findingCaseChange(X({ location: { object: "customers" } }), sqlite)).toBe(false);
+    expect(findingCaseChange(X({ location: { object: "customers" }, crossTarget: true }), sqlite)).toBe(true);
+    expect(findingCaseChange(X({ location: { object: "customers" }, agentId: "a", targetId: "t" }), sqlite)).toBe(true);
+    const event = E({ engine: "sqlite", database: "main" });
+    expect(eventCaseChange(X({ location: { object: "customers" } }), event)).toBe(false);
+    expect(eventCaseChange(X({ location: { object: "customers" }, agentId: "a", targetId: "t" }), event)).toBe(true);
   });
 
   it("keeps the other scopes of the exception", () => {

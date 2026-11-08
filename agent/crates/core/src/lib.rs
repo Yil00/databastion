@@ -18,6 +18,9 @@
 //!   connectors' JSON parsers (no unzeroized `serde_json` copy).
 //! - [`notes`]: closed target notes ([`NoteCode`], [`TargetNote`]) that
 //!   `check()` reports with [`TargetHealth`].
+//! - [`fs`]: opening a path with no symbolic link followed anywhere in it
+//!   (`openat2`, or a component walk where a seccomp filter answers
+//!   `ENOSYS`), for the connectors that check files on their handles.
 //! - [`config`]: the local `agent.yaml` (targets, secret references, hard
 //!   limits).
 //! - [`runtime`]: enrollment and the heartbeat / jobs loops. This is all the
@@ -47,8 +50,13 @@ pub mod cas_guard;
 mod checks;
 pub mod config;
 pub mod connector;
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract_rules;
 mod detect;
 pub mod engine;
+#[cfg(test)]
+mod firebird_contract_tests;
+pub mod fs;
 mod fsutil;
 pub mod identity;
 pub mod job;
@@ -64,6 +72,8 @@ mod sanitize;
 mod session;
 pub mod sink;
 mod spool;
+#[cfg(test)]
+mod sqlite_contract_tests;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod uplink;

@@ -13,7 +13,7 @@
 //! `mysql` / `sys` / `performance_schema` comparisons of
 //! `check::evaluate_privileges`, privilege names become closed labels.
 //!
-//! Handled forms (MySQL 8.0+ and MariaDB 10.6+):
+//! Handled forms (MySQL 8.0+ and MariaDB 10.11+):
 //! - `GRANT <privileges> ON <target> TO <grantee> [<options>]`, where a
 //!   privilege may carry a column list (`SELECT (`a`, `b`)`) and the target
 //!   is `*.*`, `*`, `db.*`, `db.tbl` or `tbl`, optionally after `TABLE`,

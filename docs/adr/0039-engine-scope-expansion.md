@@ -34,7 +34,7 @@ The protocol is also concerned. `Engine` is a closed enum (`postgres, mysql, mar
 4. **Client library criteria.** A connector's client, own or third party:
    - uses **rustls** for TLS; no OpenSSL, `native-tls` or system TLS library (`agent/deny.toml`);
    - has a license on the `agent/deny.toml` allow-list (Apache-2.0, MIT, BSD, ISC, Zlib, CC0, Unicode-3.0), checked by cargo-deny; copyleft (GPL, LGPL, MPL) clients are refused;
-   - builds on the workspace MSRV (`rust-version`, 1.88 today), checked by the "Agent MSRV" job;
+   - builds on the workspace MSRV (`rust-version`, 1.89 today), checked by the "Agent MSRV" job;
    - spawns no process (no `sqlcmd`, `redis-cli`, `isql` or `sqlite3` binary) and links no C client library, unless the connector ADR justifies it and the `security-reviewer` accepts it; SQLite is the expected exception (the bundled SQLite C library, as no maintained pure-Rust reader exists), fuzzed on hostile files;
    - can bound every reply (size, count, time) before allocation, and parses untrusted server data with property tests and a fuzz target.
    The project's precedent is an own bounded client for a closed protocol subset (MySQL [ADR-0018](0018-mysql-mariadb-grants-and-connector.md), MongoDB [ADR-0026](0026-mongodb-connector.md), OpenLDAP [ADR-0029](0029-openldap-connector.md)). Candidates are evaluated in each connector ADR: for TDS, an existing crate (with its rustls support, TDS 8.0 strict encryption and maintenance status checked) against an own client; for RESP, an own client is expected (a small protocol); for Firebird, a pure-Rust wire client, noting that Firebird's wire encryption is not TLS (decision 6).
@@ -68,3 +68,12 @@ The protocol is also concerned. `Engine` is a closed enum (`postgres, mysql, mar
 - **Shelling out to the engines' CLI tools** (`sqlcmd`, `redis-cli`, `isql-fb`, `sqlite3`): process spawning, output parsing of tools that print values, credentials on command lines or in environment variables, and no bounds on what the tool reads.
 - **`MONITOR` for Redis Audit**: every value crosses to the agent and the server's throughput drops; I2 and the < 2 % criterion both argue against it.
 - **Scanning the file system for SQLite files**: breaks I5 and would read files no one declared.
+
+## Implementation note (2026-10-24): minimum versions of the existing engines
+Decision 1 applied to PostgreSQL and MariaDB (ROADMAP P9-D "Version policy", branch feat/p9-d-version-policy; not released yet). It changes no decision; the sentence of decision 1 on MariaDB 10.6 "still accepted by `MIN_MARIADB`", and the context's MariaDB fact, describe the state when this ADR was written.
+
+- **MariaDB 10.11.** `connector-mysql` raises `MIN_MARIADB` from 10.6 to 10.11, the oldest version tested (MariaDB 10.6 reached its end of life in July 2026).
+- **PostgreSQL 14.** The maintainer decided on 2026-10-24 that `connector-postgres` refuses servers older than PostgreSQL 14, which answers the ROADMAP question. A server whose `server_version_num` is below 140000 is refused right after the session setup, before any other statement; `check()`, Discovery and Audit all connect through the same session, so nothing is sampled or polled on it.
+- **Failure code.** Both refusals report `unsupported` at the `connect` stage, like the existing refusals of MySQL before 8.0 and MongoDB before 5.0. A version that does not parse is refused (fail closed).
+- **Code left in place.** Paths that the new minimums make unreachable are kept: the MariaDB-before-10.11 guards in `connector-mysql`'s `check.rs` and `builtins.rs`, the `server_version_num` test that selects the `toplevel` column in `connector-postgres`'s `audit/pss.rs` (now always true), and the case of a `pgaudit.log_rows` placeholder under pgaudit 1.5 (PostgreSQL 13; placeholders set without the pgaudit library loaded are still handled as before). Removing them is a possible later clean-up, not part of this decision.
+- **Upgrade.** A PostgreSQL 12 or 13, or MariaDB 10.6, target that an older agent accepted shows as unreachable with `unsupported` after the agent upgrade (CHANGELOG "Unreleased" upgrade notes; [08-engine-capabilities.md](../08-engine-capabilities.md)).

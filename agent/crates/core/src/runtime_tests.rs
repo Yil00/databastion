@@ -457,6 +457,190 @@ async fn run_stops_on_shutdown() {
     );
 }
 
+/// A connector whose check never ends (a check in progress at the stop):
+/// its future holds a guard that marks the cut when dropped; its
+/// `shutdown` records whether the check was already dropped.
+struct CutAtStop {
+    started: Arc<tokio::sync::Notify>,
+    cut: Arc<std::sync::atomic::AtomicBool>,
+    /// The cut flag as each `shutdown` saw it.
+    shutdown: Arc<Mutex<Vec<bool>>>,
+}
+
+struct Guard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Connector for CutAtStop {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        let _guard = Guard(Arc::clone(&self.cut));
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown
+            .lock()
+            .unwrap()
+            .push(self.cut.load(Ordering::SeqCst));
+    }
+}
+
+/// The agent's stop in the middle of a check (ADR-0060, the Firebird
+/// ledger): the check is dropped first, then every connector's
+/// `shutdown` runs, once, before `run` returns.
+#[tokio::test]
+async fn a_stop_drops_the_checks_then_shuts_the_connectors_down() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/jobs"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = Arc::new(Mutex::new(Vec::new()));
+    let connector = CutAtStop {
+        started: Arc::clone(&started),
+        cut: Arc::clone(&cut),
+        shutdown: Arc::clone(&shutdown),
+    };
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn({
+        let path = env.config_path.clone();
+        async move { run(&path, vec![Box::new(connector)], rx).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert!(!cut.load(Ordering::SeqCst));
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(*shutdown.lock().unwrap(), [true]);
+}
+
+/// How a [`AtStop`] connector's `shutdown` behaves.
+#[derive(Clone, Copy)]
+enum StopMode {
+    Panics,
+    Hangs,
+    Records,
+}
+
+struct AtStop(StopMode, Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait::async_trait]
+impl Connector for AtStop {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth::not_implemented(Engine::Postgres)
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    #[allow(clippy::panic)]
+    async fn shutdown(&self) {
+        match self.0 {
+            StopMode::Panics => panic!("a connector's shutdown panics"),
+            StopMode::Hangs => std::future::pending().await,
+            StopMode::Records => self.1.store(true, Ordering::SeqCst),
+        }
+    }
+}
+
+/// N1 of the review of #418: a connector whose `shutdown` panics and one
+/// whose `shutdown` never ends do not keep the others from shutting down,
+/// and `run` returns within the shutdown bound.
+#[tokio::test]
+async fn a_panicking_or_hanging_connector_shutdown_does_not_block_the_others() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(heartbeat_response(30))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/jobs"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connectors: Vec<Box<dyn Connector>> = vec![
+        Box::new(AtStop(StopMode::Panics, Arc::clone(&unused))),
+        Box::new(AtStop(StopMode::Hangs, Arc::clone(&unused))),
+        Box::new(AtStop(StopMode::Records, Arc::clone(&done))),
+    ];
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn({
+        let path = env.config_path.clone();
+        async move { run(&path, connectors, rx).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stopped = Instant::now();
+    tx.send(true).unwrap();
+    tokio::time::timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(3), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(stopped.elapsed() < SHUTDOWN_TIMEOUT + Duration::from_secs(3));
+    assert!(done.load(Ordering::SeqCst));
+}
+
 // ------------------------------------------------------------------- jobs
 
 fn job(id: &str, kind: &str, params: serde_json::Value) -> serde_json::Value {
@@ -3795,6 +3979,119 @@ impl Connector for FakeAudit {
     }
 }
 
+/// Submits three events, then records what the sink says is durable once
+/// the core flushed them (ADR-0060 R25 item 7's durability order).
+struct DurableAudit {
+    durable: Arc<AtomicU64>,
+    submitted: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl Connector for DurableAudit {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        TargetHealth {
+            reachable: true,
+            audit_level: AuditLevel::Full,
+            failure: None,
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        sink: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        for i in 0..3 {
+            sink.submit(fake_event(10 + i)).await?;
+        }
+        self.submitted.store(sink.submitted(), Ordering::SeqCst);
+        loop {
+            if let Some(d) = sink.durable() {
+                self.durable.store(d, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    fn supports_audit(&self) -> bool {
+        true
+    }
+    fn audit_source(
+        &self,
+        _: &crate::config::TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        Some(databastion_classifiers::masking::EventSource::Pgaudit)
+    }
+}
+
+/// The sink's durable count reaches the events submitted only once the
+/// core spooled them (after the aggregation window), never before.
+#[tokio::test]
+async fn the_event_sink_tells_when_events_are_spooled() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let durable = Arc::new(AtomicU64::new(0));
+    let submitted = Arc::new(AtomicU64::new(0));
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(DurableAudit {
+            durable: Arc::clone(&durable),
+            submitted: Arc::clone(&submitted),
+        })],
+    )
+    .unwrap();
+    const ON: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f8a";
+    let body = serde_json::json!({ "jobs": [
+        audit_job(ON, serde_json::json!({
+            "enabled": true, "aggregation_window_s": 1, "poll_interval_s": 1,
+            "sensitive_objects": []})),
+    ]});
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let (stop, shutdown) = watch::channel(false);
+    let worker = rt.audit_loop(shutdown);
+    let driver = async {
+        let mut before_spool = None;
+        for _ in 0..200 {
+            if rt.lock_spool().status().batches.0 > 0 {
+                break;
+            }
+            before_spool.get_or_insert(durable.load(Ordering::SeqCst));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..100 {
+            if durable.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop.send(true).unwrap();
+        before_spool
+    };
+    let (r, before_spool) = tokio::join!(worker, driver);
+    r.unwrap();
+    assert_eq!(before_spool, Some(0), "nothing durable before the spool");
+    assert_eq!(submitted.load(Ordering::SeqCst), 3);
+    assert_eq!(durable.load(Ordering::SeqCst), 3);
+}
+
 fn audit_job(id: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "job_id": id, "type": "audit.configure", "created_at": "2026-09-28T14:00:00Z",
@@ -5396,7 +5693,40 @@ async fn long_poll_intervals_never_crash_the_audit_worker() {
 /// Spools findings of `engine` through the core's conversion, as a scan
 /// of a target of that engine would.
 fn spool_engine_findings(rt: &Runtime, engine: databastion_protocol::Engine, n: usize) {
-    let found = crate::spool::tests::masked(n, "email");
+    let mut found = crate::spool::tests::masked(n, "email");
+    if engine == databastion_protocol::Engine::Sqlite {
+        // A `sqlite` location is `main` with no schema (ADR-0059 decision
+        // 6), or the core drops it.
+        use databastion_classifiers::masking::FindingLocation;
+        use databastion_classifiers::names::normalize_path;
+        found = found
+            .into_iter()
+            .map(|f| {
+                f.with_location(FindingLocation {
+                    database: normalize_path("main"),
+                    schema: None,
+                    object: normalize_path("clients"),
+                    field: normalize_path("email"),
+                })
+            })
+            .collect();
+    }
+    if engine == databastion_protocol::Engine::Firebird {
+        // A `firebird` location has no schema (ADR-0060 decision 5).
+        use databastion_classifiers::masking::FindingLocation;
+        use databastion_classifiers::names::normalize_path;
+        found = found
+            .into_iter()
+            .map(|f| {
+                f.with_location(FindingLocation {
+                    database: normalize_path("crm"),
+                    schema: None,
+                    object: normalize_path("CUSTOMERS"),
+                    field: normalize_path("EMAIL"),
+                })
+            })
+            .collect();
+    }
     rt.spool_findings(
         Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
         &TargetId::try_from("t-1").unwrap(),
@@ -5463,6 +5793,133 @@ async fn cas_findings_wait_for_engine_cas_and_survive_a_console_that_rejects_the
     assert_eq!(sent.len(), 3, "{sent:?}");
     assert_ne!(sent[2]["batch_id"], sent[1]["batch_id"]);
     assert_eq!(sent[2]["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0059 decision 8, ADR-0042: findings of a `sqlite` target are held
+/// in the spool until the console lists `engine.sqlite`; the other batches
+/// are not blocked behind them.
+#[tokio::test]
+async fn sqlite_findings_wait_for_engine_sqlite() {
+    use crate::capabilities::token;
+    use databastion_protocol::Engine as E;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![Step::Ack(false), Step::Ack(false)].into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    spool_engine_findings(&rt, E::Sqlite, 2);
+    spool_engine_findings(&rt, E::Postgres, 3);
+    // Every other engine token, not SQLite's: the `sqlite` batch is held.
+    accept_tokens(
+        &rt,
+        &[
+            token::ENGINE_CAS,
+            token::ENGINE_SQLSERVER,
+            token::ENGINE_REDIS,
+            token::ENGINE_VALKEY,
+        ],
+    );
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].to_string().contains("sqlite"));
+    assert_eq!(rt.lock_spool().status().batches.0, 1, "held, not dropped");
+
+    accept_tokens(&rt, &[token::ENGINE_SQLITE]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["findings"][0]["location"]["engine"], "sqlite");
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0060 decision 8, ADR-0042: findings of a `firebird` target are
+/// held in the spool until the console lists `engine.firebird`; the other
+/// batches are not blocked behind them.
+#[tokio::test]
+async fn firebird_findings_wait_for_engine_firebird() {
+    use crate::capabilities::token;
+    use databastion_protocol::Engine as E;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![Step::Ack(false), Step::Ack(false)].into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    spool_engine_findings(&rt, E::Firebird, 2);
+    spool_engine_findings(&rt, E::Postgres, 3);
+    // Every other engine token, not Firebird's: the `firebird` batch is
+    // held.
+    accept_tokens(
+        &rt,
+        &[
+            token::ENGINE_CAS,
+            token::ENGINE_SQLSERVER,
+            token::ENGINE_REDIS,
+            token::ENGINE_VALKEY,
+            token::ENGINE_SQLITE,
+        ],
+    );
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].to_string().contains("firebird"));
+    assert_eq!(rt.lock_spool().status().batches.0, 1, "held, not dropped");
+
+    accept_tokens(&rt, &[token::ENGINE_FIREBIRD]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["findings"][0]["location"]["engine"], "firebird");
+    assert!(sent[1]["findings"][0]["location"].get("schema").is_none());
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0060 decision 8, ADR-0042: events of the `firebird_audit_trace`
+/// source are held in the spool until the console lists
+/// `engine.firebird`.
+#[tokio::test]
+async fn firebird_events_wait_for_engine_firebird() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Ack(false)]).await;
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ENGINE_SQLITE,
+            token::TARGET_STATUS_NOTES,
+        ],
+    );
+    let fb: databastion_protocol::EventsBatch = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/fixtures/valid/EventsBatch.firebird.json"
+    ))
+    .unwrap();
+    let n = fb.events.len();
+    let batch = ResultBatch::parse(false, serde_json::to_vec(&fb).unwrap()).unwrap();
+    rt.lock_spool().push(&batch).unwrap();
+    drain(&rt).await;
+    assert!(sent_event_batches(&server).await.is_empty());
+    assert_eq!(rt.lock_spool().status().batches.0, 1, "held, not dropped");
+
+    accept_tokens(&rt, &[token::ENGINE_FIREBIRD]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["events"].as_array().unwrap().len(), n);
+    assert_eq!(sent[0]["events"][0]["source"], "firebird_audit_trace");
     assert_eq!(rt.lock_spool().status().batches.0, 0);
 }
 

@@ -53,6 +53,50 @@ const SEVERITY: &[TargetNoteLabel] = {
         L::CreateAnyDatabaseEventSession,
         L::DropAnyDatabaseEventSession,
         L::TakeOwnership,
+        // Firebird refusal list and the system privileges that read or
+        // administer every attachment or the users (ADR-0060 decision 4):
+        // first, so a long Firebird refusal never loses them.
+        L::Sysdba,
+        L::RdbAdmin,
+        L::SecurityDatabaseAdmin,
+        L::DatabaseOwner,
+        L::VerifierRelationReadable,
+        L::TraceAnyAttachment,
+        L::MonitorAnyAttachment,
+        L::ReadRawPages,
+        L::UserManagement,
+        L::ProfileAnyAttachment,
+        L::CredentialRelationReadable,
+        L::ServerConfigReadable,
+        L::RoleGraph,
+        // Firebird trace settings of `audit.trace_settings_missing`
+        // (ADR-0060 R36 item 2): proof 4, R21, R27 item 2 and R54 / R57
+        // name 20, more than a note carries. First the settings that say
+        // the applying section does not apply or filters records out, then
+        // `log_blr_requests` (R32 item 1, review N5), then the settings
+        // that make the log unreadable or its texts unread (`max_log_size`,
+        // R54; `max_sql_length`, refinement of 2026-10-31 c), then the
+        // missing record kinds; the level is Limited whatever is cut.
+        L::ConnectionId,
+        L::Enabled,
+        L::LogFilename,
+        L::IncludeFilter,
+        L::ExcludeFilter,
+        L::LogBlrRequests,
+        L::MaxLogSize,
+        L::MaxSqlLength,
+        L::PrintPerf,
+        L::TimeThreshold,
+        L::LogStatementFinish,
+        L::LogConnections,
+        L::LogTransactions,
+        L::LogInitfini,
+        L::LogProcedureFinish,
+        L::LogFunctionFinish,
+        L::LogTriggerFinish,
+        L::LogErrors,
+        L::LogSweep,
+        L::LogServices,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,
@@ -343,6 +387,47 @@ pub enum NoteCode {
     PrivilegeRefused,
     /// `privilege.server_roles` (Microsoft SQL Server, ADR-0051).
     PrivilegeServerRoles,
+    /// `coverage.unrecognized_file_format` (SQLite, ADR-0059).
+    CoverageUnrecognizedFileFormat,
+    /// `coverage.wal_files_not_readable` (SQLite, ADR-0059).
+    CoverageWalFilesNotReadable,
+    /// `coverage.hot_journal_pending` (SQLite, ADR-0059).
+    CoverageHotJournalPending,
+    /// `coverage.network_filesystem_refused` (SQLite, ADR-0059).
+    CoverageNetworkFilesystemRefused,
+    /// `coverage.filesystem_not_read_only` (SQLite, ADR-0059).
+    CoverageFilesystemNotReadOnly,
+    /// `coverage.file_path_refused` (SQLite, ADR-0059).
+    CoverageFilePathRefused,
+    /// `coverage.rollback_mode_not_read` (SQLite, ADR-0059).
+    CoverageRollbackModeNotRead,
+    /// `coverage.reader_sandbox_unavailable` (SQLite, ADR-0059).
+    CoverageReaderSandboxUnavailable,
+    /// `coverage.reader_process_failed` (SQLite, ADR-0059).
+    CoverageReaderProcessFailed,
+    /// `coverage.virtual_tables_not_sampled` (SQLite, ADR-0059).
+    CoverageVirtualTablesNotSampled,
+    /// `privilege.database_file_writable` (SQLite, ADR-0059).
+    PrivilegeDatabaseFileWritable,
+    /// `security.file_world_readable` (SQLite, ADR-0059).
+    SecurityFileWorldReadable,
+    /// `coverage.external_file_tables` (Firebird, ADR-0060).
+    CoverageExternalFileTables,
+    /// `audit.trace_config_not_evaluated` (Firebird, ADR-0060).
+    AuditTraceConfigNotEvaluated,
+    /// `audit.trace_settings_missing` (Firebird, ADR-0060).
+    AuditTraceSettingsMissing,
+    /// `audit.services_not_audited` (Firebird, ADR-0060).
+    AuditServicesNotAudited,
+    /// `audit.log_records_ambiguous` (Firebird, ADR-0060).
+    AuditLogRecordsAmbiguous,
+    /// `audit.log_readable_by_others` (Firebird, ADR-0060 refinement R4).
+    AuditLogReadableByOthers,
+    /// `security.firebird_tunnel` (Firebird, ADR-0060 decision 3).
+    SecurityFirebirdTunnel,
+    /// `coverage.security_database_excluded` (Firebird, ADR-0060
+    /// refinement of 2026-10-26, R9).
+    CoverageSecurityDatabaseExcluded,
 }
 
 impl NoteCode {
@@ -452,6 +537,41 @@ impl NoteCode {
         Self::PrivilegeDatabaseRoles,
         Self::PrivilegeRefused,
         Self::PrivilegeServerRoles,
+        Self::CoverageUnrecognizedFileFormat,
+        Self::CoverageWalFilesNotReadable,
+        Self::CoverageHotJournalPending,
+        Self::CoverageNetworkFilesystemRefused,
+        Self::CoverageFilesystemNotReadOnly,
+        Self::CoverageFilePathRefused,
+        Self::CoverageRollbackModeNotRead,
+        Self::CoverageReaderSandboxUnavailable,
+        Self::CoverageReaderProcessFailed,
+        Self::CoverageVirtualTablesNotSampled,
+        Self::PrivilegeDatabaseFileWritable,
+        Self::SecurityFileWorldReadable,
+        Self::CoverageExternalFileTables,
+        Self::AuditTraceConfigNotEvaluated,
+        Self::AuditTraceSettingsMissing,
+        Self::AuditServicesNotAudited,
+        Self::AuditLogRecordsAmbiguous,
+        Self::AuditLogReadableByOthers,
+        Self::SecurityFirebirdTunnel,
+        Self::CoverageSecurityDatabaseExcluded,
+    ];
+
+    /// The codes registered for `firebird` only (`target-notes.json`):
+    /// attached to `firebird` targets only, whatever a connector built
+    /// (P10-C Firebird review, merge condition C1; enforced by the core
+    /// before a status is sent).
+    pub const FIREBIRD_ONLY: &'static [Self] = &[
+        Self::CoverageExternalFileTables,
+        Self::AuditTraceConfigNotEvaluated,
+        Self::AuditTraceSettingsMissing,
+        Self::AuditServicesNotAudited,
+        Self::AuditLogRecordsAmbiguous,
+        Self::AuditLogReadableByOthers,
+        Self::SecurityFirebirdTunnel,
+        Self::CoverageSecurityDatabaseExcluded,
     ];
 
     /// The registered code.
@@ -566,24 +686,55 @@ impl NoteCode {
             Self::PrivilegeDatabaseRoles => "privilege.database_roles",
             Self::PrivilegeRefused => "privilege.refused",
             Self::PrivilegeServerRoles => "privilege.server_roles",
+            Self::CoverageUnrecognizedFileFormat => "coverage.unrecognized_file_format",
+            Self::CoverageWalFilesNotReadable => "coverage.wal_files_not_readable",
+            Self::CoverageHotJournalPending => "coverage.hot_journal_pending",
+            Self::CoverageNetworkFilesystemRefused => "coverage.network_filesystem_refused",
+            Self::CoverageFilesystemNotReadOnly => "coverage.filesystem_not_read_only",
+            Self::CoverageFilePathRefused => "coverage.file_path_refused",
+            Self::CoverageRollbackModeNotRead => "coverage.rollback_mode_not_read",
+            Self::CoverageReaderSandboxUnavailable => "coverage.reader_sandbox_unavailable",
+            Self::CoverageReaderProcessFailed => "coverage.reader_process_failed",
+            Self::CoverageVirtualTablesNotSampled => "coverage.virtual_tables_not_sampled",
+            Self::PrivilegeDatabaseFileWritable => "privilege.database_file_writable",
+            Self::SecurityFileWorldReadable => "security.file_world_readable",
+            Self::CoverageExternalFileTables => "coverage.external_file_tables",
+            Self::AuditTraceConfigNotEvaluated => "audit.trace_config_not_evaluated",
+            Self::AuditTraceSettingsMissing => "audit.trace_settings_missing",
+            Self::AuditServicesNotAudited => "audit.services_not_audited",
+            Self::AuditLogRecordsAmbiguous => "audit.log_records_ambiguous",
+            Self::AuditLogReadableByOthers => "audit.log_readable_by_others",
+            Self::SecurityFirebirdTunnel => "security.firebird_tunnel",
+            Self::CoverageSecurityDatabaseExcluded => "coverage.security_database_excluded",
         }
     }
 
     /// Order in which notes are kept when a target has more than the
-    /// contract allows: insecure settings first, then the check itself,
-    /// privileges, audit and coverage.
+    /// contract allows: a refused right, a tunnel and an excluded Firebird
+    /// security database first (they explain why Discovery and Audit do not
+    /// run, on the target or on one of its databases: P10-C Firebird review,
+    /// ADR-0060 R9), then insecure settings, the check itself, privileges,
+    /// audit and coverage.
     fn rank(self) -> u8 {
+        if matches!(
+            self,
+            Self::PrivilegeRefused
+                | Self::SecurityFirebirdTunnel
+                | Self::CoverageSecurityDatabaseExcluded
+        ) {
+            return 0;
+        }
         let code = self.as_str();
         if code.starts_with("security.") {
-            0
-        } else if code.starts_with("check.") {
             1
-        } else if code.starts_with("privilege.") {
+        } else if code.starts_with("check.") {
             2
-        } else if code.starts_with("audit.") {
+        } else if code.starts_with("privilege.") {
             3
-        } else {
+        } else if code.starts_with("audit.") {
             4
+        } else {
+            5
         }
     }
 }
@@ -697,6 +848,88 @@ pub(crate) const LABELS_REVISION_2026_10_B: &[&str] = &[
 /// [`LABELS_REVISION_2026_10_B`]: `other` until the console lists it.
 pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
 
+/// The `TargetNoteLabel` values of the revision
+/// `target_status.note_labels.2026_10_d` (Firebird, ADR-0060 decisions 4
+/// and 6 and its refinements of 2026-10-25, 2026-10-26 b and 2026-10-31 c):
+/// the Firebird 4.0 and 5.0
+/// system privileges, the identities of the refusal list, the `usage`
+/// object right, the credential-relation, server-configuration and
+/// role-graph probes, the reasons of `audit.trace_config_not_evaluated`,
+/// `run_confirmation_stalled` for `audit.log_records_ambiguous` and the
+/// trace configuration settings (`log_transactions`, `log_initfini` and
+/// `log_sweep` from refinement b, R21; `max_log_size` and `max_sql_length`
+/// from the refinement of 2026-10-31 c, R57). Negotiated on
+/// their own token, like [`LABELS_REVISION_2026_10_B`]: `other` until the
+/// console lists it. Only [`NoteLabel::firebird`] builds them.
+pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
+    "user_management",
+    "read_raw_pages",
+    "create_user_types",
+    "use_nbackup_utility",
+    "change_shutdown_mode",
+    "trace_any_attachment",
+    "monitor_any_attachment",
+    "access_shutdown_database",
+    "create_database",
+    "drop_database",
+    "use_gbak_utility",
+    "use_gstat_utility",
+    "use_gfix_utility",
+    "ignore_db_triggers",
+    "change_header_settings",
+    "select_any_object_in_database",
+    "access_any_object_in_database",
+    "modify_any_object_in_database",
+    "change_mapping_rules",
+    "use_granted_by_clause",
+    "grant_revoke_on_any_object",
+    "grant_revoke_any_ddl_right",
+    "create_privileged_roles",
+    "get_dbcrypt_info",
+    "modify_ext_conn_pool",
+    "replicate_into_database",
+    "profile_any_attachment",
+    "sysdba",
+    "rdb_admin",
+    "database_owner",
+    "security_database_admin",
+    "usage",
+    "verifier_relation_readable",
+    "credential_relation_readable",
+    "server_config_readable",
+    "role_graph",
+    "firebird_conf_unreadable",
+    "trace_config_unreadable",
+    "trace_config_file_mismatch",
+    "config_changed_since_start",
+    "server_process_not_visible",
+    "similar_to_pattern",
+    "databases_conf",
+    "foreign_databases_logged",
+    "database_path_not_unique",
+    "run_confirmation_stalled",
+    "enabled",
+    "log_filename",
+    "log_connections",
+    "log_statement_finish",
+    "log_blr_requests",
+    "log_procedure_finish",
+    "log_function_finish",
+    "log_trigger_finish",
+    "log_transactions",
+    "log_initfini",
+    "log_sweep",
+    "log_errors",
+    "log_services",
+    "time_threshold",
+    "print_perf",
+    "include_filter",
+    "exclude_filter",
+    "connection_id",
+    "max_log_size",
+    "max_sql_length",
+];
+
 /// The `target_status.note_labels.<revision>` tokens the console listed in
 /// its latest heartbeat response (ADR-0022 decision 4). Each revision is
 /// negotiated on its own: a label is sent only when the token of its own
@@ -709,6 +942,8 @@ pub(crate) struct LabelRevisions {
     pub(crate) r2026_10_b: bool,
     /// `target_status.note_labels.2026_10_c` ([`LABELS_REVISION_2026_10_C`]).
     pub(crate) r2026_10_c: bool,
+    /// `target_status.note_labels.2026_10_d` ([`LABELS_REVISION_2026_10_D`]).
+    pub(crate) r2026_10_d: bool,
 }
 
 impl LabelRevisions {
@@ -718,6 +953,7 @@ impl LabelRevisions {
         r2026_10: true,
         r2026_10_b: true,
         r2026_10_c: true,
+        r2026_10_d: true,
     };
 
     /// Whether `value` (a contract `TargetNoteLabel` value) may be sent.
@@ -725,6 +961,7 @@ impl LabelRevisions {
         (self.r2026_10 || !LABELS_REVISION_2026_10.contains(&value))
             && (self.r2026_10_b || !LABELS_REVISION_2026_10_B.contains(&value))
             && (self.r2026_10_c || !LABELS_REVISION_2026_10_C.contains(&value))
+            && (self.r2026_10_d || !LABELS_REVISION_2026_10_D.contains(&value))
     }
 }
 
@@ -733,6 +970,7 @@ fn in_a_revision(value: &str) -> bool {
     LABELS_REVISION_2026_10.contains(&value)
         || LABELS_REVISION_2026_10_B.contains(&value)
         || LABELS_REVISION_2026_10_C.contains(&value)
+        || LABELS_REVISION_2026_10_D.contains(&value)
 }
 
 /// Closed label of a note: a value of the contract `TargetNoteLabel` enum.
@@ -742,11 +980,12 @@ fn in_a_revision(value: &str) -> bool {
 /// New label values are a contract enum change, negotiated with a
 /// `target_status.note_labels.<revision>` token (ADR-0022 decision 4). The
 /// values of this build are those of protocol 0.1.0, sent without a token,
-/// and those of the SQL Server revisions `2026_10`
+/// those of the SQL Server revisions `2026_10`
 /// ([`LABELS_REVISION_2026_10`]), `2026_10_b`
 /// ([`LABELS_REVISION_2026_10_B`]) and `2026_10_c`
-/// ([`LABELS_REVISION_2026_10_C`]), each sent only once the console lists
-/// its own token, `other` before ([`to_protocol`]).
+/// ([`LABELS_REVISION_2026_10_C`]), and those of the Firebird revision
+/// `2026_10_d` ([`LABELS_REVISION_2026_10_D`]), each sent only once the
+/// console lists its own token, `other` before ([`to_protocol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteLabel(TargetNoteLabel);
 
@@ -759,8 +998,10 @@ impl NoteLabel {
     /// and so are the values of the SQL Server revisions
     /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`],
     /// [`LABELS_REVISION_2026_10_C`]), which only
-    /// [`sqlserver`](Self::sqlserver) builds: a MySQL / MariaDB server
-    /// could name a dynamic privilege after one of them.
+    /// [`sqlserver`](Self::sqlserver) builds, and of the Firebird revision
+    /// ([`LABELS_REVISION_2026_10_D`]), which only
+    /// [`firebird`](Self::firebird) builds: a MySQL / MariaDB server could
+    /// name a dynamic privilege after one of them.
     #[must_use]
     pub fn parse(value: &str) -> Self {
         if in_a_revision(value) {
@@ -818,12 +1059,41 @@ impl NoteLabel {
         })
     }
 
-    /// A Microsoft SQL Server label (ADR-0051 decision 4): any contract
-    /// value, the revisions `target_status.note_labels.2026_10`,
-    /// `2026_10_b` and `2026_10_c` included (each sent as `other` until the console lists
-    /// its token, see [`to_protocol`]); anything else is `other`.
+    /// A Microsoft SQL Server label (ADR-0051 decision 4): a value of
+    /// protocol 0.1.0 or of the SQL Server revisions
+    /// `target_status.note_labels.2026_10`, `2026_10_b` and `2026_10_c`
+    /// (each sent as `other` until the console lists its token, see
+    /// [`to_protocol`]). Anything else is `other`, the Firebird revision
+    /// `2026_10_d` included: SQL Server's `CREATE DATABASE` is not
+    /// Firebird's `CREATE_DATABASE` system privilege, and stays `other` as
+    /// before that revision.
     #[must_use]
     pub fn sqlserver(value: &str) -> Self {
+        if LABELS_REVISION_2026_10_D.contains(&value) {
+            return Self::OTHER;
+        }
+        value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
+    }
+
+    /// A Firebird label (ADR-0060 decisions 4 and 6): a value of protocol
+    /// 0.1.0 or of the Firebird revision `target_status.note_labels.2026_10_d`
+    /// (sent as `other` until the console lists its token, see
+    /// [`to_protocol`]). Anything else is `other`, the SQL Server revisions
+    /// included. Firebird system privileges are given lowercased
+    /// (`trace_any_attachment`); object and DDL rights use the values of
+    /// protocol 0.1.0 (`insert`, `create`…); trace settings are given as
+    /// written in `fbtrace.conf` (`log_statement_finish`, and since the
+    /// ADR-0060 refinement of 2026-10-26 b, R21, `log_transactions`,
+    /// `log_initfini` and `log_sweep`, and since its refinement of
+    /// 2026-10-31 c, R57, `max_log_size` and `max_sql_length`).
+    #[must_use]
+    pub fn firebird(value: &str) -> Self {
+        if LABELS_REVISION_2026_10.contains(&value)
+            || LABELS_REVISION_2026_10_B.contains(&value)
+            || LABELS_REVISION_2026_10_C.contains(&value)
+        {
+            return Self::OTHER;
+        }
         value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
     }
 
@@ -1057,7 +1327,8 @@ fn sent_labels(labels: &[NoteLabel], revisions: LabelRevisions) -> Vec<TargetNot
 ///
 /// The labels of a revision after protocol 0.1.0
 /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`],
-/// [`LABELS_REVISION_2026_10_C`]) are sent only when `revisions` holds its token (the console listed it), `other`
+/// [`LABELS_REVISION_2026_10_C`], [`LABELS_REVISION_2026_10_D`]) are sent
+/// only when `revisions` holds its token (the console listed it), `other`
 /// otherwise (ADR-0022 decision 4). Negotiation comes first, then the
 /// ranking by [`SEVERITY`] (`other` last), then the cut to [`MAX_LABELS`]:
 /// labels the console cannot receive never push out labels it can.
@@ -1114,6 +1385,7 @@ mod tests {
 
     const REVISION_B_MARKER: &str = "        # Revision target_status.note_labels.2026_10_b (ADR-0051 refinement of 2026-10-14):\n";
     const REVISION_C_MARKER: &str = "        # Revision target_status.note_labels.2026_10_c (ADR-0051 refinement option (a')):\n";
+    const REVISION_D_MARKER: &str = "        # Revision target_status.note_labels.2026_10_d (ADR-0060 decisions 4 and 6): Firebird.\n";
 
     /// The labels sent for `note` with `revisions`.
     fn sent(note: &TargetNote, revisions: LabelRevisions) -> Vec<String> {
@@ -1163,11 +1435,13 @@ mod tests {
             r2026_10: true,
             r2026_10_b: false,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         let b = LabelRevisions {
             r2026_10: false,
             r2026_10_b: true,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         assert_eq!(sent(&note, none), vec!["other", "select"]);
         assert_eq!(sent(&note, b), vec!["other", "select"]);
@@ -1227,11 +1501,13 @@ mod tests {
             r2026_10: true,
             r2026_10_b: false,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         let b = LabelRevisions {
             r2026_10: false,
             r2026_10_b: true,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         // Not negotiated: every revision value is `other`, once.
         assert_eq!(sent(&refused, LabelRevisions::default()), vec!["other"]);
@@ -1277,9 +1553,9 @@ mod tests {
 
     #[test]
     fn labels_of_revision_2026_10_c_are_sent_as_other_until_negotiated() {
-        // The list is exactly the contract values of the revision, the
-        // last ones of the enum.
-        let revision = contract_revision(REVISION_C_MARKER, "    DetectedTarget:");
+        // The list is exactly the contract values of the revision, up to
+        // the next one.
+        let revision = contract_revision(REVISION_C_MARKER, REVISION_D_MARKER);
         assert_eq!(revision, super::LABELS_REVISION_2026_10_C);
         for value in super::LABELS_REVISION_2026_10_C {
             assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
@@ -1298,11 +1574,13 @@ mod tests {
             r2026_10: true,
             r2026_10_b: true,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         let c = LabelRevisions {
             r2026_10: false,
             r2026_10_b: false,
             r2026_10_c: true,
+            r2026_10_d: false,
         };
         assert_eq!(sent(&note, LabelRevisions::default()), vec!["other"]);
         assert_eq!(sent(&note, ab), vec!["other", "password_hash_probe"]);
@@ -1311,6 +1589,235 @@ mod tests {
             sent(&note, LabelRevisions::ALL),
             vec!["password_hash_probe", "on_failure_probe"]
         );
+    }
+
+    #[test]
+    fn labels_of_revision_2026_10_d_are_sent_as_other_until_negotiated() {
+        // The list is exactly the contract values of the revision, the
+        // last ones of the enum.
+        let revision = contract_revision(REVISION_D_MARKER, "    DetectedTarget:");
+        assert_eq!(revision, super::LABELS_REVISION_2026_10_D);
+        for value in super::LABELS_REVISION_2026_10_D {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            // Never built from a MySQL / MariaDB or PostgreSQL name.
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), *value);
+            assert!(
+                !super::LABELS_REVISION_2026_10.contains(value)
+                    && !super::LABELS_REVISION_2026_10_B.contains(value)
+                    && !super::LABELS_REVISION_2026_10_C.contains(value),
+                "a value belongs to one revision only"
+            );
+        }
+        // A MySQL privilege named like a Firebird one stays `other`.
+        assert!(super::NoteLabel::privilege("CREATE DATABASE").is_other());
+        assert!(super::NoteLabel::privilege("USAGE").is_other());
+        // Security review L3: SQL Server names never build a Firebird
+        // label (`CREATE DATABASE` was `other` before this revision, and
+        // stays so), and Firebird never builds a SQL Server one.
+        for value in super::LABELS_REVISION_2026_10_D {
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+        }
+        assert!(super::NoteLabel::sqlserver_name("CREATE DATABASE").is_other());
+        assert!(super::NoteLabel::sqlserver_name("ALTER ANY USAGE").is_other());
+        assert!(super::NoteLabel::sqlserver_name("USAGE").is_other());
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("CONTROL SERVER").as_str(),
+            "control_server"
+        );
+        for value in super::LABELS_REVISION_2026_10
+            .iter()
+            .chain(super::LABELS_REVISION_2026_10_B)
+            .chain(super::LABELS_REVISION_2026_10_C)
+        {
+            assert!(super::NoteLabel::firebird(value).is_other(), "{value}");
+        }
+        // 0.1.0 values are shared.
+        assert_eq!(super::NoteLabel::firebird("insert").as_str(), "insert");
+        assert_eq!(super::NoteLabel::sqlserver("select").as_str(), "select");
+        assert_eq!(
+            super::NoteLabel::firebird("similar_to_pattern").as_str(),
+            "similar_to_pattern"
+        );
+        // Not a contract value: `other`, never the raw name.
+        assert!(super::NoteLabel::firebird("TRACE_ANY_ATTACHMENT").is_other());
+        assert!(super::NoteLabel::firebird("trace any attachment").is_other());
+        let refused = super::TargetNote::new(super::NoteCode::PrivilegeRefused).with_labels(
+            ["trace_any_attachment", "rdb_admin", "select"].map(super::NoteLabel::firebird),
+        );
+        let abc = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: true,
+            r2026_10_c: true,
+            r2026_10_d: false,
+        };
+        let d = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: false,
+            r2026_10_c: false,
+            r2026_10_d: true,
+        };
+        assert_eq!(
+            sent(&refused, LabelRevisions::default()),
+            vec!["other", "select"]
+        );
+        assert_eq!(sent(&refused, abc), vec!["other", "select"]);
+        assert_eq!(
+            sent(&refused, d),
+            vec!["select", "trace_any_attachment", "rdb_admin"]
+        );
+        assert_eq!(
+            sent(&refused, LabelRevisions::ALL),
+            vec!["select", "trace_any_attachment", "rdb_admin"]
+        );
+    }
+
+    /// The labels of the ADR-0060 refinements of 2026-10-25 and 2026-10-26 b
+    /// (R21) belong to the same revision `2026_10_d`: `other` until the
+    /// console lists its token.
+    #[test]
+    fn labels_of_the_firebird_refinement_are_in_revision_2026_10_d() {
+        const REFINEMENT: [&str; 5] = [
+            "databases_conf",
+            "foreign_databases_logged",
+            "database_path_not_unique",
+            "run_confirmation_stalled",
+            "server_config_readable",
+        ];
+        assert_eq!(super::LABELS_REVISION_2026_10_D.len(), 66);
+        for value in REFINEMENT {
+            assert!(super::LABELS_REVISION_2026_10_D.contains(&value), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+        }
+        let d = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: false,
+            r2026_10_c: false,
+            r2026_10_d: true,
+        };
+        let readable = TargetNote::new(NoteCode::PrivilegeGlobalPrivileges)
+            .with_labels(["server_config_readable"].map(NoteLabel::firebird));
+        assert_eq!(sent(&readable, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&readable, d), vec!["server_config_readable"]);
+        // The Firebird audit note codes come with the connector (P10-B);
+        // negotiation does not depend on the code.
+        let audit = TargetNote::new(NoteCode::AuditStreamStopped).with_labels(
+            [
+                "databases_conf",
+                "foreign_databases_logged",
+                "database_path_not_unique",
+                "run_confirmation_stalled",
+            ]
+            .map(NoteLabel::firebird),
+        );
+        assert_eq!(sent(&audit, LabelRevisions::default()), vec!["other"]);
+        let mut kept = sent(&audit, d);
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "database_path_not_unique",
+                "databases_conf",
+                "foreign_databases_logged",
+                "run_confirmation_stalled"
+            ]
+        );
+        // Refinement b, R21: the trace settings the binding, folding,
+        // internal-attachment and sweep rules rely on, labels of
+        // `audit.trace_settings_missing`, in contract order after the
+        // trigger finish events.
+        const R21: [&str; 3] = ["log_transactions", "log_initfini", "log_sweep"];
+        let after = super::LABELS_REVISION_2026_10_D
+            .iter()
+            .position(|v| *v == "log_trigger_finish")
+            .expect("log_trigger_finish");
+        assert_eq!(super::LABELS_REVISION_2026_10_D[after + 1..after + 4], R21);
+        for value in R21 {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+            assert!(super::NoteLabel::privilege(value).is_other(), "{value}");
+        }
+        let missing = TargetNote::new(NoteCode::AuditTraceSettingsMissing).with_labels(
+            [
+                "log_sweep",
+                "log_initfini",
+                "log_transactions",
+                "print_perf",
+            ]
+            .map(NoteLabel::firebird),
+        );
+        assert_eq!(sent(&missing, LabelRevisions::default()), vec!["other"]);
+        let mut kept = sent(&missing, d);
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "log_initfini",
+                "log_sweep",
+                "log_transactions",
+                "print_perf"
+            ]
+        );
+        // Refinement of 2026-10-31 c, R57: `max_log_size` (R54) and
+        // `max_sql_length` (the tailer's line bound), last in contract
+        // order, sent as `other` until the console lists `2026_10_d`.
+        const R57: [&str; 2] = ["max_log_size", "max_sql_length"];
+        assert_eq!(super::LABELS_REVISION_2026_10_D[64..], R57);
+        for value in R57 {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+            assert!(super::NoteLabel::privilege(value).is_other(), "{value}");
+        }
+        let rotating = TargetNote::new(NoteCode::AuditTraceSettingsMissing)
+            .with_labels(["max_sql_length", "max_log_size"].map(NoteLabel::firebird));
+        assert_eq!(sent(&rotating, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&rotating, d), vec!["max_log_size", "max_sql_length"]);
+    }
+
+    /// Security review L2: with every Firebird system privilege held, the
+    /// cut to sixteen keeps the refusal-list identities and the privileges
+    /// that read or administer every attachment or the users.
+    #[test]
+    fn the_cut_to_sixteen_keeps_the_firebird_refusal_list() {
+        let privileges = &super::LABELS_REVISION_2026_10_D[..27];
+        assert_eq!(privileges.last(), Some(&"profile_any_attachment"));
+        let n = TargetNote::new(NoteCode::PrivilegeRefused)
+            .with_labels(privileges.iter().map(|p| NoteLabel::firebird(p)))
+            .with_labels(
+                [
+                    "sysdba",
+                    "rdb_admin",
+                    "security_database_admin",
+                    "database_owner",
+                    "verifier_relation_readable",
+                    "usage",
+                    "select",
+                    "insert",
+                ]
+                .map(NoteLabel::firebird),
+            );
+        let kept = sent(&n, LabelRevisions::ALL);
+        assert_eq!(kept.len(), MAX_LABELS);
+        for must in [
+            "sysdba",
+            "rdb_admin",
+            "security_database_admin",
+            "database_owner",
+            "verifier_relation_readable",
+            "trace_any_attachment",
+            "monitor_any_attachment",
+            "read_raw_pages",
+            "user_management",
+            "profile_any_attachment",
+        ] {
+            assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
     }
 
     #[test]
@@ -1438,6 +1945,63 @@ mod tests {
         }
     }
 
+    /// ADR-0060 R36 item 2 (review of #377, N5): with all 20 Firebird trace
+    /// settings missing, the five that say the section does not apply or
+    /// filters records, and `log_blr_requests`, are never cut; nor are
+    /// `max_log_size` and `max_sql_length` (refinement of 2026-10-31 c,
+    /// R57), ranked right after them.
+    #[test]
+    fn firebird_trace_setting_labels_keep_the_section_and_filter_ones() {
+        // Listed least severe first, so input order cannot save them.
+        let all = [
+            "log_services",
+            "log_sweep",
+            "log_errors",
+            "log_trigger_finish",
+            "log_function_finish",
+            "log_procedure_finish",
+            "log_initfini",
+            "log_transactions",
+            "log_connections",
+            "log_statement_finish",
+            "time_threshold",
+            "print_perf",
+            "log_blr_requests",
+            "exclude_filter",
+            "include_filter",
+            "log_filename",
+            "enabled",
+            "connection_id",
+            "max_sql_length",
+            "max_log_size",
+        ];
+        assert_eq!(all.len(), 20);
+        let n = TargetNote::new(NoteCode::AuditTraceSettingsMissing)
+            .with_labels(all.map(NoteLabel::firebird));
+        let kept = sent(&n, LabelRevisions::ALL);
+        assert_eq!(kept.len(), MAX_LABELS);
+        for must in [
+            "connection_id",
+            "enabled",
+            "log_filename",
+            "include_filter",
+            "exclude_filter",
+            "log_blr_requests",
+            "max_log_size",
+            "max_sql_length",
+        ] {
+            assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
+        for gone in [
+            "log_sweep",
+            "log_services",
+            "log_errors",
+            "log_trigger_finish",
+        ] {
+            assert!(!kept.iter().any(|k| k == gone), "{gone} kept: {kept:?}");
+        }
+    }
+
     /// Security review L1: labels of a revision the console has not
     /// negotiated become `other` before the cut, so they never push out
     /// labels it can receive; the hash probe always survives.
@@ -1448,6 +2012,7 @@ mod tests {
             r2026_10: true,
             r2026_10_b: false,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         // 14 labels of 2026_10 outside the severity list, the hash probe,
         // and the 20 labels of 2026_10_b (three of them in the severity
@@ -1550,9 +2115,21 @@ mod tests {
         notes.push(TargetNote::new(NoteCode::SecurityTlsDisabled));
         let out = to_protocol(&notes, LabelRevisions::default());
         assert_eq!(out.len(), MAX_NOTES);
-        // Security and check notes are never the ones cut.
+        // A refused right, a tunnel, security and check notes are never
+        // the ones cut (P10-C Firebird review: `privilege.refused` and
+        // `security.firebird_tunnel` first).
+        for code in [
+            "privilege.refused",
+            "security.firebird_tunnel",
+            "coverage.security_database_excluded",
+        ] {
+            assert!(out.iter().any(|n| n.code.as_str() == code), "{code}");
+        }
+        assert_eq!(NoteCode::PrivilegeRefused.rank(), 0);
+        assert_eq!(NoteCode::SecurityFirebirdTunnel.rank(), 0);
+        assert_eq!(NoteCode::CoverageSecurityDatabaseExcluded.rank(), 0);
         for c in NoteCode::ALL {
-            if c.rank() <= 1 {
+            if c.rank() == 0 {
                 assert!(out.iter().any(|n| n.code.as_str() == c.as_str()), "{c:?}");
             }
         }
@@ -1577,5 +2154,43 @@ mod tests {
             serde_json::to_value(&one).unwrap(),
             serde_json::json!([{"code": "check.timed_out"}])
         );
+    }
+
+    /// With every code registered for one engine present at once (more
+    /// than [`MAX_NOTES`] on most engines), no refused right, tunnel,
+    /// excluded security database (ADR-0060 R9), security or check note of
+    /// that engine is cut: every code of rank 2 or less one engine can
+    /// carry fits in the bound.
+    #[test]
+    fn per_engine_ranked_notes_are_never_cut() {
+        let registry: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            include_str!("../../../../shared/protocol/target-notes.json"),
+        )
+        .unwrap();
+        let engines: std::collections::BTreeSet<&str> = registry
+            .values()
+            .flat_map(|e| e["engines"].as_array().unwrap())
+            .map(|e| e.as_str().unwrap())
+            .collect();
+        for engine in engines {
+            let codes: Vec<NoteCode> = NoteCode::ALL
+                .iter()
+                .copied()
+                .filter(|c| {
+                    registry.get(c.as_str()).is_some_and(|e| {
+                        e["engines"].as_array().unwrap().iter().any(|x| x == engine)
+                    })
+                })
+                .collect();
+            let notes: Vec<TargetNote> = codes.iter().map(|c| TargetNote::new(*c)).collect();
+            let out = to_protocol(&notes, LabelRevisions::default());
+            assert_eq!(out.len(), codes.len().min(MAX_NOTES), "{engine}");
+            for c in codes.iter().filter(|c| c.rank() <= 2) {
+                assert!(
+                    out.iter().any(|n| n.code.as_str() == c.as_str()),
+                    "{engine}: {c:?}"
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,914 @@
+2026-10-30T15:33:09.4830 (23:0x7f5a7d557040) TRACE_INIT
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:09.4830 (23:0x7f5a7d557040) CREATE_DATABASE
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+
+2026-10-30T15:33:09.4840 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_1, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.4860 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_1, CONCURRENCY | WAIT | READ_WRITE)
+      2 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.4870 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_2, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.4870 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_2, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+SET TRANSACTION
+0 records fetched
+      0 ms, 1 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.4880 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_3, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.4890 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_3, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE TABLE T1 (ID INTEGER, NAME VARCHAR(40))
+0 records fetched
+      1 ms, 342 fetch(es), 41 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$DATABASE                             6                                                                      
+RDB$FIELDS                                                             2                                        
+RDB$INDICES                                       27                                                            
+RDB$RELATION_FIELDS                                                    2                                        
+RDB$RELATIONS                                     10                   1                                        
+RDB$TYPES                                          3                                                            
+RDB$USER_PRIVILEGES                                                    7                                        
+RDB$GENERATORS                                     7                                                            
+RDB$CHARACTER_SETS                                 1                                                            
+RDB$COLLATIONS                                     1                                                            
+RDB$PUBLICATIONS                                   1                                                            
+
+2026-10-30T15:33:09.4990 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_3, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      9 ms, 27 write(s), 171 fetch(es), 28 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$DATABASE                             1                   1                                                  
+RDB$FIELDS                                         2                                                            
+RDB$RELATION_FIELDS                                2         2                                                  
+RDB$RELATIONS                                      3         3                                                  
+RDB$SECURITY_CLASSES                                                   4                                        
+RDB$USER_PRIVILEGES                                5                                                            
+
+2026-10-30T15:33:09.4990 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_4, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5010 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_4, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE TABLE DDL_LOG (N INTEGER)
+0 records fetched
+      1 ms, 3 write(s), 107 fetch(es), 34 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$FIELDS                                                             1                                        
+RDB$RELATION_FIELDS                                                    1                                        
+RDB$RELATIONS                                      5                   1                                        
+RDB$USER_PRIVILEGES                                                    6                                        
+RDB$PUBLICATIONS                                   1                                                            
+
+2026-10-30T15:33:09.5060 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_4, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      4 ms, 27 write(s), 114 fetch(es), 24 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$DATABASE                             1                   1                                                  
+RDB$FIELDS                                         1                                                            
+RDB$RELATION_FIELDS                                1         1                                                  
+RDB$RELATIONS                                      3         3                                                  
+RDB$SECURITY_CLASSES                                                   3                                        
+RDB$USER_PRIVILEGES                                5                                                            
+
+2026-10-30T15:33:09.5060 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5060 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_2, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5060 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_2, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+COMMIT
+0 records fetched
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5060 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5070 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_6, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5070 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_6, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+SET TRANSACTION
+0 records fetched
+      0 ms, 1 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5070 (23:0x7f5a7d559740) TRACE_INIT
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:09.5070 (23:0x7f5a7d559740) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_2, Garbage Collector, NONE, <internal>)
+		(TRA_7, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)
+
+2026-10-30T15:33:09.5070 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_8, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5080 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_6, CONCURRENCY | WAIT | READ_WRITE)
+
+Statement 35:
+-------------------------------------------------------------------------------
+INSERT INTO T1 VALUES (1, 'marker-literal-1')
+0 records fetched
+      0 ms, 6 fetch(es), 4 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+T1                                                                     1                                        
+
+2026-10-30T15:33:09.5100 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_6, CONCURRENCY | WAIT | READ_WRITE)
+      1 ms, 4 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5100 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_6, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+COMMIT
+0 records fetched
+      1 ms, 4 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5100 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_8, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5100 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_9, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5100 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_9, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+SET TRANSACTION
+0 records fetched
+      0 ms, 1 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5110 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_10, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5110 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_10, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE TRIGGER TR_CONN ON CONNECT AS DECLARE X INTEGER; BEGIN SELECT COUNT(*) FROM T1 INTO :X; END
+0 records fetched
+      0 ms, 42 fetch(es), 7 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$INDICES                                        5                                                            
+RDB$TRIGGERS                                       1         1         1                                        
+
+2026-10-30T15:33:09.5140 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_10, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      2 ms, 10 write(s), 80 fetch(es), 13 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$DEPENDENCIES                                   1                   2         1                              
+
+2026-10-30T15:33:09.5150 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_11, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5150 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_11, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE TRIGGER TR_TXC ON TRANSACTION COMMIT AS BEGIN END
+0 records fetched
+      0 ms, 25 fetch(es), 7 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$TRIGGERS                                       1         1         1                                        
+
+2026-10-30T15:33:09.5160 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_11, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 5 write(s), 27 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5160 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_12, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5170 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_12, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE TRIGGER DDL_AFTER_CT AFTER CREATE TABLE AS BEGIN INSERT INTO DDL_LOG VALUES (1); END
+0 records fetched
+      0 ms, 42 fetch(es), 7 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$FIELDS                                         1                                                            
+RDB$RELATION_FIELDS                                2                                                            
+RDB$RELATIONS                                      2                                                            
+RDB$TRIGGERS                                       1         1         1                                        
+
+2026-10-30T15:33:09.5170 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_12, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5180 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_12, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      1 ms, 8 write(s), 92 fetch(es), 19 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$DEPENDENCIES                                   2                   4         2                              
+
+2026-10-30T15:33:09.5190 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_13, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5200 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_13, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE PROCEDURE P3 (A INTEGER) RETURNS (N VARCHAR(40)) AS BEGIN SELECT NAME FROM T1 WHERE ID = :A INTO :N; SUSPEND; END
+0 records fetched
+      0 ms, 140 fetch(es), 38 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$FIELDS                                                             2                                        
+RDB$USER_PRIVILEGES                                                    3                                        
+RDB$GENERATORS                                     1                                                            
+RDB$PROCEDURES                                     3         2         1                                        
+RDB$PROCEDURE_PARAMETERS                                               2                                        
+
+2026-10-30T15:33:09.5200 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_13, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5240 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_13, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      4 ms, 23 write(s), 186 fetch(es), 37 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$SECURITY_CLASSES                                                   3                                        
+RDB$DEPENDENCIES                                   3                   6         3                              
+
+2026-10-30T15:33:09.5250 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_14, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5260 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_14, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE FUNCTION F0 (X INTEGER) RETURNS INTEGER AS BEGIN RETURN X + 1; END
+0 records fetched
+      0 ms, 131 fetch(es), 38 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$FIELDS                                                             2                                        
+RDB$FUNCTIONS                                      3         2         1                                        
+RDB$FUNCTION_ARGUMENTS                                                 2                                        
+RDB$USER_PRIVILEGES                                                    3                                        
+RDB$GENERATORS                                     1                                                            
+
+2026-10-30T15:33:09.5260 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_14, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5300 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_14, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      3 ms, 20 write(s), 74 fetch(es), 10 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$SECURITY_CLASSES                                                   3                                        
+
+2026-10-30T15:33:09.5300 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_15, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_9, CONCURRENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_9, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_9, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+COMMIT
+0 records fetched
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_15, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_15, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_16, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_16, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+SET TRANSACTION
+0 records fetched
+      0 ms, 1 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5310 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_17, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5320 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_17, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	DDL_AFTER_CT FOR DDL_LOG (AFTER DDL) 
+      0 ms, 6 fetch(es), 4 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+DDL_LOG                                                                1                                        
+
+2026-10-30T15:33:09.5320 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_17, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE TABLE T2 (A INTEGER)
+0 records fetched
+      0 ms, 114 fetch(es), 37 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$FIELDS                                                             1                                        
+RDB$RELATION_FIELDS                                                    1                                        
+RDB$RELATIONS                                      5                   1                                        
+RDB$USER_PRIVILEGES                                                    6                                        
+RDB$PUBLICATIONS                                   1                                                            
+DDL_LOG                                                                1                                        
+
+2026-10-30T15:33:09.5320 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_17, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_17, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      5 ms, 31 write(s), 113 fetch(es), 25 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$DATABASE                             1                   1                                                  
+RDB$FIELDS                                         1                                                            
+RDB$RELATION_FIELDS                                1         1                                                  
+RDB$RELATIONS                                      3         3                                                  
+RDB$SECURITY_CLASSES                                                   3                                        
+RDB$USER_PRIVILEGES                                5                                                            
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_18, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_16, CONCURRENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_16, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_16, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+COMMIT
+0 records fetched
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_18, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5380 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_18, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5390 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5390 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+SET TRANSACTION
+0 records fetched
+      0 ms, 1 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5390 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5400 (23:0x7f5a7d557040) EXECUTE_PROCEDURE_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+Procedure P3:
+param0 = integer, "1"
+
+1 records fetched
+      0 ms, 6 fetch(es)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+T1                                       1                                                                      
+
+2026-10-30T15:33:09.5400 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+Statement 89:
+-------------------------------------------------------------------------------
+SELECT * FROM P3(1)
+1 records fetched
+      0 ms, 6 fetch(es)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+T1                                       1                                                                      
+
+2026-10-30T15:33:09.5400 (23:0x7f5a7d557040) EXECUTE_FUNCTION_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+Function F0:
+param0 = integer, "1"
+
+returns:
+param0 = integer, "2"
+
+      0 ms
+
+2026-10-30T15:33:09.5400 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+Statement 94:
+-------------------------------------------------------------------------------
+SELECT F0(ID) FROM T1
+1 records fetched
+      0 ms, 5 fetch(es)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+T1                                       1                                                                      
+
+2026-10-30T15:33:09.5410 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+CREATE USER MARKERUSER PASSWORD 'marker-password-1'
+0 records fetched
+      0 ms
+
+2026-10-30T15:33:09.5410 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5470 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_20, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      6 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5480 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_21, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5480 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5480 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5480 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_19, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+COMMIT
+0 records fetched
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5480 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_21, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5480 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_21, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5490 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_22, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5490 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_22, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+SET TRANSACTION
+0 records fetched
+      0 ms, 1 write(s), 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5490 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_23, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5490 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_23, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+DROP USER MARKERUSER
+0 records fetched
+      0 ms
+
+2026-10-30T15:33:09.5490 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_23, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5540 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_23, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      4 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_24, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_22, CONCURRENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_22, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) EXECUTE_STATEMENT_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_22, CONCURRENCY | WAIT | READ_WRITE)
+
+-------------------------------------------------------------------------------
+COMMIT
+0 records fetched
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_24, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+		(TRA_24, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) DETACH_DATABASE
+	/var/lib/firebird/data/app.fdb (ATT_3, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57026)
+	/opt/firebird/bin/isql:27
+
+2026-10-30T15:33:09.5550 (23:0x7f5a7d557040) TRACE_FINI
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:09.5560 (23:0x7f5a7d559740) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_2, Garbage Collector, NONE, <internal>)
+		(TRA_7, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)
+      0 ms
+
+2026-10-30T15:33:09.5560 (23:0x7f5a7d559740) TRACE_FINI
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:09.7070 (23:0x7f5a7d559740) TRACE_INIT
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:09.7070 (23:0x7f5a7d559740) ATTACH_DATABASE
+	/var/lib/firebird/data/app.fdb (ATT_4, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57042)
+	/opt/firebird/bin/gfix:39
+
+2026-10-30T15:33:09.7070 (23:0x7f5a7d559740) SWEEP_START
+	/var/lib/firebird/data/app.fdb (ATT_4, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57042)
+	/opt/firebird/bin/gfix:39
+
+Transaction counters:
+	Oldest interesting         21
+	Oldest active              22
+	Oldest snapshot            22
+	Next transaction           25
+
+2026-10-30T15:33:09.7070 (23:0x7f5a7d559740) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_4, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57042)
+	/opt/firebird/bin/gfix:39
+		(TRA_26, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)
+
+2026-10-30T15:33:09.7200 (23:0x7f5a7d559740) SWEEP_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_4, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57042)
+	/opt/firebird/bin/gfix:39
+
+Transaction counters:
+	Oldest interesting         25
+	Oldest active              25
+	Oldest snapshot            25
+	Next transaction           26
+     12 ms, 132 read(s), 38 write(s), 1887 fetch(es), 111 mark(s)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+RDB$PAGES                              168                                                                      
+RDB$DATABASE                            15                                                                      
+RDB$INDICES                                       63                                                            
+RDB$RELATIONS                                     17                                                            
+RDB$SECURITY_CLASSES                               3                                                            
+RDB$TYPES                                          1                                                            
+RDB$TRIGGERS                                      24                                                            
+RDB$USER_PRIVILEGES                              733                                                            
+RDB$GENERATORS                                     5                                                            
+RDB$CHARACTER_SETS                                 1                                                            
+RDB$COLLATIONS                                     1                                                            
+RDB$ROLES                                          1                                                            
+
+2026-10-30T15:33:09.7200 (23:0x7f5a7d559740) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_4, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57042)
+	/opt/firebird/bin/gfix:39
+		(TRA_26, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)
+      0 ms
+
+2026-10-30T15:33:09.7200 (23:0x7f5a7d559740) DETACH_DATABASE
+	/var/lib/firebird/data/app.fdb (ATT_4, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57042)
+	/opt/firebird/bin/gfix:39
+
+2026-10-30T15:33:09.7200 (23:0x7f5a7d559740) TRACE_FINI
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:10.0110 (23:0x7f5a7d559740) TRACE_INIT
+	SESSION_1 Firebird Audit
+	
+
+2026-10-30T15:33:10.0110 (23:0x7f5a7d559740) ATTACH_DATABASE
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+
+2026-10-30T15:33:10.0110 (23:0x7f5a7d559740) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+		(TRA_27, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:10.0110 (23:0x7f5a7d559740) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+		(TRA_27, CONCURRENCY | WAIT | READ_WRITE)
+	TR_CONN (ON CONNECT) 
+      0 ms, 6 fetch(es)
+
+Table                              Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge
+****************************************************************************************************************
+T1                                       1                                                                      
+
+2026-10-30T15:33:10.0120 (23:0x7f5a7d559740) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+		(TRA_27, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms
+
+2026-10-30T15:33:10.0120 (23:0x7f5a7d559740) START_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+		(TRA_28, CONCURRENCY | WAIT | READ_WRITE)
+
+2026-10-30T15:33:10.0260 (23:0x7f5a7d559740) EXECUTE_TRIGGER_FINISH
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+		(TRA_28, CONCURRENCY | WAIT | READ_WRITE)
+	TR_TXC (ON TRANSACTION_COMMIT) 
+      0 ms
+
+2026-10-30T15:33:10.0260 (23:0x7f5a7d559740) COMMIT_TRANSACTION
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+		(TRA_28, CONCURRENCY | WAIT | READ_WRITE)
+      0 ms, 1 fetch(es), 1 mark(s)
+
+2026-10-30T15:33:10.0260 (23:0x7f5a7d559740) DETACH_DATABASE
+	/var/lib/firebird/data/app.fdb (ATT_7, SYSDBA:NONE, NONE, TCPv4:127.0.0.1/57058)
+	/opt/firebird/bin/gbak:59
+
+2026-10-30T15:33:10.0270 (23:0x7f5a7d559740) TRACE_FINI
+	SESSION_1 Firebird Audit
+	
+
