@@ -13,7 +13,7 @@ It is separate from the dev seed ([../seed/generate.py](../seed/generate.py), [.
 ## Files
 | File | Content |
 |------|---------|
-| [generate.py](generate.py) | Generator. Python 3 stdlib only, fixed seed `399851027` |
+| [generate.py](generate.py) | Generator. Python 3 stdlib only, fixed seed `646840010` |
 | `corpus.json` (**not committed**, git-ignored, about 8 MB) | `{"generator", "seed", "version", "rows_per_column", "columns": [...]}`. Each column is `{id, engine, database, container, object, field, values}`, with 200 string `values` |
 | `labels.json` (committed, the reviewable artifact) | `{"generator", "seed", "version", "classifiers", "notes", "corpus_sha256", "locations": [...]}`, one location per column, joined on `id`. `corpus_sha256` is the SHA-256 of the exact bytes of `corpus.json` |
 | [test_generate.py](test_generate.py) | Unit tests: check-digit validators, determinism, validation, committed `labels.json` and pinned corpus SHA-256 up to date, minimum counts |
@@ -72,7 +72,7 @@ The Wilson lower bound for a perfect score is n / (n + 3.84). **With 30 positive
 
 For precision (LB ≥ 0.85): with TP = 62 the gate tolerates up to 4 FP, with TP = 78 up to 6 FP. So in practice the gate asks for about 98 % recall at column level. Anyone who wants more slack should raise `TARGET_POSITIVES` (for example 100 allows 4 misses) and not lower the bar.
 
-## Counts (seed 399851027)
+## Counts (seed 646840010)
 1416 columns × 200 rows: 643 positive columns, 759 hard-negative columns and 14 ambiguous columns (excluded).
 
 Non-ambiguous positive columns per classifier:
@@ -123,7 +123,7 @@ Hard-negative types:
 - **AWS**: access key ids `AKIA…`/`ASIA…`, secret access keys, `id:secret` pairs.
 - **Password hashes**: bcrypt (`$2a$`/`$2b$`/`$2y$`), argon2id, scrypt (passlib `$scrypt$` and Django `scrypt$`), Django `pbkdf2_sha256$`, `$6$` (with and without `rounds=`), `$5$`, `$1$`, yescrypt `$y$`, `{SSHA}`, and mixed "migration" columns.
 - **Free text**: notes in 5 languages with an embedded e-mail and/or phone in about 40 % of rows, plus three **low-prevalence** columns (about 5 % of rows). These are labeled with the types actually present.
-- About 15 % of the positive columns (94) are **sparse**: about 8 % of their cells are `""`, `N/A` or `-`.
+- About 15 % of the positive columns (92) are **sparse**: about 8 % of their cells are `""`, `N/A` or `-`.
 
 ## Ambiguous columns (excluded, `ambiguous: true`)
 | Columns | Best-guess label | Why |
