@@ -180,12 +180,19 @@ jobs:
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          # GitHub release downloads answer 504 at times: retry, the checksum check still guards the archive.
-          retry=(--retry 6 --retry-delay 10 --retry-all-errors --retry-max-time 180)
-          curl -sSfL "${retry[@]}" -o "$archive" "$base/$archive"
-          curl -sSfL "${retry[@]}" -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
-          grep " ${archive}\$" checksums.txt | sha256sum -c -
-          tar -xzf "$archive" gitleaks
+          # GitHub release downloads answer 504 at times: retry, and fall back to building the same
+          # version from the Go module proxy (its content is verified against sum.golang.org).
+          retry=(--retry 3 --retry-delay 10 --retry-all-errors --retry-max-time 90)
+          if curl -sSfL "${retry[@]}" -o "$archive" "$base/$archive" \
+            && curl -sSfL "${retry[@]}" -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"; then
+            grep " ${archive}\$" checksums.txt | sha256sum -c -
+            tar -xzf "$archive" gitleaks
+          else
+            echo "::warning::gitleaks release download failed; building v${GITLEAKS_VERSION} from the Go module proxy"
+            GOTOOLCHAIN=auto GOFLAGS=-mod=mod go install "github.com/zricethezav/gitleaks/v8@v${GITLEAKS_VERSION}"
+            cp "$(go env GOPATH)/bin/gitleaks" ./gitleaks
+          fi
+          ./gitleaks version
       - name: Scan history
         run: ./gitleaks git --redact --verbose --exit-code 1 .
 
