@@ -138,7 +138,9 @@ first database initialization, reading the passwords from the Docker secret file
 pg-boss schema upgrades are not console migrations: the worker applies them at startup as the
 runtime role (e.g. pg-boss 12.36's schema 44 and its `pgboss.instance` table, or 12.37's
 schema 45: a nullable `job.upsert_by_key` column and a partial unique index that pg-boss's
-maintenance builds concurrently in the background after startup), which owns every pg-boss table,
+maintenance builds concurrently in the background after startup, or 12.38's schema 46: a nullable
+`queue.retained_count` / `retained_on`, and four `job` indexes built concurrently in the background
+after startup), which owns every pg-boss table,
 so they need no new grant. `pgboss.instance` holds one row per pg-boss instance
 (worker, web sender): host name, pid, versions, pool and process figures, queue names and an
 allow-list of pg-boss options; no connection string, password or job data
