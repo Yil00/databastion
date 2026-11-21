@@ -31,7 +31,7 @@ x-console: &console
     DATABASTION_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
     LOG_LEVEL: info
 
-x-postgres-image: &postgres-image postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+x-postgres-image: &postgres-image postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
 # Same pinned images as dev/docker-compose.yml.
 x-mysql-image: &mysql-image mysql:8.4.11@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d
 x-mariadb-image: &mariadb-image mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
@@ -180,7 +180,7 @@ services:
     # pg_stat_statements only (Limited level): for hosts that cannot build dev/postgres.
     build:
       context: ../dev/postgres
-    image: ${E2E_TARGET_PG_IMAGE:-databastion-dev/postgres:17.11-pgaudit}
+    image: ${E2E_TARGET_PG_IMAGE:-databastion-dev/postgres:17.12-pgaudit}
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     environment:
       POSTGRES_USER: postgres

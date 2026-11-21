@@ -25,7 +25,7 @@
 
 services:
   cas-db:
-    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    image: postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

@@ -22,8 +22,8 @@ services:
       context: ./postgres
       args:
         # Base image of dev/postgres/Dockerfile; the pgaudit package follows its PG_MAJOR.
-        PG_IMAGE: ${DATABASTION_DEV_POSTGRES_IMAGE:-postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652}
-    image: databastion-dev/postgres:${DATABASTION_DEV_POSTGRES_TAG:-17.11}-pgaudit
+        PG_IMAGE: ${DATABASTION_DEV_POSTGRES_IMAGE:-postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b}
+    image: databastion-dev/postgres:${DATABASTION_DEV_POSTGRES_TAG:-17.12}-pgaudit
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?copy dev/.env.example to dev/.env}
@@ -345,7 +345,7 @@ services:
   # Role and database `cas` in the dev PostgreSQL (cas/db-init.sh). The client image is the
   # pinned PostgreSQL 17 one whatever DATABASTION_DEV_POSTGRES_IMAGE says (psql 15+ needed).
   cas-db-init:
-    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    image: postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
     profiles: [cas]
     depends_on:
       postgres: { condition: service_healthy }
@@ -403,7 +403,7 @@ services:
 
   # The agent's column grants on the ticket table CAS created at start (cas/db-init.sh grants).
   cas-db-grants:
-    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    image: postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
     profiles: [cas]
     depends_on:
       cas: { condition: service_healthy }
@@ -463,7 +463,7 @@ services:
   # (seed/out/redis.txt) with the agent's ACL users (redis/entrypoint.sh), TLS only on TCP with
   # the dev CA of redis-tls-init, `default` user off, and the slow log at every command.
   redis-tls-init:
-    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    image: postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
     profiles: [redis]
     user: "0:0"
     network_mode: none
