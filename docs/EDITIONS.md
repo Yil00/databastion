@@ -2,13 +2,16 @@
 
 DataBastion follows an **open-core** model, like Kestra ([ADR-0005](adr/0005-open-core-license.md)).
 
+> **Status**: only the Community Edition exists today. There is no commercial version yet: the Enterprise Edition below is the planned scope, which may change.
+
 ```
 ┌──────────────────────────────────────────────────────────┐
 │        DataBastion Community Edition — Apache 2.0        │
 │               (this repository, public)                  │
 │  • Console: agents, targets, findings, incidents         │
 │  • Agent + PostgreSQL, MySQL/MariaDB, MongoDB,           │
-│    OpenLDAP, Apereo CAS connectors (more planned)        │
+│    OpenLDAP, Apereo CAS, Microsoft SQL Server,           │
+│    Redis/Valkey, SQLite and Firebird connectors          │
 │  • Discovery + Audit, standard classifiers               │
 │  • Simple policies, email / webhook alerting             │
 │  • Local auth + OIDC single sign-on (ADR-0038)           │
@@ -18,7 +21,7 @@ DataBastion follows an **open-core** model, like Kestra ([ADR-0005](adr/0005-ope
                              +
 ┌──────────────────────────────────────────────────────────┐
 │     DataBastion Enterprise Edition — commercial license  │
-│               (separate private repository)              │
+│       (planned, not available yet; private repository)   │
 │  • Multi-tenancy, fine-grained RBAC (per target / team)  │
 │  • SAML, SCIM                                            │
 │  • Advanced Prevention mode (proxy, blocking)            │
