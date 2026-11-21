@@ -346,7 +346,7 @@ The first run builds the console, agent, target PostgreSQL (dev/postgres, pgaudi
 apt repository) and OpenLDAP (dev/openldap, Debian's slapd) images (several minutes). No secret is
 written to the repository; nothing listens outside `127.0.0.1`. `E2E_SKIP_BUILD=1` (ignored under
 GitHub Actions) reuses `databastion-console:e2e`, `databastion-agent:e2e`,
-`databastion-dev/postgres:17.11-pgaudit` and `databastion-dev/openldap:bookworm-20260918` as
+`databastion-dev/postgres:17.12-pgaudit` and `databastion-dev/openldap:bookworm-20260918` as
 already built (`E2E_CONSOLE_IMAGE`, `E2E_AGENT_IMAGE`, `E2E_TARGET_PG_IMAGE`,
 `E2E_TARGET_LDAP_IMAGE` name other tags),
 for hosts where the Dockerfiles cannot build as is (e.g. a TLS-intercepting proxy). Behind an HTTP

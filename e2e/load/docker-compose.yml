@@ -30,7 +30,7 @@ x-console: &console
     LOG_LEVEL: info
 
 # Same pinned images as e2e/docker-compose.yml and dev/docker-compose.yml.
-x-postgres-image: &postgres-image postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+x-postgres-image: &postgres-image postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
 x-mariadb-image: &mariadb-image mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
 x-mongo-image: &mongo-image mongo:8.0.32@sha256:4968f22d0c6c10ef29952f3e807f62872ba22b3312f25803564fbfc08255efc2
 # sysbench 1.1 (Percona build, linux/amd64): the MariaDB workload client (reports the p95 latency).
@@ -139,7 +139,7 @@ services:
     <<: *hardening
     build:
       context: ../../dev/postgres
-    image: ${LOAD_TARGET_PG_IMAGE:-databastion-dev/postgres:17.11-pgaudit}
+    image: ${LOAD_TARGET_PG_IMAGE:-databastion-dev/postgres:17.12-pgaudit}
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     cpus: ${LOAD_DB_CPUS:-2}
     environment:

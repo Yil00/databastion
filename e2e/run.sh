@@ -113,7 +113,7 @@ case "$E2E_PG_AUDIT" in
   pss)
     [ "${GITHUB_ACTIONS:-}" != true ] || fail "E2E_PG_AUDIT=pss is for local runs only"
     # The plain pinned image (no pgaudit): pg_stat_statements only.
-    export E2E_TARGET_PG_IMAGE="postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652"
+    export E2E_TARGET_PG_IMAGE="postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b"
     export E2E_PG_PRELOAD="pg_stat_statements"
     PG_AUDIT_LEVELS="limited"; PG_AUDIT_SOURCE="pg_stat_statements"
     PG_AUDIT_STARTED="audit source: pg_stat_statements (Limited)" ;;
@@ -544,7 +544,7 @@ else
   BUILD_SERVICES+=(agent)
 fi
 if [ "$E2E_PG_AUDIT" = pgaudit ]; then
-  BUILT_IMAGES+=("${E2E_TARGET_PG_IMAGE:-databastion-dev/postgres:17.11-pgaudit}")
+  BUILT_IMAGES+=("${E2E_TARGET_PG_IMAGE:-databastion-dev/postgres:17.12-pgaudit}")
   BUILD_SERVICES+=(target-pg)
 fi
 if [ "${E2E_SKIP_BUILD:-0}" = 1 ] && [ "${GITHUB_ACTIONS:-}" != true ]; then

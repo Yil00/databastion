@@ -54,12 +54,14 @@ pub(crate) fn allow_own_files_for_tests() {
     RELAXED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(not(test))]
 fn strict() -> bool {
-    #[cfg(test)]
-    if RELAXED.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
     true
+}
+
+#[cfg(test)]
+fn strict() -> bool {
+    !RELAXED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn me() -> (u32, u32, Option<Vec<u32>>) {
