@@ -60,7 +60,7 @@ python3 -m unittest discover -s e2e/load -p 'test_*.py'   # unit tests (no Docke
 ```
 
 `LOAD_SKIP_BUILD=1` (ignored under GitHub Actions) uses `databastion-console:e2e`,
-`databastion-agent:e2e` and `databastion-dev/postgres:17.11-pgaudit` as built by `e2e/run.sh`
+`databastion-agent:e2e` and `databastion-dev/postgres:17.12-pgaudit` as built by `e2e/run.sh`
 (`LOAD_CONSOLE_IMAGE`, `LOAD_AGENT_IMAGE`, `LOAD_TARGET_PG_IMAGE` name other tags). Where the apt
 mirrors that `dev/postgres` needs are blocked, `LOAD_PG_AUDIT=pss` (local runs only, refused under
 GitHub Actions, as e2e's `E2E_PG_AUDIT=pss`) runs `target-pg` on the plain pinned image with

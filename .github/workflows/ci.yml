@@ -235,7 +235,7 @@ jobs:
       # databases and non-superuser owner / runtime roles from this admin URL (src/test/db.ts).
       - name: Start PostgreSQL 17 (DB test suites)
         env:
-          PG_IMAGE: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+          PG_IMAGE: postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
         run: |
           docker run -d --name databastion-test-pg -p 127.0.0.1:5432:5432 \
             -e POSTGRES_HOST_AUTH_METHOD=trust \

@@ -57,7 +57,7 @@ case "$LOAD_PG_AUDIT" in
   pgaudit) PG_AUDIT_STARTED="audit source: pgaudit log" ;;
   pss)
     [ "${GITHUB_ACTIONS:-}" != true ] || { echo "LOAD_PG_AUDIT=pss is for local runs only" >&2; exit 2; }
-    export LOAD_TARGET_PG_IMAGE="postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652"
+    export LOAD_TARGET_PG_IMAGE="postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b"
     export LOAD_PG_PRELOAD="pg_stat_statements"
     PG_AUDIT_STARTED="audit source: pg_stat_statements (Limited)" ;;
   *) echo "LOAD_PG_AUDIT must be pgaudit or pss" >&2; exit 2 ;;
@@ -389,7 +389,7 @@ fi
 if [ "${LOAD_SKIP_BUILD:-0}" = 1 ] && [ "${GITHUB_ACTIONS:-}" != true ]; then
   # (pss mode: the plain PostgreSQL image is pulled by `up` like the other pinned images.)
   SKIP_IMAGES=("${LOAD_CONSOLE_IMAGE:-databastion-console:e2e}" "${LOAD_AGENT_IMAGE:-databastion-agent:e2e}")
-  [ "$LOAD_PG_AUDIT" = pss ] || SKIP_IMAGES+=("${LOAD_TARGET_PG_IMAGE:-databastion-dev/postgres:17.11-pgaudit}")
+  [ "$LOAD_PG_AUDIT" = pss ] || SKIP_IMAGES+=("${LOAD_TARGET_PG_IMAGE:-databastion-dev/postgres:17.12-pgaudit}")
   for img in "${SKIP_IMAGES[@]}"; do
     docker image inspect "$img" >/dev/null 2>&1 || fail "LOAD_SKIP_BUILD=1 but image $img is missing"
   done

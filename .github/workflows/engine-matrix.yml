@@ -102,34 +102,34 @@ jobs:
           # version: 13 (end of life) has no pg_stat_statements_info, through which the connector
           # proves pg_stat_statements loaded (docs/08-engine-capabilities.md).
           - engine: PostgreSQL
-            version: "14.24"
+            version: "14.25"
             it: postgres
             services: postgres
-            postgres_image: postgres:14.24-bookworm@sha256:dcc2ca942d8518144f387a0c2630188427835f984caaed0418b986928e761809
-            postgres_tag: "14.24"
+            postgres_image: postgres:14.25-bookworm@sha256:a54c8b1e143b22f16b0fd3e249e9297a6f08828a143ee7108b1b5ca51f352765
+            postgres_tag: "14.25"
             postgres_log_format: csvlog
           - engine: PostgreSQL
-            version: "15.19"
+            version: "15.20"
             it: postgres
             services: postgres
-            postgres_image: postgres:15.19-bookworm@sha256:539ceaaae49b3a7c8a04467cf00cc6788d8e3f1675df41860d86eebc4c40524f
-            postgres_tag: "15.19"
+            postgres_image: postgres:15.20-bookworm@sha256:8180c3e1b9b603d2988f937dfbe51008bad5c4b07c77f35119695c027a7315ab
+            postgres_tag: "15.20"
           - engine: PostgreSQL
-            version: "16.15"
+            version: "16.16"
             it: postgres
             services: postgres
-            postgres_image: postgres:16.15-bookworm@sha256:efedf3595f1d6f415c08568ba171029bf54052e754cc9f030e3f2412b21f3d67
-            postgres_tag: "16.15"
+            postgres_image: postgres:16.16-bookworm@sha256:ce3efec6bc404f6b15ebf5d9bed6b45a9d4655aea238d7dacc3467ccb05a1175
+            postgres_tag: "16.16"
           - engine: PostgreSQL
-            version: "17.11 (default)"
+            version: "17.12 (default)"
             it: postgres
             services: postgres
           - engine: PostgreSQL
-            version: "18.6"
+            version: "18.7"
             it: postgres
             services: postgres
-            postgres_image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
-            postgres_tag: "18.6"
+            postgres_image: postgres:18.7-bookworm@sha256:194e55feb2597b1465dbee81cc9fd8d204566cd2eb42c8d22fd6c931a38781b1
+            postgres_tag: "18.7"
           # MySQL Community. dev/agent-it.sh mysql also runs the MariaDB and Percona services
           # at their default versions: the same tests and DATABASTION_TEST_REQUIRE as ci.yml.
           - engine: MySQL
