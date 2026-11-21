@@ -861,7 +861,7 @@ of the pinned image with systemd as PID 1 (`--privileged` turns Docker's seccomp
 profile is `e2e-sqlite`'s). The runner's kernel is Ubuntu's, so this proves the unit and systemd
 252, not Debian 12's own kernel.
 
-**Debian 12's own kernel (manual).** GitHub has no Debian runner image; a nested VM is possible
+**Debian 12's own kernel (manual).** Not run for 0.10.0: deferred by the maintainer on 2026-11-08, still an open gate in [RELEASE.md](../RELEASE.md#open-release-gates). GitHub has no Debian runner image; a nested VM is possible
 (KVM on the standard Linux runners, Debian's `genericcloud` image) but not set up. On a throwaway
 Debian 12 VM booted on Debian's kernel (`linux-image-amd64` or `-arm64`, 6.1), as root, from a
 checkout of the branch and the `.deb` of the same commit (CI artifact `deb-<arch>`):
