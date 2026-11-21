@@ -25,7 +25,7 @@ Auditing depends on what the engine logs natively. DataBastion **does not promis
 |---------|--------|--------------|
 | CAS | Lower priority | 8 |
 | Console login with OIDC | Local accounts are enough for the MVP | 8 ([ADR-0038](adr/0038-console-oidc-login.md), accepted) |
-| Microsoft SQL Server, Redis, Valkey, SQLite, Firebird | Wider engine scope after the MVP | 9 and 10 ([ADR-0039](adr/0039-engine-scope-expansion.md), proposed) |
+| Microsoft SQL Server, Redis, Valkey, SQLite, Firebird | Wider engine scope after the MVP | 9 and 10, done: SQL Server, Redis and Valkey since 0.8.0, SQLite and Firebird since 0.10.0 ([ADR-0039](adr/0039-engine-scope-expansion.md)) |
 | Helm / Kubernetes | Compose is enough for the MVP | 11 |
 | Agent ↔ console mTLS | Token + TLS are enough for the MVP | 11 (ADR first) |
 | Real-time Prevention mode | Requires being in the data path | Community: recommended actions and response hooks, phase 12; blocking proxy: Enterprise ([ADR-0040](adr/0040-prevention-mode-scope.md)) |

@@ -53,7 +53,7 @@ A **single Rust binary** ([ADR-0002](adr/0002-single-agent-connectors.md)) made 
 ```
 agent
 ├── core        enrollment, configuration, scheduler, HTTPS uplink, disk spool
-├── connectors  postgres · mysql · mongodb · openldap   (Cargo features)
+├── connectors  postgres · mysql · mongodb · openldap · cas · redis · sqlserver · sqlite · firebird
 ├── classifiers PII / secrets detection (regex + validators: Luhn, IBAN, NIR…)
 └── masking     masking + HMAC fingerprints before anything is sent
 ```
