@@ -4,7 +4,7 @@
 # dev/docker-compose.yml; the e2e harnesses build this file without the argument). The
 # engine-matrix workflow overrides it. PG_MAJOR comes from the base image: the pgaudit package
 # follows it.
-ARG PG_IMAGE=postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+ARG PG_IMAGE=postgres:17.12-bookworm@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b
 FROM ${PG_IMAGE}
 
 # The images of PostgreSQL 18+ default to /var/lib/postgresql/<major>/docker and refuse a volume
