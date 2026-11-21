@@ -10,7 +10,7 @@ It detects, audits and (eventually) prevents leaks of sensitive data **as close 
 - OpenLDAP
 - Apereo CAS (Central Authentication Service) — *since 0.4.0 (ROADMAP phase 8)*
 - Microsoft SQL Server, Redis and Valkey — *since 0.8.0 (ROADMAP phase 9); SQL Server Audit reads SQL Server Audit files on 2022 and 2025, or an Extended Events session on every supported version (the only source on 2019)*
-- SQLite and Firebird — *planned, ROADMAP phase 10 ([ADR-0039](adr/0039-engine-scope-expansion.md)); not supported yet*
+- SQLite and Firebird — *since 0.10.0 (ROADMAP phase 10); SQLite: Discovery of declared database files only ([ADR-0059](adr/0059-sqlite-connector.md)); Firebird 4.0 and 5.0: Discovery and an Audit read from the system audit trace log, Partial at best ([ADR-0060](adr/0060-firebird-connector.md))*
 
 ## Problem addressed
 Traditional DLPs monitor workstations, email or the network. They do not know **where** sensitive data lives in databases, nor **who** is extracting it in bulk (`pg_dump`, `mysqldump`, `mongoexport`, LDIF exports, `SELECT *` on a customer table…). DataBastion answers these two questions:
