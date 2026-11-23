@@ -27,7 +27,7 @@ zeroize.workspace = true
 # ADR-0059 decision 1: exactly these features (agent/deny.toml allow-lists them;
 # architecture test `sqlite_features_are_the_reviewed_ones`). No load_extension,
 # vtab, functions, trace, backup, blob, serialize, session or integrations.
-rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "hooks", "limits"] }
 # The reader sandbox (ADR-0059 decision 4), scoped to this crate by agent/deny.toml.
 landlock = { version = "0.4.7", default-features = false }
 seccompiler = { version = "0.5.0", default-features = false }
@@ -42,7 +42,7 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # 0.29, the last series where `close` takes a descriptor number; sound there
 # because the reader has opened nothing yet (sandbox::early). Scoped to this
 # crate by agent/deny.toml.
-nix = { version = "0.31", default-features = false }
+nix = { version = "0.32", default-features = false }
 
 [features]
 # Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
@@ -62,7 +62,7 @@ databastion-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "process"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # The fuzz module's tests (`cfg(test)`): the `fuzzing` feature's `nix/fs`.
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.32", default-features = false, features = ["fs"] }
 
 [lints]
 workspace = true
